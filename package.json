@@ -1,0 +1,16 @@
+{
+  "name": "wovly-assistant",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n ui,desktop \"npm run -w apps/ui dev\" \"npm run -w apps/desktop dev\"",
+    "build": "npm run -w apps/ui build && npm run -w apps/desktop build",
+    "lint": "npm run -w apps/ui lint && npm run -w apps/desktop lint"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}

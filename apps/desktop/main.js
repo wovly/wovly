@@ -1,0 +1,5719 @@
+const { app, BrowserWindow, ipcMain } = require("electron");
+const path = require("path");
+const fs = require("fs/promises");
+const os = require("os");
+const http = require("http");
+const { URL, URLSearchParams } = require("url");
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
+const QRCode = require("qrcode");
+
+let win;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WhatsApp State
+// ─────────────────────────────────────────────────────────────────────────────
+let whatsappSocket = null;
+let whatsappQR = null;
+let whatsappStatus = "disconnected"; // disconnected, connecting, connected, qr_ready
+let whatsappSelfChatJid = null; // JID for the self-chat (to sync messages)
+let whatsappAuthState = null;
+let whatsappSaveCreds = null;
+
+const getWovlyDir = async () => {
+  const dir = path.join(os.homedir(), ".wovly-assistant");
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+};
+
+const getSettingsPath = async () => {
+  const dir = await getWovlyDir();
+  return path.join(dir, "settings.json");
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Memory System - Date Helpers and Paths
+// ─────────────────────────────────────────────────────────────────────────────
+
+const getMemoryDailyDir = async () => {
+  const dir = await getWovlyDir();
+  const dailyDir = path.join(dir, "memory", "daily");
+  await fs.mkdir(dailyDir, { recursive: true });
+  return dailyDir;
+};
+
+const getMemoryLongtermDir = async () => {
+  const dir = await getWovlyDir();
+  const longtermDir = path.join(dir, "memory", "longterm");
+  await fs.mkdir(longtermDir, { recursive: true });
+  return longtermDir;
+};
+
+// Get date string in YYYY-MM-DD format
+const getTodayDate = () => new Date().toISOString().split('T')[0];
+
+const getYesterdayDate = () => {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  return d.toISOString().split('T')[0];
+};
+
+// Check if a date string (YYYY-MM-DD) is older than N days
+const isOlderThanDays = (dateStr, days) => {
+  const fileDate = new Date(dateStr + 'T00:00:00');
+  const cutoff = new Date();
+  cutoff.setHours(0, 0, 0, 0);
+  cutoff.setDate(cutoff.getDate() - days);
+  return fileDate < cutoff;
+};
+
+// Check if a date string is within the last N days (but not today/yesterday)
+const isWithinDaysRange = (dateStr, minDays, maxDays) => {
+  const fileDate = new Date(dateStr + 'T00:00:00');
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  
+  const minCutoff = new Date(now);
+  minCutoff.setDate(minCutoff.getDate() - minDays);
+  
+  const maxCutoff = new Date(now);
+  maxCutoff.setDate(maxCutoff.getDate() - maxDays);
+  
+  return fileDate < minCutoff && fileDate >= maxCutoff;
+};
+
+// Extract summary from memory file (if exists)
+const extractSummaryFromMemory = (content) => {
+  const match = content.match(/## Summary\n([\s\S]*?)\n---/);
+  return match ? match[1].trim() : null;
+};
+
+// Check if memory file has a summary section
+const hasSummarySection = (content) => {
+  return content.includes('## Summary\n');
+};
+
+// Generate summary for a memory file using LLM
+const generateMemorySummary = async (content, apiKey) => {
+  if (!apiKey) {
+    console.log("[Memory] No API key for summarization");
+    return null;
+  }
+
+  const prompt = `Analyze this conversation log and create a concise summary. Extract:
+- Key facts learned about the user
+- Decisions made
+- Appointments or events discussed
+- Problems or issues mentioned
+- Tasks created
+- Important questions asked and answers given
+
+Be concise but capture important details. Format as bullet points.
+
+Conversation log:
+${content}`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+
+    if (!response.ok) {
+      console.error("[Memory] Summary generation failed:", response.status);
+      return null;
+    }
+
+    const result = await response.json();
+    const summaryText = result.content.find(b => b.type === "text")?.text || "";
+    return summaryText;
+  } catch (err) {
+    console.error("[Memory] Summary generation error:", err.message);
+    return null;
+  }
+};
+
+// Process old memory files on startup - summarize and move to longterm
+const processOldMemoryFiles = async () => {
+  console.log("[Memory] Processing old memory files...");
+  
+  // Get API key for summarization
+  let apiKey = null;
+  try {
+    const settingsPath = await getSettingsPath();
+    const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+    apiKey = settings.apiKeys?.anthropic;
+  } catch {
+    console.log("[Memory] No API key configured, skipping summarization");
+    return;
+  }
+
+  if (!apiKey) {
+    console.log("[Memory] No Anthropic API key, skipping summarization");
+    return;
+  }
+
+  const dailyDir = await getMemoryDailyDir();
+  const longtermDir = await getMemoryLongtermDir();
+  const today = getTodayDate();
+  const yesterday = getYesterdayDate();
+
+  let files;
+  try {
+    files = await fs.readdir(dailyDir);
+  } catch {
+    console.log("[Memory] No daily memory directory yet");
+    return;
+  }
+
+  // Filter to only .md files and sort by date
+  const mdFiles = files.filter(f => f.endsWith('.md')).sort();
+
+  for (const file of mdFiles) {
+    const dateStr = file.replace('.md', '');
+    
+    // Skip today and yesterday - keep in daily
+    if (dateStr === today || dateStr === yesterday) {
+      console.log(`[Memory] Keeping ${file} in daily (recent)`);
+      continue;
+    }
+
+    // Check if older than 1 day
+    if (!isOlderThanDays(dateStr, 1)) {
+      continue;
+    }
+
+    const filePath = path.join(dailyDir, file);
+    let content;
+    try {
+      content = await fs.readFile(filePath, "utf8");
+    } catch {
+      continue;
+    }
+
+    // Check if already has summary
+    if (hasSummarySection(content)) {
+      console.log(`[Memory] ${file} already has summary, moving to longterm`);
+      // Just move it
+      const destPath = path.join(longtermDir, file);
+      await fs.rename(filePath, destPath);
+      continue;
+    }
+
+    // Generate summary
+    console.log(`[Memory] Generating summary for ${file}...`);
+    const summary = await generateMemorySummary(content, apiKey);
+    
+    if (summary) {
+      // Prepend summary to file
+      const newContent = `## Summary\n${summary}\n\n---\n\n${content}`;
+      
+      // Write to longterm location
+      const destPath = path.join(longtermDir, file);
+      await fs.writeFile(destPath, newContent, "utf8");
+      
+      // Remove from daily
+      await fs.unlink(filePath);
+      
+      console.log(`[Memory] Summarized and moved ${file} to longterm`);
+    } else {
+      console.log(`[Memory] Could not generate summary for ${file}, keeping in daily`);
+    }
+  }
+
+  console.log("[Memory] Finished processing old memory files");
+};
+
+// Load conversation context for LLM - today, yesterday, and recent summaries
+const loadConversationContext = async () => {
+  const dailyDir = await getMemoryDailyDir();
+  const longtermDir = await getMemoryLongtermDir();
+  const today = getTodayDate();
+  const yesterday = getYesterdayDate();
+
+  let todayMessages = "";
+  let yesterdayMessages = "";
+  let recentSummaries = "";
+
+  // Load today's messages
+  try {
+    const todayPath = path.join(dailyDir, `${today}.md`);
+    todayMessages = await fs.readFile(todayPath, "utf8");
+  } catch {
+    // No messages today yet
+  }
+
+  // Load yesterday's messages
+  try {
+    const yesterdayPath = path.join(dailyDir, `${yesterday}.md`);
+    yesterdayMessages = await fs.readFile(yesterdayPath, "utf8");
+  } catch {
+    // Try longterm (may have been moved)
+    try {
+      const yesterdayLongtermPath = path.join(longtermDir, `${yesterday}.md`);
+      const content = await fs.readFile(yesterdayLongtermPath, "utf8");
+      // Extract just the summary if available, otherwise use full content
+      const summary = extractSummaryFromMemory(content);
+      yesterdayMessages = summary || content;
+    } catch {
+      // No messages yesterday
+    }
+  }
+
+  // Load summaries from longterm (2-14 days ago)
+  try {
+    const longtermFiles = await fs.readdir(longtermDir);
+    const summaryParts = [];
+
+    for (const file of longtermFiles.sort().reverse()) {
+      if (!file.endsWith('.md')) continue;
+      
+      const dateStr = file.replace('.md', '');
+      
+      // Skip if it's yesterday (already loaded above)
+      if (dateStr === yesterday) continue;
+      
+      // Only include files from 2-14 days ago
+      if (!isWithinDaysRange(dateStr, 2, 14)) continue;
+
+      try {
+        const filePath = path.join(longtermDir, file);
+        const content = await fs.readFile(filePath, "utf8");
+        const summary = extractSummaryFromMemory(content);
+        
+        if (summary) {
+          summaryParts.push(`**${dateStr}:**\n${summary}`);
+        }
+      } catch {
+        // Skip unreadable files
+      }
+    }
+
+    recentSummaries = summaryParts.join("\n\n");
+  } catch {
+    // No longterm directory yet
+  }
+
+  return { todayMessages, yesterdayMessages, recentSummaries };
+};
+
+const getUserProfilePath = async () => {
+  const dir = await getWovlyDir();
+  const profilesDir = path.join(dir, "profiles");
+  await fs.mkdir(profilesDir, { recursive: true });
+  
+  // Look for existing profile or create one
+  try {
+    const files = await fs.readdir(profilesDir);
+    const profileFile = files.find(f => f.endsWith(".md"));
+    if (profileFile) {
+      return path.join(profilesDir, profileFile);
+    }
+  } catch {
+    // Directory doesn't exist yet
+  }
+  
+  // Create a new profile
+  const userId = require("crypto").randomUUID();
+  const profilePath = path.join(profilesDir, `${userId}.md`);
+  const defaultProfile = `# User Profile
+
+## Basic Info
+- **First Name**: User
+- **Last Name**: 
+- **Email**: 
+- **Date of Birth**: 
+- **City**: 
+
+## Life Context
+- **Occupation**: 
+- **Home Life**: 
+
+## Personal Notes
+
+## System
+- **User ID**: ${userId}
+- **Created**: ${new Date().toISOString()}
+- **Onboarding Completed**: false
+`;
+  await fs.writeFile(profilePath, defaultProfile, "utf8");
+  return profilePath;
+};
+
+// Parse user profile markdown
+const parseUserProfile = (markdown) => {
+  const profile = {
+    firstName: "",
+    lastName: "",
+    email: "",
+    dateOfBirth: "",
+    city: "",
+    occupation: "",
+    homeLife: "",
+    userId: "",
+    created: "",
+    onboardingCompleted: false,
+    notes: [] // Custom facts and notes
+  };
+
+  const lines = markdown.split("\n");
+  let inNotesSection = false;
+  
+  for (const line of lines) {
+    // Check if we're entering the Notes section
+    if (line.match(/^##\s*Notes/i) || line.match(/^##\s*Personal Notes/i) || line.match(/^##\s*Custom Facts/i)) {
+      inNotesSection = true;
+      continue;
+    }
+    
+    // Check if we're leaving notes section (another ## header)
+    if (inNotesSection && line.match(/^##\s/)) {
+      inNotesSection = false;
+    }
+    
+    // Parse notes as bullet points
+    if (inNotesSection) {
+      const noteMatch = line.match(/^\s*-\s+(.+)$/);
+      if (noteMatch) {
+        profile.notes.push(noteMatch[1].trim());
+      }
+      continue;
+    }
+    
+    // Parse structured fields
+    const match = line.match(/^\s*-\s*\*\*([^*]+)\*\*:\s*(.*)$/);
+    if (match) {
+      const key = match[1].trim();
+      const value = match[2].trim();
+      
+      switch (key) {
+        case "First Name": profile.firstName = value; break;
+        case "Last Name": profile.lastName = value; break;
+        case "Email": profile.email = value; break;
+        case "Date of Birth": profile.dateOfBirth = value; break;
+        case "City": profile.city = value; break;
+        case "Occupation": profile.occupation = value; break;
+        case "Home Life": profile.homeLife = value; break;
+        case "User ID": profile.userId = value; break;
+        case "Created": profile.created = value; break;
+        case "Onboarding Completed": profile.onboardingCompleted = value.toLowerCase() === "true"; break;
+      }
+    }
+  }
+  return profile;
+};
+
+// Serialize profile back to markdown
+const serializeUserProfile = (profile) => {
+  let markdown = `# User Profile
+
+## Basic Info
+- **First Name**: ${profile.firstName || ""}
+- **Last Name**: ${profile.lastName || ""}
+- **Email**: ${profile.email || ""}
+- **Date of Birth**: ${profile.dateOfBirth || ""}
+- **City**: ${profile.city || ""}
+
+## Life Context
+- **Occupation**: ${profile.occupation || ""}
+- **Home Life**: ${profile.homeLife || ""}
+
+## Personal Notes
+`;
+
+  // Add notes
+  if (profile.notes && profile.notes.length > 0) {
+    for (const note of profile.notes) {
+      markdown += `- ${note}\n`;
+    }
+  }
+
+  markdown += `
+## System
+- **User ID**: ${profile.userId || ""}
+- **Created**: ${profile.created || ""}
+- **Onboarding Completed**: ${profile.onboardingCompleted ? "true" : "false"}
+`;
+
+  return markdown;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Skills Storage Functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+const getSkillsDir = async () => {
+  const dir = await getWovlyDir();
+  const skillsDir = path.join(dir, "skills");
+  await fs.mkdir(skillsDir, { recursive: true });
+  return skillsDir;
+};
+
+// Parse skill markdown into structured object
+const parseSkill = (markdown, filename) => {
+  const skill = {
+    id: filename.replace(".md", ""),
+    name: "",
+    description: "",
+    keywords: [],
+    procedure: [],
+    constraints: [],
+    tools: []
+  };
+
+  const lines = markdown.split("\n");
+  let currentSection = null;
+
+  for (const line of lines) {
+    // Get skill name from title
+    if (line.startsWith("# ")) {
+      skill.name = line.slice(2).trim();
+      continue;
+    }
+
+    // Detect section headers
+    if (line.startsWith("## ")) {
+      currentSection = line.slice(3).trim().toLowerCase();
+      continue;
+    }
+
+    // Parse content based on current section
+    if (currentSection === "description") {
+      if (line.trim()) {
+        skill.description += (skill.description ? " " : "") + line.trim();
+      }
+    } else if (currentSection === "keywords") {
+      if (line.trim()) {
+        // Keywords are comma-separated
+        const keywords = line.split(",").map(k => k.trim().toLowerCase()).filter(k => k);
+        skill.keywords.push(...keywords);
+      }
+    } else if (currentSection === "procedure") {
+      // Parse numbered list items
+      const match = line.match(/^\d+\.\s+(.+)$/);
+      if (match) {
+        skill.procedure.push(match[1].trim());
+      }
+    } else if (currentSection === "constraints") {
+      // Parse bullet points
+      const match = line.match(/^[-*]\s+(.+)$/);
+      if (match) {
+        skill.constraints.push(match[1].trim());
+      }
+    } else if (currentSection === "tools") {
+      if (line.trim()) {
+        // Tools are comma-separated
+        const tools = line.split(",").map(t => t.trim()).filter(t => t);
+        skill.tools.push(...tools);
+      }
+    }
+  }
+
+  return skill;
+};
+
+// Serialize skill object to markdown
+const serializeSkill = (skill) => {
+  let markdown = `# ${skill.name}
+
+## Description
+${skill.description}
+
+## Keywords
+${skill.keywords.join(", ")}
+
+## Procedure
+${skill.procedure.map((step, i) => `${i + 1}. ${step}`).join("\n")}
+
+## Constraints
+${skill.constraints.map(c => `- ${c}`).join("\n")}
+
+## Tools
+${skill.tools.join(", ")}
+`;
+  return markdown;
+};
+
+// Load all skills from the skills directory
+const loadAllSkills = async () => {
+  const skillsDir = await getSkillsDir();
+  const skills = [];
+
+  try {
+    const files = await fs.readdir(skillsDir);
+    const mdFiles = files.filter(f => f.endsWith(".md"));
+
+    for (const file of mdFiles) {
+      try {
+        const filePath = path.join(skillsDir, file);
+        const content = await fs.readFile(filePath, "utf8");
+        const skill = parseSkill(content, file);
+        if (skill.name && skill.description) {
+          skills.push(skill);
+        }
+      } catch (err) {
+        console.error(`[Skills] Error loading ${file}:`, err.message);
+      }
+    }
+  } catch {
+    // Skills directory may not exist yet
+  }
+
+  return skills;
+};
+
+// Get a single skill by ID
+const getSkill = async (skillId) => {
+  const skillsDir = await getSkillsDir();
+  const filePath = path.join(skillsDir, `${skillId}.md`);
+  
+  try {
+    const content = await fs.readFile(filePath, "utf8");
+    return parseSkill(content, `${skillId}.md`);
+  } catch {
+    return null;
+  }
+};
+
+// Save a skill (create or update)
+const saveSkill = async (skillId, content) => {
+  const skillsDir = await getSkillsDir();
+  const filePath = path.join(skillsDir, `${skillId}.md`);
+  await fs.writeFile(filePath, content, "utf8");
+  return parseSkill(content, `${skillId}.md`);
+};
+
+// Delete a skill
+const deleteSkill = async (skillId) => {
+  const skillsDir = await getSkillsDir();
+  const filePath = path.join(skillsDir, `${skillId}.md`);
+  await fs.unlink(filePath);
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Skill Router - Match user queries to skills
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Extract keywords from user query for matching
+const extractQueryKeywords = (query) => {
+  // Convert to lowercase and remove punctuation
+  const cleaned = query.toLowerCase().replace(/[^\w\s]/g, " ");
+  // Split into words and filter out common stop words
+  const stopWords = new Set([
+    "i", "me", "my", "we", "our", "you", "your", "it", "its", "the", "a", "an",
+    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "could", "should", "can", "may",
+    "to", "of", "in", "for", "on", "with", "at", "by", "from", "as", "into",
+    "about", "like", "through", "after", "over", "between", "out", "against",
+    "during", "without", "before", "under", "around", "among", "this", "that",
+    "these", "those", "then", "just", "so", "than", "too", "very", "now",
+    "want", "need", "please", "help", "me", "can", "could", "would"
+  ]);
+  
+  const words = cleaned.split(/\s+/).filter(w => w.length > 2 && !stopWords.has(w));
+  return [...new Set(words)];
+};
+
+// Calculate keyword match score between query and skill
+const calculateSkillScore = (queryKeywords, skill) => {
+  if (!skill.keywords || skill.keywords.length === 0) return 0;
+  
+  let matchCount = 0;
+  const skillKeywords = skill.keywords.map(k => k.toLowerCase());
+  
+  for (const queryWord of queryKeywords) {
+    // Check exact match
+    if (skillKeywords.includes(queryWord)) {
+      matchCount += 2; // Exact match worth more
+      continue;
+    }
+    
+    // Check partial match (skill keyword contains query word or vice versa)
+    for (const skillWord of skillKeywords) {
+      if (skillWord.includes(queryWord) || queryWord.includes(skillWord)) {
+        matchCount += 1;
+        break;
+      }
+    }
+  }
+  
+  // Also check description for matches
+  const descWords = skill.description.toLowerCase().split(/\s+/);
+  for (const queryWord of queryKeywords) {
+    if (descWords.some(dw => dw.includes(queryWord) || queryWord.includes(dw))) {
+      matchCount += 0.5;
+    }
+  }
+  
+  // Normalize score (0-1 range)
+  const maxPossibleScore = queryKeywords.length * 2.5;
+  return matchCount / maxPossibleScore;
+};
+
+// Find the best matching skill for a user query
+const findBestSkill = async (userQuery, skills = null) => {
+  // Load skills if not provided
+  if (!skills) {
+    skills = await loadAllSkills();
+  }
+  
+  if (skills.length === 0) {
+    return null;
+  }
+  
+  const queryKeywords = extractQueryKeywords(userQuery);
+  console.log(`[Skills] Query keywords: ${queryKeywords.join(", ")}`);
+  
+  if (queryKeywords.length === 0) {
+    return null;
+  }
+  
+  // Score each skill
+  let bestSkill = null;
+  let bestScore = 0;
+  
+  for (const skill of skills) {
+    const score = calculateSkillScore(queryKeywords, skill);
+    console.log(`[Skills] ${skill.name}: score ${score.toFixed(2)}`);
+    
+    if (score > bestScore) {
+      bestScore = score;
+      bestSkill = skill;
+    }
+  }
+  
+  // Only return if confidence is above threshold
+  const CONFIDENCE_THRESHOLD = 0.3;
+  if (bestScore >= CONFIDENCE_THRESHOLD && bestSkill) {
+    console.log(`[Skills] Best match: ${bestSkill.name} (confidence: ${bestScore.toFixed(2)})`);
+    return { skill: bestSkill, confidence: bestScore };
+  }
+  
+  console.log(`[Skills] No skill matched with sufficient confidence`);
+  return null;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task Storage Functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+const getTasksDir = async () => {
+  const dir = await getWovlyDir();
+  const tasksDir = path.join(dir, "tasks");
+  await fs.mkdir(tasksDir, { recursive: true });
+  return tasksDir;
+};
+
+// Parse task markdown into structured object
+const parseTaskMarkdown = (markdown, taskId) => {
+  const task = {
+    id: taskId,
+    title: "",
+    status: "pending",
+    created: "",
+    lastUpdated: "",
+    nextCheck: null,
+    hidden: false,
+    originalRequest: "",
+    plan: [],
+    currentStep: {
+      step: 1,
+      description: "",
+      state: "pending",
+      pollInterval: null
+    },
+    executionLog: [],
+    contextMemory: {}
+  };
+
+  const lines = markdown.split("\n");
+  let currentSection = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Detect section headers
+    if (line.startsWith("## ")) {
+      currentSection = line.replace("## ", "").trim().toLowerCase();
+      continue;
+    }
+
+    // Parse title from first H1
+    if (line.startsWith("# Task:")) {
+      task.title = line.replace("# Task:", "").trim();
+      continue;
+    }
+
+    // Parse metadata section
+    if (currentSection === "metadata") {
+      const match = line.match(/^\s*-\s*\*\*([^*]+)\*\*:\s*(.*)$/);
+      if (match) {
+        const key = match[1].trim().toLowerCase();
+        const value = match[2].trim();
+        switch (key) {
+          case "status": task.status = value; break;
+          case "created": task.created = value; break;
+          case "last updated": task.lastUpdated = value; break;
+          case "next check": task.nextCheck = value ? new Date(value.split(" ")[0]).getTime() : null; break;
+          case "hidden": task.hidden = value.toLowerCase() === "true"; break;
+        }
+      }
+    }
+
+    // Parse original request
+    if (currentSection === "original request") {
+      if (line.trim() && !line.startsWith("#")) {
+        task.originalRequest += (task.originalRequest ? "\n" : "") + line;
+      }
+    }
+
+    // Parse plan (numbered list)
+    if (currentSection === "plan") {
+      const planMatch = line.match(/^\d+\.\s+(.+)$/);
+      if (planMatch) {
+        task.plan.push(planMatch[1]);
+      }
+    }
+
+    // Parse current step
+    if (currentSection === "current step") {
+      if (line.startsWith("Step:")) {
+        task.currentStep.step = parseInt(line.replace("Step:", "").trim()) || 1;
+      } else if (line.startsWith("Description:")) {
+        task.currentStep.description = line.replace("Description:", "").trim();
+      } else if (line.startsWith("State:")) {
+        task.currentStep.state = line.replace("State:", "").trim();
+      } else if (line.startsWith("Poll Interval:")) {
+        const intervalStr = line.replace("Poll Interval:", "").trim();
+        task.currentStep.pollInterval = parseInt(intervalStr) || null;
+      }
+    }
+
+    // Parse execution log
+    if (currentSection === "execution log") {
+      const logMatch = line.match(/^\s*-\s*\[([^\]]+)\]\s*(.+)$/);
+      if (logMatch) {
+        task.executionLog.push({
+          timestamp: logMatch[1],
+          message: logMatch[2]
+        });
+      }
+    }
+
+    // Parse context memory
+    if (currentSection === "context memory") {
+      const contextMatch = line.match(/^\s*-\s*([^:]+):\s*(.+)$/);
+      if (contextMatch) {
+        task.contextMemory[contextMatch[1].trim()] = contextMatch[2].trim();
+      }
+    }
+  }
+
+  return task;
+};
+
+// Serialize task object to markdown
+const serializeTask = (task) => {
+  let markdown = `# Task: ${task.title || task.id}
+
+## Metadata
+- **Status**: ${task.status || "pending"}
+- **Created**: ${task.created || new Date().toISOString()}
+- **Last Updated**: ${task.lastUpdated || new Date().toISOString()}
+- **Next Check**: ${task.nextCheck ? new Date(task.nextCheck).toISOString() : ""}
+- **Hidden**: ${task.hidden ? "true" : "false"}
+
+## Original Request
+${task.originalRequest || ""}
+
+## Plan
+`;
+
+  // Add numbered plan steps
+  if (task.plan && task.plan.length > 0) {
+    task.plan.forEach((step, index) => {
+      markdown += `${index + 1}. ${step}\n`;
+    });
+  }
+
+  markdown += `
+## Current Step
+Step: ${task.currentStep?.step || 1}
+Description: ${task.currentStep?.description || ""}
+State: ${task.currentStep?.state || "pending"}
+Poll Interval: ${task.currentStep?.pollInterval || ""}
+
+## Execution Log
+`;
+
+  // Add execution log entries
+  if (task.executionLog && task.executionLog.length > 0) {
+    task.executionLog.forEach(entry => {
+      markdown += `- [${entry.timestamp}] ${entry.message}\n`;
+    });
+  }
+
+  markdown += `
+## Context Memory
+`;
+
+  // Add context memory entries
+  if (task.contextMemory) {
+    for (const [key, value] of Object.entries(task.contextMemory)) {
+      markdown += `- ${key}: ${value}\n`;
+    }
+  }
+
+  return markdown;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task Manager Functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Create a new task and save to markdown file
+const createTask = async (taskData) => {
+  const tasksDir = await getTasksDir();
+  const taskId = `${taskData.title?.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 30) || "task"}-${require("crypto").randomUUID().slice(0, 8)}`;
+  
+  // Auto-detect messaging channel from original request if not provided
+  let messagingChannel = taskData.messagingChannel;
+  if (!messagingChannel && taskData.originalRequest) {
+    const request = taskData.originalRequest.toLowerCase();
+    if (request.includes("text") || request.includes("imessage") || request.includes("sms") || request.match(/\bmessage\b/)) {
+      messagingChannel = "imessage";
+    } else if (request.includes("slack")) {
+      messagingChannel = "slack";
+    } else if (request.includes("email") || request.includes("mail")) {
+      messagingChannel = "email";
+    }
+  }
+  
+  // Try to match a skill to the original request
+  let matchedSkill = null;
+  let skillPlan = taskData.plan || [];
+  let skillContext = {};
+  
+  try {
+    const skills = await loadAllSkills();
+    if (skills.length > 0 && taskData.originalRequest) {
+      const result = await findBestSkill(taskData.originalRequest, skills);
+      if (result && result.confidence >= 0.3) {
+        matchedSkill = result.skill;
+        // ALWAYS use skill procedure when a skill matches - skills are the authoritative SOPs
+        if (matchedSkill.procedure && matchedSkill.procedure.length > 0) {
+          skillPlan = matchedSkill.procedure;
+          console.log(`[Tasks] Using skill "${matchedSkill.name}" procedure as task plan (${skillPlan.length} steps)`);
+        }
+        skillContext = {
+          skill_name: matchedSkill.name,
+          skill_constraints: matchedSkill.constraints.join("; ")
+        };
+      }
+    }
+  } catch (err) {
+    console.error(`[Tasks] Error matching skill:`, err.message);
+  }
+  
+  const task = {
+    id: taskId,
+    title: taskData.title || "Untitled Task",
+    status: "active",
+    created: new Date().toISOString(),
+    lastUpdated: new Date().toISOString(),
+    nextCheck: null,
+    originalRequest: taskData.originalRequest || "",
+    messagingChannel: messagingChannel || null,
+    plan: skillPlan,
+    currentStep: {
+      step: 1,
+      description: skillPlan[0] || "",
+      state: "active",
+      pollInterval: null
+    },
+    executionLog: [{
+      timestamp: new Date().toISOString(),
+      message: `Task created and starting execution${messagingChannel ? ` (using ${messagingChannel})` : ""}${matchedSkill ? ` (skill: ${matchedSkill.name})` : ""}`
+    }],
+    contextMemory: {
+      ...taskData.context,
+      ...(messagingChannel ? { messaging_channel: messagingChannel } : {}),
+      ...skillContext
+    }
+  };
+
+  const markdown = serializeTask(task);
+  const taskPath = path.join(tasksDir, `${taskId}.md`);
+  await fs.writeFile(taskPath, markdown, "utf8");
+  
+  console.log(`[Tasks] Created task: ${taskId}`);
+  return task;
+};
+
+// Get a single task by ID
+const getTask = async (taskId) => {
+  const tasksDir = await getTasksDir();
+  const taskPath = path.join(tasksDir, `${taskId}.md`);
+  
+  try {
+    const markdown = await fs.readFile(taskPath, "utf8");
+    return parseTaskMarkdown(markdown, taskId);
+  } catch (err) {
+    console.error(`[Tasks] Failed to read task ${taskId}:`, err.message);
+    return null;
+  }
+};
+
+// Update a task with new data
+const updateTask = async (taskId, updates) => {
+  const task = await getTask(taskId);
+  if (!task) {
+    return { error: `Task ${taskId} not found` };
+  }
+
+  // Merge updates
+  if (updates.status !== undefined) task.status = updates.status;
+  if (updates.nextCheck !== undefined) task.nextCheck = updates.nextCheck;
+  if (updates.hidden !== undefined) task.hidden = updates.hidden;
+  if (updates.currentStep) {
+    task.currentStep = { ...task.currentStep, ...updates.currentStep };
+  }
+  if (updates.contextMemory) {
+    task.contextMemory = { ...task.contextMemory, ...updates.contextMemory };
+  }
+  if (updates.plan) {
+    task.plan = updates.plan;
+  }
+  
+  // Add execution log entry if provided
+  if (updates.logEntry) {
+    task.executionLog.push({
+      timestamp: new Date().toISOString(),
+      message: updates.logEntry
+    });
+  }
+
+  task.lastUpdated = new Date().toISOString();
+
+  // Save updated task
+  const tasksDir = await getTasksDir();
+  const taskPath = path.join(tasksDir, `${taskId}.md`);
+  await fs.writeFile(taskPath, serializeTask(task), "utf8");
+  
+  console.log(`[Tasks] Updated task: ${taskId}`);
+  return task;
+};
+
+// List all tasks
+const listTasks = async () => {
+  const tasksDir = await getTasksDir();
+  
+  try {
+    const files = await fs.readdir(tasksDir);
+    const tasks = [];
+    
+    for (const file of files) {
+      if (file.endsWith(".md")) {
+        const taskId = file.replace(".md", "");
+        const task = await getTask(taskId);
+        if (task) {
+          tasks.push(task);
+        }
+      }
+    }
+    
+    // Filter out hidden tasks and sort by lastUpdated descending
+    const visibleTasks = tasks.filter(t => !t.hidden);
+    visibleTasks.sort((a, b) => new Date(b.lastUpdated) - new Date(a.lastUpdated));
+    return visibleTasks;
+  } catch (err) {
+    console.error("[Tasks] Failed to list tasks:", err.message);
+    return [];
+  }
+};
+
+// List only active/waiting tasks (for scheduler)
+const listActiveTasks = async () => {
+  const tasks = await listTasks();
+  return tasks.filter(t => t.status === "active" || t.status === "waiting");
+};
+
+// Cancel a task
+const cancelTask = async (taskId) => {
+  const task = await getTask(taskId);
+  if (!task) {
+    return { error: `Task ${taskId} not found` };
+  }
+
+  await updateTask(taskId, {
+    status: "cancelled",
+    logEntry: "Task cancelled by user"
+  });
+  
+  console.log(`[Tasks] Cancelled task: ${taskId}`);
+  return { success: true };
+};
+
+// Hide a task from UI (keeps the file)
+const hideTask = async (taskId) => {
+  const task = await getTask(taskId);
+  if (!task) {
+    return { error: `Task ${taskId} not found` };
+  }
+
+  await updateTask(taskId, {
+    hidden: true,
+    logEntry: "Task hidden from UI"
+  });
+  
+  console.log(`[Tasks] Hidden task: ${taskId}`);
+  return { success: true };
+};
+
+// Get raw markdown for editing
+const getTaskRawMarkdown = async (taskId) => {
+  const tasksDir = await getTasksDir();
+  const taskPath = path.join(tasksDir, `${taskId}.md`);
+  
+  try {
+    return await fs.readFile(taskPath, "utf8");
+  } catch (err) {
+    return { error: `Task ${taskId} not found` };
+  }
+};
+
+// Save raw markdown with basic validation
+const saveTaskRawMarkdown = async (taskId, markdown) => {
+  // Basic validation - ensure required sections exist
+  if (!markdown.includes("## Metadata") || !markdown.includes("**Status**")) {
+    return { error: "Invalid markdown format: Missing required Metadata section or Status field" };
+  }
+
+  const tasksDir = await getTasksDir();
+  const taskPath = path.join(tasksDir, `${taskId}.md`);
+  
+  try {
+    await fs.writeFile(taskPath, markdown, "utf8");
+    console.log(`[Tasks] Saved raw markdown for task: ${taskId}`);
+    return { success: true };
+  } catch (err) {
+    return { error: `Failed to save: ${err.message}` };
+  }
+};
+
+// Track task updates for notifications
+let taskUpdates = [];
+const addTaskUpdate = (taskId, message) => {
+  taskUpdates.push({
+    taskId,
+    message,
+    timestamp: new Date().toISOString()
+  });
+  // Keep only last 50 updates
+  if (taskUpdates.length > 50) {
+    taskUpdates = taskUpdates.slice(-50);
+  }
+  // Notify renderer
+  if (win) {
+    win.webContents.send("task:update", { taskId, message });
+  }
+};
+
+const getTaskUpdates = () => {
+  const updates = [...taskUpdates];
+  taskUpdates = []; // Clear after reading
+  return updates;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task Scheduler
+// ─────────────────────────────────────────────────────────────────────────────
+
+let taskSchedulerInterval = null;
+
+// Forward declaration - will be defined later after executeTaskStep
+const startTaskScheduler = () => {
+  if (taskSchedulerInterval) {
+    clearInterval(taskSchedulerInterval);
+  }
+
+  // Poll every 60 seconds - lightweight checks are cheap, only run LLM when needed
+  console.log("[Tasks] Starting task scheduler (checking every 60 seconds)");
+  
+  taskSchedulerInterval = setInterval(async () => {
+    try {
+      const tasks = await listActiveTasks();
+      const googleAccessToken = await getGoogleAccessToken();
+      const slackAccessToken = await getSlackAccessToken();
+      
+      const waitingTasks = tasks.filter(t => t.status === "waiting");
+      if (waitingTasks.length > 0) {
+        console.log(`[Tasks] Scheduler tick: ${waitingTasks.length} waiting tasks`);
+      }
+      
+      for (const task of tasks) {
+        // Check if task needs execution
+        if (task.status === "waiting" && task.nextCheck && Date.now() >= task.nextCheck) {
+          console.log(`[Tasks] Processing task ${task.id}: nextCheck was ${new Date(task.nextCheck).toISOString()}`);
+          
+          // Check for unified messaging context (new system)
+          const waitingVia = task.contextMemory?.waiting_via;
+          const waitingForContact = task.contextMemory?.waiting_for_contact;
+          const lastMessageTime = task.contextMemory?.last_message_time;
+          
+          console.log(`[Tasks] Task context: via=${waitingVia}, contact=${waitingForContact}, lastMsg=${lastMessageTime}`);
+          
+          // Also support legacy email context for backward compatibility
+          const legacyWaitingForEmail = task.contextMemory?.waiting_for_email || task.contextMemory?.email;
+          const legacyLastCheckTime = task.contextMemory?.last_email_check || task.contextMemory?.email_sent_time;
+          
+          // Try unified messaging first
+          if (waitingVia && waitingForContact && lastMessageTime) {
+            const integration = getMessagingIntegration(waitingVia);
+            
+            if (integration && integration.checkForNewMessages) {
+              // Get the appropriate access token for this integration
+              const accessToken = waitingVia === "email" ? googleAccessToken :
+                                  waitingVia === "slack" ? slackAccessToken : null;
+              
+              console.log(`[Tasks] Checking ${integration.name} for reply from ${waitingForContact}`);
+              const check = await integration.checkForNewMessages(
+                waitingForContact, 
+                new Date(lastMessageTime).getTime(),
+                accessToken
+              );
+              
+              if (!check.hasNew) {
+                // No new messages - reschedule without LLM
+                console.log(`[Tasks] No new ${integration.name} from ${waitingForContact}, rescheduling`);
+                await updateTask(task.id, {
+                  nextCheck: Date.now() + 60000,
+                  contextMemory: { ...task.contextMemory, last_check_time: new Date().toISOString() }
+                });
+                continue; // Skip to next task
+              }
+              
+              console.log(`[Tasks] New ${integration.name} from ${waitingForContact}! Running executor.`);
+              
+              // Update task context with info about new messages so executor knows a reply was received
+              await updateTask(task.id, {
+                contextMemory: { 
+                  ...task.contextMemory, 
+                  new_reply_detected: true,
+                  new_reply_count: check.count || 1,
+                  last_check_time: new Date().toISOString()
+                }
+              });
+              
+              // Proactively notify user that a reply was received
+              if (win) {
+                win.webContents.send("chat:newMessage", {
+                  role: "assistant",
+                  content: `📬 **Task: ${task.title}**\n\nReceived a reply from ${waitingForContact} via ${integration.name}! Processing now...`,
+                  source: "task"
+                });
+              }
+            }
+          }
+          // Fall back to legacy email check
+          else if (legacyWaitingForEmail && googleAccessToken && legacyLastCheckTime) {
+            console.log(`[Tasks] Legacy email check for task ${task.id}: waiting for ${legacyWaitingForEmail}`);
+            const emailCheck = await checkForNewEmails(googleAccessToken, legacyWaitingForEmail, new Date(legacyLastCheckTime).getTime());
+            
+            if (!emailCheck.hasNew) {
+              console.log(`[Tasks] No new emails from ${legacyWaitingForEmail}, rescheduling check`);
+              await updateTask(task.id, {
+                nextCheck: Date.now() + 60000,
+                contextMemory: { ...task.contextMemory, last_email_check: new Date().toISOString() }
+              });
+              continue;
+            }
+            
+            console.log(`[Tasks] New email found from ${legacyWaitingForEmail}! Running task executor.`);
+          }
+          
+          console.log(`[Tasks] Executing scheduled check for task: ${task.id}`);
+          await executeTaskStep(task.id);
+        }
+      }
+    } catch (err) {
+      console.error("[Tasks] Scheduler error:", err.message);
+    }
+  }, 60000); // Check every 60 seconds
+};
+
+const stopTaskScheduler = () => {
+  if (taskSchedulerInterval) {
+    clearInterval(taskSchedulerInterval);
+    taskSchedulerInterval = null;
+    console.log("[Tasks] Stopped task scheduler");
+  }
+};
+
+// Resume tasks on app startup
+const resumeTasksOnStartup = async () => {
+  console.log("[Tasks] Checking for tasks to resume...");
+  
+  try {
+    const tasks = await listActiveTasks();
+    
+    for (const task of tasks) {
+      if (task.status === "waiting" && task.nextCheck) {
+        // Check if we missed any polls while app was closed
+        if (Date.now() >= task.nextCheck) {
+          console.log(`[Tasks] Resuming task: ${task.id} (missed scheduled check)`);
+          await executeTaskStep(task.id);
+        } else {
+          console.log(`[Tasks] Task ${task.id} will be checked at next scheduled time`);
+        }
+      } else if (task.status === "active") {
+        console.log(`[Tasks] Task ${task.id} is active, will continue execution`);
+      }
+    }
+  } catch (err) {
+    console.error("[Tasks] Failed to resume tasks:", err.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task Executor
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Execute a single step of a task using the LLM
+// This is a placeholder that will be replaced with the full implementation in app.whenReady()
+let executeTaskStep = async (taskId) => {
+  console.log(`[Tasks] Placeholder executeTaskStep called for: ${taskId}`);
+  return { error: "Task executor not yet initialized" };
+};
+
+// This will be called from app.whenReady() to inject the real implementation
+const setTaskExecutor = (executor) => {
+  executeTaskStep = executor;
+};
+
+// Get Google access token (with refresh if needed)
+const getGoogleAccessToken = async () => {
+  const settingsPath = await getSettingsPath();
+  let settings;
+  try {
+    settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+  } catch {
+    return null;
+  }
+
+  if (!settings.googleTokens) {
+    return null;
+  }
+
+  const { access_token, refresh_token, expires_at, client_id, client_secret } = settings.googleTokens;
+
+  // Check if token is expired (with 5 min buffer)
+  if (expires_at && Date.now() > expires_at - 300000 && refresh_token) {
+    try {
+      const response = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id,
+          client_secret,
+          refresh_token,
+          grant_type: "refresh_token"
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        settings.googleTokens.access_token = data.access_token;
+        settings.googleTokens.expires_at = Date.now() + (data.expires_in * 1000);
+        await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+        return data.access_token;
+      }
+    } catch (err) {
+      console.error("Token refresh failed:", err);
+    }
+  }
+
+  return access_token;
+};
+
+// Helper to get Slack access token (moved outside app.whenReady for scheduler access)
+const getSlackAccessToken = async () => {
+  try {
+    const settingsPath = await getSettingsPath();
+    const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+    
+    if (!settings.slackTokens?.access_token) {
+      return null;
+    }
+    
+    return settings.slackTokens.access_token;
+  } catch {
+    return null;
+  }
+};
+
+// Lightweight check for new Gmail messages from a specific sender since a given timestamp
+// This is cheap (no LLM) and can be called frequently
+const checkForNewEmails = async (accessToken, fromEmail, afterTimestamp) => {
+  if (!accessToken || !fromEmail) {
+    console.log("[Tasks] Email check: missing parameters", { hasToken: !!accessToken, fromEmail });
+    return { hasNew: false, reason: "missing parameters" };
+  }
+
+  try {
+    // Use newer_than to get recent messages, then filter by actual timestamp
+    // Gmail's after: is date-only, so we need to check internalDate for same-day messages
+    const query = `from:${fromEmail} newer_than:2d`;
+    const url = new URL("https://www.googleapis.com/gmail/v1/users/me/messages");
+    url.searchParams.set("q", query);
+    url.searchParams.set("maxResults", "10");
+
+    console.log(`[Tasks] Checking emails from ${fromEmail} after ${new Date(afterTimestamp).toISOString()}`);
+
+    const response = await fetch(url.toString(), {
+      headers: { "Authorization": `Bearer ${accessToken}` }
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("[Tasks] Gmail list failed:", response.status, errorText);
+      return { hasNew: false, reason: "api_error" };
+    }
+
+    const data = await response.json();
+    const messageIds = data.messages || [];
+    
+    if (messageIds.length === 0) {
+      console.log(`[Tasks] No emails found from ${fromEmail} in last 2 days`);
+      return { hasNew: false, count: 0 };
+    }
+
+    // Check each message's actual timestamp to see if it's newer than our afterTimestamp
+    let newMessageCount = 0;
+    const newMessages = [];
+    
+    for (const msg of messageIds.slice(0, 5)) { // Check up to 5 most recent
+      try {
+        const msgUrl = `https://www.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=Date&metadataHeaders=Subject`;
+        const msgResponse = await fetch(msgUrl, {
+          headers: { "Authorization": `Bearer ${accessToken}` }
+        });
+        
+        if (msgResponse.ok) {
+          const msgData = await msgResponse.json();
+          const internalDate = parseInt(msgData.internalDate, 10); // Unix timestamp in ms
+          
+          if (internalDate > afterTimestamp) {
+            newMessageCount++;
+            const subjectHeader = msgData.payload?.headers?.find(h => h.name === "Subject");
+            newMessages.push({
+              id: msg.id,
+              timestamp: internalDate,
+              subject: subjectHeader?.value || "(no subject)"
+            });
+            console.log(`[Tasks] Found NEW email: ${subjectHeader?.value || "(no subject)"} at ${new Date(internalDate).toISOString()}`);
+          } else {
+            console.log(`[Tasks] Email too old: internalDate ${new Date(internalDate).toISOString()} <= ${new Date(afterTimestamp).toISOString()}`);
+          }
+        }
+      } catch (msgErr) {
+        console.error(`[Tasks] Error fetching message ${msg.id}:`, msgErr.message);
+      }
+    }
+    
+    console.log(`[Tasks] Email check result: ${newMessageCount} new messages from ${fromEmail}`);
+    return { 
+      hasNew: newMessageCount > 0, 
+      count: newMessageCount,
+      messages: newMessages
+    };
+  } catch (err) {
+    console.error("[Tasks] Email check error:", err.message);
+    return { hasNew: false, reason: err.message };
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unified Messaging Registry
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Messaging integrations registry - stores all messaging integrations
+const messagingIntegrations = {};
+
+// Register a messaging integration
+const registerMessagingIntegration = (integration) => {
+  messagingIntegrations[integration.id] = integration;
+  console.log(`[Messaging] Registered: ${integration.name}`);
+};
+
+// Find integration by keyword (e.g., "text" → imessage, "slack" → slack)
+const findIntegrationByKeyword = (text) => {
+  const lowerText = text.toLowerCase();
+  for (const integration of Object.values(messagingIntegrations)) {
+    if (!integration.enabled) continue;
+    for (const keyword of integration.keywords) {
+      if (lowerText.includes(keyword)) {
+        return integration;
+      }
+    }
+  }
+  return null;
+};
+
+// Get integration by ID
+const getMessagingIntegration = (id) => messagingIntegrations[id];
+
+// Get all enabled messaging integrations
+const getEnabledMessagingIntegrations = () => {
+  return Object.values(messagingIntegrations).filter(i => i.enabled);
+};
+
+// Lightweight check for new iMessages - zero cost (local SQLite query)
+const checkForNewIMessages = async (contactIdentifier, afterTimestamp) => {
+  if (!contactIdentifier) {
+    return { hasNew: false, reason: "missing contact" };
+  }
+
+  const dbPath = path.join(os.homedir(), "Library", "Messages", "chat.db");
+  
+  try {
+    await fs.access(dbPath);
+  } catch {
+    return { hasNew: false, reason: "cannot access Messages database" };
+  }
+
+  // Convert timestamp to Apple epoch (2001-01-01 based, nanoseconds)
+  const appleEpoch = new Date("2001-01-01T00:00:00Z").getTime();
+  const cutoffTimestamp = (afterTimestamp - appleEpoch) * 1000000;
+
+  // Resolve contact name to phone if needed (reuse findContactsByName from iMessage tools)
+  let phoneFilter = contactIdentifier;
+  if (/[a-zA-Z]/.test(contactIdentifier) && !/[@]/.test(contactIdentifier)) {
+    // This is a name, not a phone number or email - we'll resolve it in the query
+    // For now, just use the name as-is and match against handle.id
+  }
+
+  // Build query to count messages FROM contact (not from me) after timestamp
+  const digits = phoneFilter.replace(/\D/g, "");
+  const lastDigits = digits.slice(-10);
+  
+  // Query for messages from this contact after the cutoff time
+  const query = lastDigits 
+    ? `SELECT COUNT(*) as count FROM message m JOIN handle h ON m.handle_id = h.ROWID WHERE h.id LIKE '%${lastDigits}%' AND m.is_from_me = 0 AND m.date > ${cutoffTimestamp}`
+    : `SELECT COUNT(*) as count FROM message m JOIN handle h ON m.handle_id = h.ROWID WHERE h.id LIKE '%${contactIdentifier.replace(/'/g, "''")}%' AND m.is_from_me = 0 AND m.date > ${cutoffTimestamp}`;
+
+  return new Promise((resolve) => {
+    const { exec } = require("child_process");
+    exec(`sqlite3 "${dbPath}" "${query.replace(/"/g, '\\"')}"`, { timeout: 5000 }, (error, stdout) => {
+      if (error) {
+        console.error(`[Messaging] iMessage check error: ${error.message}`);
+        resolve({ hasNew: false, reason: error.message });
+        return;
+      }
+      const count = parseInt(stdout.trim()) || 0;
+      console.log(`[Messaging] iMessage check for ${contactIdentifier}: ${count} new messages`);
+      resolve({ hasNew: count > 0, count });
+    });
+  });
+};
+
+// Lightweight check for new Slack messages - uses Slack API
+const checkForNewSlackMessages = async (channelOrUser, afterTimestamp, accessToken) => {
+  if (!channelOrUser || !accessToken) {
+    return { hasNew: false, reason: "missing parameters" };
+  }
+
+  try {
+    // Convert timestamp to Slack format (seconds since epoch)
+    const oldest = Math.floor(afterTimestamp / 1000);
+    
+    // If it's a user name/ID, we need to find their DM channel first
+    let channelId = channelOrUser;
+    
+    // If it doesn't look like a channel ID (starts with C, D, or G), try to resolve it
+    if (!/^[CDG][A-Z0-9]+$/i.test(channelOrUser)) {
+      // Search for user and get DM channel
+      const usersResponse = await fetch(`https://slack.com/api/users.list?limit=200`, {
+        headers: { "Authorization": `Bearer ${accessToken}` }
+      });
+      const usersData = await usersResponse.json();
+      
+      if (usersData.ok && usersData.members) {
+        const user = usersData.members.find(m => 
+          m.name?.toLowerCase().includes(channelOrUser.toLowerCase()) ||
+          m.real_name?.toLowerCase().includes(channelOrUser.toLowerCase())
+        );
+        
+        if (user) {
+          // Open/get DM channel with user
+          const dmResponse = await fetch("https://slack.com/api/conversations.open", {
+            method: "POST",
+            headers: { 
+              "Authorization": `Bearer ${accessToken}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ users: user.id })
+          });
+          const dmData = await dmResponse.json();
+          if (dmData.ok && dmData.channel) {
+            channelId = dmData.channel.id;
+          }
+        }
+      }
+    }
+
+    // Now check for messages in the channel
+    const response = await fetch(
+      `https://slack.com/api/conversations.history?channel=${channelId}&oldest=${oldest}&limit=5`,
+      { headers: { "Authorization": `Bearer ${accessToken}` } }
+    );
+    
+    const data = await response.json();
+    
+    if (!data.ok) {
+      console.error(`[Messaging] Slack check error: ${data.error}`);
+      return { hasNew: false, reason: data.error };
+    }
+
+    // Count messages not from bot (filter out our own messages if possible)
+    const messageCount = data.messages?.length || 0;
+    console.log(`[Messaging] Slack check for ${channelOrUser}: ${messageCount} new messages`);
+    
+    return { hasNew: messageCount > 0, count: messageCount };
+  } catch (err) {
+    console.error(`[Messaging] Slack check error: ${err.message}`);
+    return { hasNew: false, reason: err.message };
+  }
+};
+
+// Fetch calendar events for a date range
+const fetchCalendarEvents = async (accessToken, startDate, endDate) => {
+  const calendarUrl = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
+  calendarUrl.searchParams.set("timeMin", startDate.toISOString());
+  calendarUrl.searchParams.set("timeMax", endDate.toISOString());
+  calendarUrl.searchParams.set("singleEvents", "true");
+  calendarUrl.searchParams.set("orderBy", "startTime");
+
+  const response = await fetch(calendarUrl.toString(), {
+    headers: { "Authorization": `Bearer ${accessToken}` }
+  });
+
+  if (!response.ok) {
+    throw new Error("Failed to fetch calendar events");
+  }
+
+  const data = await response.json();
+  return (data.items || []).map(event => ({
+    id: event.id,
+    title: event.summary || "(No title)",
+    start: event.start?.dateTime || event.start?.date,
+    end: event.end?.dateTime || event.end?.date,
+    location: event.location,
+    description: event.description
+  }));
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WhatsApp Connection Manager
+// ─────────────────────────────────────────────────────────────────────────────
+
+const getWhatsAppAuthDir = async () => {
+  const dir = await getWovlyDir();
+  const authDir = path.join(dir, "whatsapp-auth");
+  await fs.mkdir(authDir, { recursive: true });
+  return authDir;
+};
+
+const connectWhatsApp = async () => {
+  try {
+    whatsappStatus = "connecting";
+    notifyWhatsAppStatus();
+
+    const authDir = await getWhatsAppAuthDir();
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    whatsappAuthState = state;
+    whatsappSaveCreds = saveCreds;
+
+    const { version } = await fetchLatestBaileysVersion();
+    
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: true,
+      browser: ["Wovly", "Desktop", "1.0.0"],
+      generateHighQualityLinkPreview: false,
+      syncFullHistory: false
+    });
+
+    whatsappSocket = sock;
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        // Generate QR code as data URL
+        try {
+          whatsappQR = await QRCode.toDataURL(qr, { width: 256, margin: 2 });
+          whatsappStatus = "qr_ready";
+          notifyWhatsAppStatus();
+        } catch (err) {
+          console.error("QR code generation failed:", err);
+        }
+      }
+
+      if (connection === "close") {
+        whatsappSocket = null;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        
+        console.log("WhatsApp connection closed:", statusCode, "Reconnecting:", shouldReconnect);
+        
+        if (statusCode === DisconnectReason.loggedOut) {
+          whatsappStatus = "disconnected";
+          whatsappQR = null;
+          // Clear auth state on logout
+          try {
+            const authDir = await getWhatsAppAuthDir();
+            const files = await fs.readdir(authDir);
+            for (const file of files) {
+              await fs.unlink(path.join(authDir, file)).catch(() => {});
+            }
+          } catch (e) {
+            console.error("Failed to clear auth:", e);
+          }
+        } else {
+          whatsappStatus = "disconnected";
+          // Auto-reconnect after short delay
+          if (shouldReconnect) {
+            setTimeout(() => connectWhatsApp(), 3000);
+          }
+        }
+        notifyWhatsAppStatus();
+      }
+
+      if (connection === "open") {
+        console.log("WhatsApp connected!");
+        whatsappStatus = "connected";
+        whatsappQR = null;
+        notifyWhatsAppStatus();
+      }
+    });
+
+    // Handle incoming messages
+    sock.ev.on("messages.upsert", async (m) => {
+      if (!m.messages || m.type !== "notify") return;
+
+      // Get own JID for self-message detection
+      const ownJid = sock.user?.id || "";
+      const ownNumber = ownJid.split("@")[0].split(":")[0]; // Extract just the phone number
+      
+      console.log("WhatsApp: Message event received, own number:", ownNumber);
+
+      for (const msg of m.messages) {
+        const remoteJid = msg.key.remoteJid || "";
+        const remoteNumber = remoteJid.split("@")[0].split(":")[0];
+        const isLidChat = remoteJid.endsWith("@lid"); // Linked ID format (used for self-chat)
+        
+        console.log("WhatsApp: Processing message - fromMe:", msg.key.fromMe, "remoteJid:", remoteJid, "isLidChat:", isLidChat);
+        
+        // Skip status updates
+        if (remoteJid === "status@broadcast") {
+          console.log("WhatsApp: Skipping status broadcast");
+          continue;
+        }
+
+        // Check if this is a self-message:
+        // 1. Same phone number (traditional format)
+        // 2. OR it's a @lid chat with fromMe=true (WhatsApp's "Message yourself" feature)
+        const isSelfMessage = (ownNumber && remoteNumber === ownNumber) || (isLidChat && msg.key.fromMe);
+        console.log("WhatsApp: isSelfMessage:", isSelfMessage);
+        
+        // Store the self-chat JID for syncing messages from the app
+        if (isSelfMessage && !whatsappSelfChatJid) {
+          whatsappSelfChatJid = remoteJid;
+          console.log("WhatsApp: Stored self-chat JID:", whatsappSelfChatJid);
+        }
+        
+        // For regular chats: skip messages from self (we don't want to respond to our own messages)
+        // For self-chats: we WANT to process fromMe messages (that's how self-messaging works)
+        if (msg.key.fromMe && !isSelfMessage) {
+          console.log("WhatsApp: Skipping - fromMe is true and not self-message");
+          continue;
+        }
+
+        // Debug: log the full message structure to understand format
+        console.log("WhatsApp: Message structure:", JSON.stringify(msg.message, null, 2));
+
+        // Get the message text - try multiple possible locations
+        const text = msg.message?.conversation || 
+                     msg.message?.extendedTextMessage?.text ||
+                     msg.message?.imageMessage?.caption ||
+                     msg.message?.videoMessage?.caption ||
+                     msg.message?.buttonsResponseMessage?.selectedDisplayText ||
+                     msg.message?.listResponseMessage?.title ||
+                     msg.message?.templateButtonReplyMessage?.selectedDisplayText ||
+                     // For edited messages
+                     msg.message?.editedMessage?.message?.conversation ||
+                     msg.message?.editedMessage?.message?.extendedTextMessage?.text ||
+                     // Protocol messages sometimes wrap the actual message
+                     msg.message?.protocolMessage?.editedMessage?.message?.conversation ||
+                     msg.message?.protocolMessage?.editedMessage?.message?.extendedTextMessage?.text;
+
+        if (!text) {
+          console.log("WhatsApp: Skipping - no text content found in message");
+          continue;
+        }
+
+        // Skip if this looks like a Wovly response (to prevent loops)
+        if (text.startsWith("[Wovly]")) {
+          console.log("WhatsApp: Skipping - Wovly response (loop prevention)");
+          continue;
+        }
+
+        console.log("WhatsApp message from:", remoteJid, isSelfMessage ? "(self)" : "", ":", text);
+
+        // Notify UI about the incoming message (for sync)
+        if (win && !win.isDestroyed()) {
+          win.webContents.send("chat:newMessage", {
+            role: "user",
+            content: text,
+            source: "whatsapp",
+            timestamp: Date.now()
+          });
+        }
+
+        // Process message with LLM
+        try {
+          const response = await processWhatsAppMessage(text, remoteJid);
+          
+          // Send response back (prefix self-messages to identify Wovly responses)
+          if (response && whatsappSocket) {
+            const responseText = isSelfMessage ? `[Wovly] ${response}` : response;
+            console.log("WhatsApp: Sending response:", responseText.substring(0, 100) + "...");
+            await whatsappSocket.sendMessage(remoteJid, { text: responseText });
+            
+            // Notify UI about the AI response (for sync)
+            if (win && !win.isDestroyed()) {
+              win.webContents.send("chat:newMessage", {
+                role: "assistant",
+                content: response, // Send without [Wovly] prefix for clean display
+                source: "whatsapp",
+                timestamp: Date.now()
+              });
+            }
+          }
+        } catch (err) {
+          console.error("Error processing WhatsApp message:", err);
+        }
+      }
+    });
+
+  } catch (err) {
+    console.error("WhatsApp connection error:", err);
+    whatsappStatus = "disconnected";
+    notifyWhatsAppStatus();
+  }
+};
+
+const disconnectWhatsApp = async () => {
+  if (whatsappSocket) {
+    await whatsappSocket.logout().catch(() => {});
+    whatsappSocket = null;
+  }
+  whatsappStatus = "disconnected";
+  whatsappQR = null;
+  
+  // Clear auth state
+  try {
+    const authDir = await getWhatsAppAuthDir();
+    const files = await fs.readdir(authDir);
+    for (const file of files) {
+      await fs.unlink(path.join(authDir, file)).catch(() => {});
+    }
+  } catch (e) {
+    console.error("Failed to clear auth:", e);
+  }
+  
+  notifyWhatsAppStatus();
+};
+
+const notifyWhatsAppStatus = () => {
+  if (win && !win.isDestroyed()) {
+    win.webContents.send("whatsapp:status", {
+      status: whatsappStatus,
+      qr: whatsappQR
+    });
+  }
+};
+
+// Process incoming WhatsApp message with LLM
+const processWhatsAppMessage = async (text, senderId) => {
+  try {
+    const settingsPath = await getSettingsPath();
+    let apiKeys = {};
+    let models = {};
+    let activeProvider = "anthropic";
+    
+    try {
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      apiKeys = settings.apiKeys || {};
+      models = settings.models || {};
+      activeProvider = settings.activeProvider || "anthropic";
+    } catch {
+      return "Sorry, I'm not configured yet. Please set up an API key in the Wovly app.";
+    }
+
+    if (!apiKeys.anthropic && !apiKeys.openai && !apiKeys.google) {
+      return "Sorry, no AI provider is configured. Please add an API key in Wovly settings.";
+    }
+
+    // Get user profile for context
+    let profile = null;
+    try {
+      const profilePath = await getUserProfilePath();
+      const markdown = await fs.readFile(profilePath, "utf8");
+      profile = parseUserProfile(markdown);
+    } catch {
+      // No profile
+    }
+
+    // Build system prompt for WhatsApp context
+    let systemPrompt = `You are Wovly, a helpful AI assistant responding via WhatsApp. Keep responses concise and conversational - WhatsApp messages should be brief and to the point.`;
+
+    if (profile) {
+      systemPrompt += `\n\nUser Profile:\n- Name: ${profile.firstName} ${profile.lastName}\n- Occupation: ${profile.occupation || "Not specified"}\n- City: ${profile.city || "Not specified"}`;
+    }
+
+    // Simple message handling for WhatsApp (no tools for now to keep it fast)
+    const messages = [{ role: "user", content: text }];
+
+    // Determine which provider to use
+    const useProvider = apiKeys[activeProvider] ? activeProvider : 
+                        apiKeys.anthropic ? "anthropic" : 
+                        apiKeys.openai ? "openai" : 
+                        apiKeys.google ? "google" : null;
+
+    if (!useProvider) {
+      return "Sorry, no AI provider available.";
+    }
+
+    if (useProvider === "anthropic" && apiKeys.anthropic) {
+      const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKeys.anthropic,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model: anthropicModel,
+          max_tokens: 500, // Keep WhatsApp responses short
+          system: systemPrompt,
+          messages
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return data.content?.[0]?.text || "Sorry, I couldn't generate a response.";
+      }
+    }
+
+    if (useProvider === "openai" && apiKeys.openai) {
+      const openaiModel = models.openai || "gpt-4o";
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKeys.openai}`
+        },
+        body: JSON.stringify({
+          model: openaiModel,
+          max_tokens: 500,
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...messages
+          ]
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return data.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
+      }
+    }
+
+    if (useProvider === "google" && apiKeys.google) {
+      const geminiModel = models.google || "gemini-1.5-pro";
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKeys.google}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text }] }],
+            systemInstruction: { parts: [{ text: systemPrompt }] }
+          })
+        }
+      );
+
+      if (response.ok) {
+        const data = await response.json();
+        return data.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I couldn't generate a response.";
+      }
+    }
+
+    return "Sorry, I couldn't process your message. Please try again.";
+  } catch (err) {
+    console.error("WhatsApp message processing error:", err);
+    return "Sorry, something went wrong. Please try again.";
+  }
+};
+
+function createWindow() {
+  win = new BrowserWindow({
+    width: 1440,
+    height: 900,
+    minWidth: 1024,
+    minHeight: 700,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+
+  const isDev = !app.isPackaged;
+  if (isDev) {
+    win.loadURL("http://localhost:5173");
+    win.webContents.openDevTools();
+  } else {
+    win.loadFile(path.join(__dirname, "../ui/dist/index.html"));
+  }
+}
+
+app.whenReady().then(async () => {
+  createWindow();
+
+  // Process old memory files (summarize and move to longterm)
+  processOldMemoryFiles().catch(err => {
+    console.error("[Memory] Error processing old files:", err.message);
+  });
+
+  // Resume tasks and start scheduler
+  await resumeTasksOnStartup();
+  startTaskScheduler();
+
+  // Settings handlers
+  ipcMain.handle("settings:get", async () => {
+    try {
+      const settingsPath = await getSettingsPath();
+      const data = await fs.readFile(settingsPath, "utf8");
+      return { ok: true, settings: JSON.parse(data) };
+    } catch {
+      return { ok: true, settings: {} };
+    }
+  });
+
+  ipcMain.handle("settings:set", async (_event, { settings }) => {
+    try {
+      const settingsPath = await getSettingsPath();
+      let existing = {};
+      try {
+        existing = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch {
+        // No existing settings
+      }
+      const merged = { ...existing, ...settings };
+      await fs.writeFile(settingsPath, JSON.stringify(merged, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Profile handlers
+  ipcMain.handle("profile:get", async () => {
+    try {
+      const profilePath = await getUserProfilePath();
+      const markdown = await fs.readFile(profilePath, "utf8");
+      const profile = parseUserProfile(markdown);
+      return { ok: true, profile };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("profile:update", async (_event, { updates }) => {
+    try {
+      const profilePath = await getUserProfilePath();
+      const markdown = await fs.readFile(profilePath, "utf8");
+      const profile = parseUserProfile(markdown);
+      Object.assign(profile, updates);
+      const newMarkdown = serializeUserProfile(profile);
+      await fs.writeFile(profilePath, newMarkdown, "utf8");
+      return { ok: true, profile };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("profile:needsOnboarding", async () => {
+    try {
+      const profilePath = await getUserProfilePath();
+      const markdown = await fs.readFile(profilePath, "utf8");
+      const profile = parseUserProfile(markdown);
+      
+      const needsOnboarding = !profile.onboardingCompleted && (
+        !profile.occupation || 
+        !profile.homeLife || 
+        !profile.city
+      );
+      
+      return { ok: true, needsOnboarding, profile };
+    } catch {
+      return { ok: true, needsOnboarding: false };
+    }
+  });
+
+  // Skills handlers
+  ipcMain.handle("skills:list", async () => {
+    try {
+      const skills = await loadAllSkills();
+      return { ok: true, skills };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("skills:get", async (_event, { skillId }) => {
+    try {
+      const skillsDir = await getSkillsDir();
+      const filePath = path.join(skillsDir, `${skillId}.md`);
+      const content = await fs.readFile(filePath, "utf8");
+      const skill = parseSkill(content, `${skillId}.md`);
+      return { ok: true, skill, content };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("skills:save", async (_event, { skillId, content }) => {
+    try {
+      const skillsDir = await getSkillsDir();
+      const filePath = path.join(skillsDir, `${skillId}.md`);
+      await fs.writeFile(filePath, content, "utf8");
+      const skill = parseSkill(content, `${skillId}.md`);
+      return { ok: true, skill };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("skills:delete", async (_event, { skillId }) => {
+    try {
+      const skillsDir = await getSkillsDir();
+      const filePath = path.join(skillsDir, `${skillId}.md`);
+      await fs.unlink(filePath);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("skills:getTemplate", async () => {
+    const template = `# New Skill
+
+## Description
+Describe what this skill does and when it should be used.
+
+## Keywords
+keyword1, keyword2, keyword3
+
+## Procedure
+1. First step
+2. Second step
+3. Third step
+
+## Constraints
+- Important constraint or rule
+- Another constraint
+
+## Tools
+tool1, tool2
+`;
+    return { ok: true, template };
+  });
+
+  // LLM-powered welcome message generator
+  ipcMain.handle("welcome:generate", async () => {
+    try {
+      // Get current time info
+      const now = new Date();
+      const hour = now.getHours();
+      const dayOfWeek = now.toLocaleDateString("en-US", { weekday: "long" });
+      const dateStr = now.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+      const timeStr = now.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+
+      // Determine time of day
+      let timeOfDay;
+      if (hour >= 5 && hour < 12) {
+        timeOfDay = "morning";
+      } else if (hour >= 12 && hour < 17) {
+        timeOfDay = "afternoon";
+      } else if (hour >= 17 && hour < 21) {
+        timeOfDay = "evening";
+      } else {
+        timeOfDay = "night";
+      }
+
+      // Get user profile
+      let profile = null;
+      try {
+        const profilePath = await getUserProfilePath();
+        const markdown = await fs.readFile(profilePath, "utf8");
+        profile = parseUserProfile(markdown);
+      } catch {
+        // Profile not available
+      }
+
+      // Check if onboarding needed - return simple message if so
+      const needsOnboarding = profile && !profile.onboardingCompleted && (
+        !profile.occupation || 
+        !profile.homeLife || 
+        !profile.city
+      );
+
+      if (needsOnboarding && profile) {
+        const greeting = timeOfDay === "morning" ? "Good morning" : 
+                        timeOfDay === "afternoon" ? "Good afternoon" : 
+                        timeOfDay === "evening" ? "Good evening" : "Hey there";
+        return {
+          ok: true,
+          message: `${greeting}, ${profile.firstName || "there"}! Welcome to Wovly.\n\nTo help me assist you better, I'd love to get to know you a bit. Mind if I ask you a few quick questions?`,
+          needsOnboarding: true,
+          timeOfDay,
+          profile
+        };
+      }
+
+      // Get today's and tomorrow's agenda if Google is authorized
+      let todayEvents = [];
+      let tomorrowEvents = [];
+      
+      try {
+        const accessToken = await getGoogleAccessToken();
+        if (accessToken) {
+          // Today's events
+          const todayStart = new Date(now);
+          todayStart.setHours(0, 0, 0, 0);
+          const todayEnd = new Date(now);
+          todayEnd.setHours(23, 59, 59, 999);
+          todayEvents = await fetchCalendarEvents(accessToken, todayStart, todayEnd);
+
+          // Tomorrow's events
+          const tomorrowStart = new Date(now);
+          tomorrowStart.setDate(tomorrowStart.getDate() + 1);
+          tomorrowStart.setHours(0, 0, 0, 0);
+          const tomorrowEnd = new Date(tomorrowStart);
+          tomorrowEnd.setHours(23, 59, 59, 999);
+          tomorrowEvents = await fetchCalendarEvents(accessToken, tomorrowStart, tomorrowEnd);
+        }
+      } catch (err) {
+        console.error("Calendar fetch error:", err);
+      }
+
+      // Get API keys for LLM
+      const settingsPath = await getSettingsPath();
+      let apiKeys = {};
+      let models = {};
+      let activeProvider = "anthropic";
+      try {
+        const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+        apiKeys = settings.apiKeys || {};
+        models = settings.models || {};
+        activeProvider = settings.activeProvider || "anthropic";
+      } catch {
+        // No settings
+      }
+
+      // If no API key, return a simple template message
+      if (!apiKeys.anthropic && !apiKeys.openai && !apiKeys.google) {
+        const firstName = profile?.firstName || "there";
+        let simpleMessage;
+        
+        if (timeOfDay === "night") {
+          simpleMessage = `Hey ${firstName}, it's getting late. Hope you had a good ${dayOfWeek}. Rest well!`;
+        } else if (timeOfDay === "morning") {
+          simpleMessage = `Good morning, ${firstName}! Ready to take on this ${dayOfWeek}?`;
+        } else if (timeOfDay === "evening") {
+          simpleMessage = `Good evening, ${firstName}! Hope your ${dayOfWeek} is winding down nicely.`;
+        } else {
+          simpleMessage = `Good afternoon, ${firstName}! How's your ${dayOfWeek} going?`;
+        }
+        
+        return { ok: true, message: simpleMessage, timeOfDay, profile };
+      }
+
+      // Build context for LLM
+      const formatEvents = (events) => {
+        if (events.length === 0) return "No events scheduled.";
+        return events.map(e => {
+          const startTime = e.start.includes("T") 
+            ? new Date(e.start).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+            : "All day";
+          return `- ${startTime}: ${e.title}`;
+        }).join("\n");
+      };
+
+      const llmPrompt = `You are Wovly, a warm and personable AI assistant. Generate a welcome message for the user based on the context below.
+
+CURRENT TIME: ${timeStr} on ${dayOfWeek}, ${dateStr}
+TIME OF DAY: ${timeOfDay}
+
+USER PROFILE:
+- Name: ${profile?.firstName || "Friend"} ${profile?.lastName || ""}
+- Occupation: ${profile?.occupation || "Not specified"}
+- City: ${profile?.city || "Not specified"}
+- Home Life: ${profile?.homeLife || "Not specified"}
+
+TODAY'S AGENDA (${dayOfWeek}):
+${formatEvents(todayEvents)}
+
+TOMORROW'S AGENDA:
+${formatEvents(tomorrowEvents)}
+
+INSTRUCTIONS:
+- Keep the message concise (2-4 sentences max)
+- Be warm and personable, like a supportive friend
+- Reference specific events or context when relevant
+- Adjust tone based on time of day:
+  * Morning: Energizing, mention what's ahead
+  * Afternoon: Encouraging, acknowledge progress on the day
+  * Evening: Supportive, mention winding down
+  * Night (after 9pm): Calm, reflective, hopeful about tomorrow
+- If it's late night and they have events tomorrow, mention being ready for tomorrow
+- If they have kids (mentioned in home life), reference kid-related events like pickups
+- Don't be overly formal or use exclamation marks excessively
+- End with an invitation to chat or ask for help
+
+Generate ONLY the welcome message, nothing else.`;
+
+      // Determine which provider to use for welcome
+      const useProvider = apiKeys[activeProvider] ? activeProvider : 
+                          apiKeys.anthropic ? "anthropic" : 
+                          apiKeys.openai ? "openai" : 
+                          apiKeys.google ? "google" : null;
+
+      // Call the LLM
+      let welcomeMessage = "";
+
+      if (useProvider === "anthropic" && apiKeys.anthropic) {
+        try {
+          const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
+          const response = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": apiKeys.anthropic,
+              "anthropic-version": "2023-06-01"
+            },
+            body: JSON.stringify({
+              model: anthropicModel,
+              max_tokens: 300,
+              messages: [{ role: "user", content: llmPrompt }]
+            })
+          });
+
+          if (response.ok) {
+            const data = await response.json();
+            welcomeMessage = data.content?.[0]?.text || "";
+          }
+        } catch (err) {
+          console.error("Anthropic API error:", err);
+        }
+      }
+
+      // OpenAI
+      if (!welcomeMessage && apiKeys.openai) {
+        try {
+          const openaiModel = models.openai || "gpt-4o";
+          const response = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${apiKeys.openai}`
+            },
+            body: JSON.stringify({
+              model: openaiModel,
+              max_tokens: 300,
+              messages: [{ role: "user", content: llmPrompt }]
+            })
+          });
+
+          if (response.ok) {
+            const data = await response.json();
+            welcomeMessage = data.choices?.[0]?.message?.content || "";
+          }
+        } catch (err) {
+          console.error("OpenAI API error:", err);
+        }
+      }
+
+      // Google Gemini
+      if (!welcomeMessage && apiKeys.google) {
+        try {
+          const geminiModel = models.google || "gemini-1.5-pro";
+          const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKeys.google}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                contents: [{ role: "user", parts: [{ text: llmPrompt }] }]
+              })
+            }
+          );
+
+          if (response.ok) {
+            const data = await response.json();
+            welcomeMessage = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+          }
+        } catch (err) {
+          console.error("Gemini API error:", err);
+        }
+      }
+
+      // Final fallback
+      if (!welcomeMessage) {
+        const firstName = profile?.firstName || "there";
+        welcomeMessage = `Hey ${firstName}! How can I help you today?`;
+      }
+
+      return {
+        ok: true,
+        message: welcomeMessage,
+        needsOnboarding: false,
+        timeOfDay,
+        hour,
+        dayOfWeek,
+        profile,
+        todayEventCount: todayEvents.length,
+        tomorrowEventCount: tomorrowEvents.length
+      };
+
+    } catch (err) {
+      console.error("Welcome generation error:", err);
+      return {
+        ok: false,
+        error: err.message,
+        message: "Hello! I'm Wovly, your AI assistant. How can I help you today?"
+      };
+    }
+  });
+
+  // Calendar events handler
+  ipcMain.handle("calendar:getEvents", async (_event, { date }) => {
+    try {
+      const accessToken = await getGoogleAccessToken();
+      if (!accessToken) {
+        return { ok: false, error: "Google not authorized" };
+      }
+
+      const startDate = new Date(date);
+      startDate.setHours(0, 0, 0, 0);
+      const endDate = new Date(startDate);
+      endDate.setHours(23, 59, 59, 999);
+
+      const events = await fetchCalendarEvents(accessToken, startDate, endDate);
+      return { ok: true, events };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Integration test handlers
+  ipcMain.handle("integrations:testGoogle", async () => {
+    try {
+      const accessToken = await getGoogleAccessToken();
+      if (!accessToken) {
+        return { ok: false, error: "Not authorized" };
+      }
+      
+      const response = await fetch("https://www.googleapis.com/oauth2/v1/userinfo?alt=json", {
+        headers: { "Authorization": `Bearer ${accessToken}` }
+      });
+      
+      if (response.ok) {
+        const userInfo = await response.json();
+        return { ok: true, message: `Connected as ${userInfo.email}` };
+      }
+      return { ok: false, error: "Failed to verify connection" };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Note: testSlack handler is now defined in the Slack Integration section above
+
+  ipcMain.handle("integrations:testIMessage", async () => {
+    if (process.platform !== "darwin") {
+      return { ok: false, error: "iMessage is only available on macOS" };
+    }
+    
+    const dbPath = path.join(os.homedir(), "Library", "Messages", "chat.db");
+    try {
+      await fs.access(dbPath);
+      return { ok: true, message: "iMessage database accessible" };
+    } catch {
+      return { ok: false, error: "Cannot access Messages database. Grant Full Disk Access to this app." };
+    }
+  });
+
+  // Weather test handler
+  ipcMain.handle("integrations:testWeather", async () => {
+    try {
+      // Test Open-Meteo API with a simple location query
+      const response = await fetch("https://api.open-meteo.com/v1/forecast?latitude=40.71&longitude=-74.01&current=temperature_2m&timezone=auto");
+      if (response.ok) {
+        const data = await response.json();
+        const temp = Math.round(data.current.temperature_2m * 9/5 + 32); // Convert to F
+        return { ok: true, message: `Weather API connected. Current: ${temp}°F in NYC` };
+      }
+      return { ok: false, error: "Failed to connect to weather API" };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Weather enable/disable handler
+  ipcMain.handle("integrations:setWeatherEnabled", async (_event, { enabled }) => {
+    try {
+      const settingsPath = await getSettingsPath();
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch {
+        // No existing settings
+      }
+      settings.weatherEnabled = enabled;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("integrations:getWeatherEnabled", async () => {
+    try {
+      const settingsPath = await getSettingsPath();
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      return { ok: true, enabled: settings.weatherEnabled !== false };
+    } catch {
+      return { ok: true, enabled: true }; // Default to enabled
+    }
+  });
+
+  // Google OAuth flow
+  ipcMain.handle("integrations:startGoogleOAuth", async (_event, { clientId, clientSecret }) => {
+    return new Promise((resolve) => {
+      const redirectUri = "http://localhost:18923/oauth/callback";
+      const scopes = [
+        "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/gmail.compose",
+        "https://www.googleapis.com/auth/drive.readonly"
+      ].join(" ");
+
+      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
+        `client_id=${encodeURIComponent(clientId)}` +
+        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+        `&response_type=code` +
+        `&scope=${encodeURIComponent(scopes)}` +
+        `&access_type=offline` +
+        `&prompt=consent`;
+
+      // Create local server to handle callback
+      const server = http.createServer(async (req, res) => {
+        const url = new URL(req.url, `http://localhost:18923`);
+        
+        if (url.pathname === "/oauth/callback") {
+          const code = url.searchParams.get("code");
+          const error = url.searchParams.get("error");
+
+          if (error) {
+            res.writeHead(200, { "Content-Type": "text/html" });
+            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
+            server.close();
+            resolve({ ok: false, error });
+            return;
+          }
+
+          if (code) {
+            try {
+              // Exchange code for tokens
+              const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: new URLSearchParams({
+                  code,
+                  client_id: clientId,
+                  client_secret: clientSecret,
+                  redirect_uri: redirectUri,
+                  grant_type: "authorization_code"
+                })
+              });
+
+              const tokenData = await tokenResponse.json();
+
+              if (tokenData.access_token) {
+                // Save tokens
+                const settingsPath = await getSettingsPath();
+                let settings = {};
+                try {
+                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+                } catch {
+                  // No existing settings
+                }
+
+                settings.googleTokens = {
+                  access_token: tokenData.access_token,
+                  refresh_token: tokenData.refresh_token,
+                  expires_at: Date.now() + (tokenData.expires_in * 1000),
+                  client_id: clientId,
+                  client_secret: clientSecret
+                };
+
+                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
+                server.close();
+                resolve({ ok: true });
+              } else {
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
+                server.close();
+                resolve({ ok: false, error: tokenData.error_description || "Token exchange failed" });
+              }
+            } catch (err) {
+              res.writeHead(200, { "Content-Type": "text/html" });
+              res.end("<h1>Error</h1><p>" + err.message + "</p>");
+              server.close();
+              resolve({ ok: false, error: err.message });
+            }
+          }
+        }
+      });
+
+      server.listen(18923, () => {
+        require("electron").shell.openExternal(authUrl);
+      });
+
+      // Timeout after 5 minutes
+      setTimeout(() => {
+        server.close();
+        resolve({ ok: false, error: "Authorization timed out" });
+      }, 300000);
+    });
+  });
+
+  ipcMain.handle("integrations:checkGoogleAuth", async () => {
+    const accessToken = await getGoogleAccessToken();
+    return { ok: true, authorized: !!accessToken };
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Slack Integration
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Cloudflare Tunnel for Slack OAuth (HTTPS required)
+  let slackTunnelProcess = null;
+  let slackTunnelUrl = null;
+
+  ipcMain.handle("integrations:startSlackTunnel", async () => {
+    // Kill existing tunnel if any
+    if (slackTunnelProcess) {
+      slackTunnelProcess.kill();
+      slackTunnelProcess = null;
+      slackTunnelUrl = null;
+    }
+
+    const { spawn, exec } = require("child_process");
+
+    // Helper to check if cloudflared is installed
+    const isCloudflaredInstalled = () => {
+      return new Promise((resolve) => {
+        exec("which cloudflared", (error) => {
+          resolve(!error);
+        });
+      });
+    };
+
+    // Helper to install cloudflared via brew
+    const installCloudflared = () => {
+      return new Promise((resolve) => {
+        console.log("Installing cloudflared via Homebrew...");
+        const installProc = spawn("brew", ["install", "cloudflared"], {
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+
+        let output = "";
+        installProc.stdout.on("data", (data) => {
+          output += data.toString();
+          console.log("brew:", data.toString());
+        });
+        installProc.stderr.on("data", (data) => {
+          output += data.toString();
+          console.log("brew:", data.toString());
+        });
+
+        installProc.on("close", (code) => {
+          if (code === 0) {
+            resolve({ ok: true });
+          } else {
+            // Check if brew is installed
+            exec("which brew", (brewError) => {
+              if (brewError) {
+                resolve({ 
+                  ok: false, 
+                  error: "Homebrew is not installed. Please install it first: https://brew.sh" 
+                });
+              } else {
+                resolve({ ok: false, error: "Failed to install cloudflared: " + output });
+              }
+            });
+          }
+        });
+
+        installProc.on("error", () => {
+          resolve({ 
+            ok: false, 
+            error: "Homebrew is not installed. Please install it first: https://brew.sh" 
+          });
+        });
+      });
+    };
+
+    // Check and install cloudflared if needed
+    const installed = await isCloudflaredInstalled();
+    if (!installed) {
+      console.log("cloudflared not found, installing...");
+      const installResult = await installCloudflared();
+      if (!installResult.ok) {
+        return installResult;
+      }
+      console.log("cloudflared installed successfully");
+    }
+
+    return new Promise((resolve) => {
+      // Start cloudflared quick tunnel
+      const proc = spawn("cloudflared", ["tunnel", "--url", "http://localhost:18924"], {
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+
+      slackTunnelProcess = proc;
+      let urlFound = false;
+
+      const handleOutput = (data) => {
+        const output = data.toString();
+        console.log("cloudflared:", output);
+        
+        // Look for the tunnel URL in output
+        const urlMatch = output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
+        if (urlMatch && !urlFound) {
+          urlFound = true;
+          slackTunnelUrl = urlMatch[0];
+          console.log("Slack tunnel URL:", slackTunnelUrl);
+          resolve({ ok: true, url: slackTunnelUrl });
+        }
+      };
+
+      proc.stdout.on("data", handleOutput);
+      proc.stderr.on("data", handleOutput);
+
+      proc.on("error", (err) => {
+        console.error("cloudflared error:", err);
+        if (!urlFound) {
+          resolve({ 
+            ok: false, 
+            error: "Failed to start cloudflared: " + err.message
+          });
+        }
+      });
+
+      proc.on("exit", (code) => {
+        if (!urlFound && code !== 0) {
+          resolve({ 
+            ok: false, 
+            error: "cloudflared exited unexpectedly" 
+          });
+        }
+        slackTunnelProcess = null;
+      });
+
+      // Timeout after 30 seconds
+      setTimeout(() => {
+        if (!urlFound) {
+          proc.kill();
+          resolve({ ok: false, error: "Tunnel startup timed out" });
+        }
+      }, 30000);
+    });
+  });
+
+  ipcMain.handle("integrations:stopSlackTunnel", async () => {
+    if (slackTunnelProcess) {
+      slackTunnelProcess.kill();
+      slackTunnelProcess = null;
+      slackTunnelUrl = null;
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle("integrations:getSlackTunnelUrl", async () => {
+    return { ok: true, url: slackTunnelUrl };
+  });
+
+  // Slack OAuth flow - using USER tokens to send messages as the user
+  ipcMain.handle("integrations:startSlackOAuth", async (_event, { clientId, clientSecret, tunnelUrl }) => {
+    return new Promise((resolve) => {
+      // Use tunnel URL if provided, otherwise fall back to localhost
+      const redirectUri = tunnelUrl ? `${tunnelUrl}/oauth/callback` : "http://localhost:18924/oauth/callback";
+      
+      // User scopes - these allow sending messages as the user (not as a bot)
+      const userScopes = [
+        "channels:history",
+        "channels:read", 
+        "channels:write",
+        "chat:write",
+        "groups:history",
+        "groups:read",
+        "groups:write",
+        "im:history",
+        "im:read",
+        "im:write",
+        "mpim:history",
+        "mpim:read",
+        "users:read",
+        "users:read.email"
+      ].join(",");
+
+      // Use user_scope instead of scope to get user token
+      const authUrl = `https://slack.com/oauth/v2/authorize?` +
+        `client_id=${encodeURIComponent(clientId)}` +
+        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+        `&user_scope=${encodeURIComponent(userScopes)}`;
+
+      // Create local server to handle callback
+      const server = http.createServer(async (req, res) => {
+        const url = new URL(req.url, `http://localhost:18924`);
+        
+        if (url.pathname === "/oauth/callback") {
+          const code = url.searchParams.get("code");
+          const error = url.searchParams.get("error");
+
+          if (error) {
+            res.writeHead(200, { "Content-Type": "text/html" });
+            res.end("<h1>Authorization Failed</h1><p>" + error + "</p><p>You can close this window.</p>");
+            server.close();
+            resolve({ ok: false, error });
+            return;
+          }
+
+          if (code) {
+            try {
+              // Exchange code for tokens
+              const tokenResponse = await fetch("https://slack.com/api/oauth.v2.access", {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: new URLSearchParams({
+                  code,
+                  client_id: clientId,
+                  client_secret: clientSecret,
+                  redirect_uri: redirectUri
+                })
+              });
+
+              const tokenData = await tokenResponse.json();
+              console.log("Slack OAuth response:", tokenData.ok ? "success" : tokenData.error);
+
+              // Check for user token (authed_user.access_token) - this allows sending as the user
+              const userToken = tokenData.authed_user?.access_token;
+              const userId = tokenData.authed_user?.id;
+              
+              if (tokenData.ok && userToken) {
+                // Save user token (not bot token)
+                const settingsPath = await getSettingsPath();
+                let settings = {};
+                try {
+                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+                } catch {
+                  // No existing settings
+                }
+
+                settings.slackTokens = {
+                  access_token: userToken,  // User token, not bot token
+                  user_id: userId,
+                  team: tokenData.team,
+                  client_id: clientId,
+                  client_secret: clientSecret,
+                  is_user_token: true  // Flag to indicate this is a user token
+                };
+
+                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end(`<h1>Slack Connected!</h1><p>Workspace: ${tokenData.team?.name || "Unknown"}</p><p>Connected as user. Messages will be sent on your behalf.</p><p>You can close this window and return to Wovly.</p>`);
+                server.close();
+                resolve({ ok: true, team: tokenData.team });
+              } else {
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Authorization Failed</h1><p>" + (tokenData.error || "Unknown error") + "</p>");
+                server.close();
+                resolve({ ok: false, error: tokenData.error || "Token exchange failed" });
+              }
+            } catch (err) {
+              res.writeHead(200, { "Content-Type": "text/html" });
+              res.end("<h1>Error</h1><p>" + err.message + "</p>");
+              server.close();
+              resolve({ ok: false, error: err.message });
+            }
+          }
+        }
+      });
+
+      server.listen(18924, () => {
+        require("electron").shell.openExternal(authUrl);
+      });
+
+      // Timeout after 5 minutes
+      setTimeout(() => {
+        server.close();
+        resolve({ ok: false, error: "Authorization timed out" });
+      }, 300000);
+    });
+  });
+
+  ipcMain.handle("integrations:checkSlackAuth", async () => {
+    const accessToken = await getSlackAccessToken();
+    if (!accessToken) {
+      return { ok: true, authorized: false };
+    }
+    
+    try {
+      const settingsPath = await getSettingsPath();
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      return { 
+        ok: true, 
+        authorized: true,
+        team: settings.slackTokens?.team
+      };
+    } catch {
+      return { ok: true, authorized: false };
+    }
+  });
+
+  ipcMain.handle("integrations:disconnectSlack", async () => {
+    try {
+      const settingsPath = await getSettingsPath();
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch {
+        // No settings
+      }
+      delete settings.slackTokens;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Update the test handler
+  ipcMain.handle("integrations:testSlack", async () => {
+    const accessToken = await getSlackAccessToken();
+    if (!accessToken) {
+      return { ok: false, error: "Slack not connected" };
+    }
+
+    try {
+      const response = await fetch("https://slack.com/api/auth.test", {
+        headers: { "Authorization": `Bearer ${accessToken}` }
+      });
+      const data = await response.json();
+      
+      if (data.ok) {
+        return { ok: true, message: `Connected to ${data.team} as ${data.user} (messages will be sent as you)` };
+      }
+      return { ok: false, error: data.error || "Connection test failed" };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Task IPC Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("tasks:create", async (_event, taskData) => {
+    try {
+      const task = await createTask(taskData);
+      return { ok: true, task };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("tasks:list", async () => {
+    try {
+      const tasks = await listTasks();
+      return { ok: true, tasks };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("tasks:get", async (_event, taskId) => {
+    try {
+      const task = await getTask(taskId);
+      if (!task) {
+        return { ok: false, error: "Task not found" };
+      }
+      return { ok: true, task };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("tasks:update", async (_event, { taskId, updates }) => {
+    try {
+      const task = await updateTask(taskId, updates);
+      if (task.error) {
+        return { ok: false, error: task.error };
+      }
+      return { ok: true, task };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("tasks:cancel", async (_event, taskId) => {
+    try {
+      const result = await cancelTask(taskId);
+      if (result.error) {
+        return { ok: false, error: result.error };
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("tasks:hide", async (_event, taskId) => {
+    try {
+      const result = await hideTask(taskId);
+      if (result.error) {
+        return { ok: false, error: result.error };
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("tasks:getUpdates", async () => {
+    try {
+      const updates = getTaskUpdates();
+      return { ok: true, updates };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("tasks:getRawMarkdown", async (_event, taskId) => {
+    try {
+      const markdown = await getTaskRawMarkdown(taskId);
+      if (markdown.error) {
+        return { ok: false, error: markdown.error };
+      }
+      return { ok: true, markdown };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("tasks:saveRawMarkdown", async (_event, { taskId, markdown }) => {
+    try {
+      const result = await saveTaskRawMarkdown(taskId, markdown);
+      if (result.error) {
+        return { ok: false, error: result.error };
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("tasks:execute", async (_event, taskId) => {
+    try {
+      const result = await executeTaskStep(taskId);
+      if (result.error) {
+        return { ok: false, error: result.error };
+      }
+      return { ok: true, result };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Slack API helpers for tools
+  const fetchSlackChannels = async (accessToken) => {
+    const response = await fetch("https://slack.com/api/conversations.list?types=public_channel,private_channel,im,mpim&limit=100", {
+      headers: { "Authorization": `Bearer ${accessToken}` }
+    });
+    const data = await response.json();
+    if (!data.ok) throw new Error(data.error);
+    return data.channels || [];
+  };
+
+  const fetchSlackMessages = async (accessToken, channelId, limit = 20) => {
+    const response = await fetch(`https://slack.com/api/conversations.history?channel=${channelId}&limit=${limit}`, {
+      headers: { "Authorization": `Bearer ${accessToken}` }
+    });
+    const data = await response.json();
+    if (!data.ok) throw new Error(data.error);
+    return data.messages || [];
+  };
+
+  const sendSlackMessage = async (accessToken, channelId, text) => {
+    const response = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: { 
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ channel: channelId, text })
+    });
+    const data = await response.json();
+    if (!data.ok) throw new Error(data.error);
+    return data;
+  };
+
+  const fetchSlackUsers = async (accessToken) => {
+    const response = await fetch("https://slack.com/api/users.list?limit=200", {
+      headers: { "Authorization": `Bearer ${accessToken}` }
+    });
+    const data = await response.json();
+    if (!data.ok) throw new Error(data.error);
+    return data.members || [];
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // WhatsApp Interface Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("whatsapp:connect", async () => {
+    try {
+      await connectWhatsApp();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("whatsapp:disconnect", async () => {
+    try {
+      await disconnectWhatsApp();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("whatsapp:getStatus", async () => {
+    return {
+      ok: true,
+      status: whatsappStatus,
+      qr: whatsappQR
+    };
+  });
+
+  ipcMain.handle("whatsapp:checkAuth", async () => {
+    // Check if we have auth state saved
+    try {
+      const authDir = await getWhatsAppAuthDir();
+      const files = await fs.readdir(authDir);
+      const hasAuth = files.some(f => f.includes("creds"));
+      return {
+        ok: true,
+        hasAuth,
+        connected: whatsappStatus === "connected"
+      };
+    } catch {
+      return { ok: true, hasAuth: false, connected: false };
+    }
+  });
+
+  ipcMain.handle("whatsapp:sendMessage", async (_event, { recipient, message }) => {
+    if (!whatsappSocket || whatsappStatus !== "connected") {
+      return { ok: false, error: "WhatsApp is not connected" };
+    }
+
+    try {
+      // Ensure recipient ends with @s.whatsapp.net for individual chats
+      let jid = recipient;
+      if (!jid.includes("@")) {
+        jid = jid.replace(/[^0-9]/g, "") + "@s.whatsapp.net";
+      }
+      
+      await whatsappSocket.sendMessage(jid, { text: message });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Sync a message to WhatsApp self-chat (for chat window sync)
+  ipcMain.handle("whatsapp:syncToSelfChat", async (_event, { message, isFromUser }) => {
+    if (!whatsappSocket || whatsappStatus !== "connected") {
+      return { ok: false, error: "WhatsApp is not connected" };
+    }
+
+    if (!whatsappSelfChatJid) {
+      return { ok: false, error: "Self-chat not initialized. Send a message from WhatsApp first." };
+    }
+
+    try {
+      // Prefix AI responses with [Wovly] to distinguish from user messages
+      const text = isFromUser ? message : `[Wovly] ${message}`;
+      await whatsappSocket.sendMessage(whatsappSelfChatJid, { text });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Check if WhatsApp sync is ready (connected and has self-chat JID)
+  ipcMain.handle("whatsapp:isSyncReady", async () => {
+    return {
+      ok: true,
+      ready: whatsappStatus === "connected" && !!whatsappSelfChatJid
+    };
+  });
+
+  // Clear Google authorization (to force re-auth with new scopes)
+  ipcMain.handle("integrations:disconnectGoogle", async () => {
+    try {
+      const settingsPath = await getSettingsPath();
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch {
+        // No settings
+      }
+      
+      // Remove Google tokens
+      delete settings.googleTokens;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Google Workspace Tools
+  const googleWorkspaceTools = [
+    {
+      name: "get_calendar_events",
+      description: "Get calendar events for a specific date or date range.",
+      input_schema: {
+        type: "object",
+        properties: {
+          date: { type: "string", description: "Date in YYYY-MM-DD format" },
+          days: { type: "number", description: "Number of days to fetch (default 1)" }
+        },
+        required: []
+      }
+    },
+    {
+      name: "create_calendar_event",
+      description: "Create a new calendar event with optional attendees. Attendees will receive email invitations.",
+      input_schema: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Event title" },
+          start: { type: "string", description: "Start datetime in ISO format" },
+          end: { type: "string", description: "End datetime in ISO format" },
+          description: { type: "string", description: "Event description" },
+          location: { type: "string", description: "Event location" },
+          attendees: { 
+            type: "array", 
+            items: { type: "string" },
+            description: "Array of email addresses to invite to the event. They will receive calendar invitations."
+          },
+          sendNotifications: {
+            type: "boolean",
+            description: "Whether to send email notifications to attendees (default: true)"
+          }
+        },
+        required: ["title", "start", "end"]
+      }
+    },
+    {
+      name: "delete_calendar_event",
+      description: "Delete a calendar event by ID.",
+      input_schema: {
+        type: "object",
+        properties: {
+          eventId: { type: "string", description: "The event ID to delete" }
+        },
+        required: ["eventId"]
+      }
+    },
+    {
+      name: "search_emails",
+      description: "Search for emails.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query" },
+          maxResults: { type: "number", description: "Max results (default 10)" }
+        },
+        required: ["query"]
+      }
+    },
+    {
+      name: "get_email_content",
+      description: "Get the content of a specific email.",
+      input_schema: {
+        type: "object",
+        properties: {
+          messageId: { type: "string", description: "The email message ID" }
+        },
+        required: ["messageId"]
+      }
+    },
+    {
+      name: "send_email",
+      description: "Send an email or reply to an existing email thread. Always confirm with user before sending. When replying to an email, use threadId and replyToMessageId to keep the conversation in the same thread.",
+      input_schema: {
+        type: "object",
+        properties: {
+          to: { type: "string", description: "Recipient email" },
+          subject: { type: "string", description: "Email subject. For replies, keep the original subject (optionally with 'Re: ' prefix) to maintain the thread." },
+          body: { type: "string", description: "Email body" },
+          cc: { type: "string", description: "CC recipients" },
+          bcc: { type: "string", description: "BCC recipients" },
+          threadId: { type: "string", description: "Gmail thread ID to reply to. Use this when replying to an existing email conversation." },
+          replyToMessageId: { type: "string", description: "Message-ID header of the email being replied to. Required for proper threading." }
+        },
+        required: ["to", "subject", "body"]
+      }
+    },
+    {
+      name: "list_drive_files",
+      description: "List files in Google Drive.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query" },
+          maxResults: { type: "number", description: "Max results (default 10)" }
+        },
+        required: []
+      }
+    }
+  ];
+
+  // Profile tools
+  const profileTools = [
+    {
+      name: "get_user_profile",
+      description: "Get the user's profile information.",
+      input_schema: { type: "object", properties: {}, required: [] }
+    },
+    {
+      name: "update_user_profile",
+      description: "Update the user's profile with new information. Use this when the user shares ANY personal information - their job, family details, important dates (birthdays, anniversaries), preferences, or any facts they want you to remember. Always confirm with user before updating. Use 'addNote' for custom facts like family birthdays, anniversaries, preferences, etc.",
+      input_schema: {
+        type: "object",
+        properties: {
+          occupation: { type: "string", description: "User's job or profession" },
+          city: { type: "string", description: "City where user lives" },
+          homeLife: { type: "string", description: "Family situation - spouse, kids, pets" },
+          dateOfBirth: { type: "string", description: "User's birthday in any format" },
+          onboardingCompleted: { type: "boolean", description: "Set true when basic info is collected" },
+          addNote: { type: "string", description: "Add a custom fact or note to remember. Use for ANY information the user wants saved: family birthdays, anniversaries, preferences, important dates, etc. Example: 'Wife\\'s birthday: November 29, 1985'" },
+          removeNote: { type: "string", description: "Remove a note that contains this text" }
+        },
+        required: []
+      }
+    }
+  ];
+
+  // Memory search tool - for explicit historical searches
+  const memoryTools = [
+    {
+      name: "search_memory",
+      description: "Search through historical conversations. Use when user explicitly asks about past conversations, especially those older than 2 weeks. Examples: 'did we ever discuss Italy?', 'what did I say about the project last month?'",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search terms to look for in past conversations" },
+          date_range: { 
+            type: "string", 
+            enum: ["last_week", "last_month", "last_3_months", "all"],
+            description: "How far back to search. Default is 'all' for comprehensive search."
+          }
+        },
+        required: ["query"]
+      }
+    }
+  ];
+
+  // Memory search execution function
+  const executeMemorySearch = async (query, dateRange = "all") => {
+    const dailyDir = await getMemoryDailyDir();
+    const longtermDir = await getMemoryLongtermDir();
+    const results = [];
+    const queryLower = query.toLowerCase();
+
+    // Calculate date cutoff based on range
+    const now = new Date();
+    let cutoffDate = null;
+    if (dateRange === "last_week") {
+      cutoffDate = new Date(now);
+      cutoffDate.setDate(cutoffDate.getDate() - 7);
+    } else if (dateRange === "last_month") {
+      cutoffDate = new Date(now);
+      cutoffDate.setMonth(cutoffDate.getMonth() - 1);
+    } else if (dateRange === "last_3_months") {
+      cutoffDate = new Date(now);
+      cutoffDate.setMonth(cutoffDate.getMonth() - 3);
+    }
+    // 'all' means no cutoff
+
+    // Search helper function
+    const searchFile = async (filePath, dateStr) => {
+      try {
+        const content = await fs.readFile(filePath, "utf8");
+        if (content.toLowerCase().includes(queryLower)) {
+          // Extract matching lines for context
+          const lines = content.split('\n');
+          const matchingLines = lines.filter(line => 
+            line.toLowerCase().includes(queryLower)
+          ).slice(0, 5); // Limit to 5 matches per file
+
+          if (matchingLines.length > 0) {
+            results.push({
+              date: dateStr,
+              matches: matchingLines
+            });
+          }
+        }
+      } catch {
+        // Skip unreadable files
+      }
+    };
+
+    // Search daily files
+    try {
+      const dailyFiles = await fs.readdir(dailyDir);
+      for (const file of dailyFiles) {
+        if (!file.endsWith('.md')) continue;
+        const dateStr = file.replace('.md', '');
+        
+        // Check date cutoff
+        if (cutoffDate) {
+          const fileDate = new Date(dateStr + 'T00:00:00');
+          if (fileDate < cutoffDate) continue;
+        }
+
+        await searchFile(path.join(dailyDir, file), dateStr);
+      }
+    } catch {
+      // No daily directory
+    }
+
+    // Search longterm files
+    try {
+      const longtermFiles = await fs.readdir(longtermDir);
+      for (const file of longtermFiles) {
+        if (!file.endsWith('.md')) continue;
+        const dateStr = file.replace('.md', '');
+        
+        // Check date cutoff
+        if (cutoffDate) {
+          const fileDate = new Date(dateStr + 'T00:00:00');
+          if (fileDate < cutoffDate) continue;
+        }
+
+        await searchFile(path.join(longtermDir, file), dateStr);
+      }
+    } catch {
+      // No longterm directory
+    }
+
+    // Sort results by date (most recent first)
+    results.sort((a, b) => b.date.localeCompare(a.date));
+
+    if (results.length === 0) {
+      return { found: false, message: `No conversations found matching "${query}" in the specified time range.` };
+    }
+
+    return {
+      found: true,
+      totalMatches: results.length,
+      results: results.slice(0, 10) // Limit to 10 most recent matching days
+    };
+  };
+
+  // iMessage tools
+  // Contact name cache to avoid repeated lookups
+  const contactNameCache = new Map();
+
+  // Look up contact name from phone number or email using AppleScript
+  const lookupContactName = (identifier) => {
+    return new Promise((resolve) => {
+      if (!identifier) {
+        resolve(null);
+        return;
+      }
+
+      // Check cache first
+      if (contactNameCache.has(identifier)) {
+        resolve(contactNameCache.get(identifier));
+        return;
+      }
+
+      const { exec } = require("child_process");
+      
+      // Clean the identifier (remove non-numeric chars for phone matching)
+      const cleanPhone = identifier.replace(/\D/g, "");
+      const lastDigits = cleanPhone.slice(-10); // Last 10 digits for matching
+      
+      // AppleScript to search contacts
+      const appleScript = `
+        tell application "Contacts"
+          set matchedName to ""
+          repeat with aPerson in people
+            repeat with aPhone in phones of aPerson
+              set phoneDigits to do shell script "echo " & quoted form of (value of aPhone) & " | tr -cd '0-9'"
+              if phoneDigits ends with "${lastDigits}" then
+                set matchedName to (first name of aPerson & " " & last name of aPerson)
+                exit repeat
+              end if
+            end repeat
+            if matchedName is not "" then exit repeat
+            repeat with anEmail in emails of aPerson
+              if value of anEmail is "${identifier}" then
+                set matchedName to (first name of aPerson & " " & last name of aPerson)
+                exit repeat
+              end if
+            end repeat
+            if matchedName is not "" then exit repeat
+          end repeat
+          return matchedName
+        end tell
+      `;
+
+      exec(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, { timeout: 5000 }, (error, stdout) => {
+        const name = stdout?.trim() || null;
+        if (name && name !== " " && name.length > 1) {
+          contactNameCache.set(identifier, name);
+          resolve(name);
+        } else {
+          contactNameCache.set(identifier, null);
+          resolve(null);
+        }
+      });
+    });
+  };
+
+  // Batch lookup contact names for multiple identifiers
+  const lookupContactNames = async (identifiers) => {
+    const results = new Map();
+    const uniqueIds = [...new Set(identifiers.filter(Boolean))];
+    
+    await Promise.all(uniqueIds.map(async (id) => {
+      const name = await lookupContactName(id);
+      results.set(id, name);
+    }));
+    
+    return results;
+  };
+
+  const iMessageTools = [
+    {
+      name: "get_recent_messages",
+      description: "Get recent text messages (iMessage/SMS) with sender names resolved from contacts. Use this when the user asks about their texts or messages they received.",
+      input_schema: {
+        type: "object",
+        properties: {
+          hours: { type: "number", description: "Hours back to look (default 24)" },
+          contact: { type: "string", description: "Filter by contact name or phone number (e.g., 'Adaira' or '+1234567890')" },
+          limit: { type: "number", description: "Max messages (default 50)" }
+        },
+        required: []
+      }
+    },
+    {
+      name: "search_messages",
+      description: "Search through text messages with sender names resolved. Use to find specific messages or conversations.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search term to find in message content" },
+          contact: { type: "string", description: "Filter by contact name or phone number" },
+          limit: { type: "number", description: "Max results (default 20)" }
+        },
+        required: ["query"]
+      }
+    },
+    {
+      name: "lookup_contact",
+      description: "Look up a contact's phone number from Apple Contacts by name. Returns the contact's name and phone numbers. Use this FIRST when you need to text someone by name to get their phone number.",
+      input_schema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Contact name to search for (first name, last name, or full name)" }
+        },
+        required: ["name"]
+      }
+    },
+    {
+      name: "send_imessage",
+      description: "Send a text message via iMessage or SMS. The recipient can be a contact name (will auto-lookup phone number) or a phone number directly. Always confirm with user first before sending.",
+      input_schema: {
+        type: "object",
+        properties: {
+          recipient: { type: "string", description: "Contact name (e.g., 'Adaira', 'John Smith') or phone number (e.g., '+15551234567')" },
+          message: { type: "string", description: "The message content to send" }
+        },
+        required: ["recipient", "message"]
+      }
+    }
+  ];
+
+  // Weather tools (using Open-Meteo API - free, no API key required)
+  const weatherTools = [
+    {
+      name: "get_weather_forecast",
+      description: "Get weather forecast for a location. Use this when user asks about weather, forecast, temperature, rain, etc. Can specify a location name or coordinates.",
+      input_schema: {
+        type: "object",
+        properties: {
+          location: { type: "string", description: "Location name (e.g., 'Paris, France', 'New York')" },
+          latitude: { type: "number", description: "Latitude coordinate (-90 to 90)" },
+          longitude: { type: "number", description: "Longitude coordinate (-180 to 180)" },
+          days: { type: "number", description: "Number of days to forecast (1-16, default 7)" }
+        },
+        required: []
+      }
+    },
+    {
+      name: "get_current_weather",
+      description: "Get current weather conditions for a location. Use this for real-time weather.",
+      input_schema: {
+        type: "object",
+        properties: {
+          location: { type: "string", description: "Location name (e.g., 'San Francisco', 'London')" },
+          latitude: { type: "number", description: "Latitude coordinate (-90 to 90)" },
+          longitude: { type: "number", description: "Longitude coordinate (-180 to 180)" }
+        },
+        required: []
+      }
+    },
+    {
+      name: "search_location",
+      description: "Find coordinates for a location by name. Use this to get latitude/longitude for weather lookups.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Location name to search (e.g., 'Tokyo', 'New York, NY')" }
+        },
+        required: ["query"]
+      }
+    }
+  ];
+
+  // Execute Weather tool (using Open-Meteo API)
+  const executeWeatherTool = async (toolName, toolInput) => {
+    console.log(`[Weather] Executing ${toolName} with input:`, JSON.stringify(toolInput));
+    try {
+      // Helper to geocode location name to coordinates
+      const geocodeLocation = async (locationName) => {
+        console.log(`[Weather] Geocoding location: ${locationName}`);
+        
+        // Try different variations of the location name
+        const variations = [
+          locationName,
+          // Strip state/country suffix (e.g., "Boston, MA" -> "Boston")
+          locationName.split(',')[0].trim(),
+          // Replace comma with space
+          locationName.replace(/,/g, ' ').trim()
+        ];
+        
+        for (const variation of variations) {
+          console.log(`[Weather] Trying geocode variation: ${variation}`);
+          const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(variation)}&count=5&language=en&format=json`;
+          const response = await fetch(url);
+          
+          if (!response.ok) {
+            console.error(`[Weather] Geocoding API failed: ${response.status}`);
+            continue;
+          }
+          
+          const data = await response.json();
+          
+          if (data.results && data.results.length > 0) {
+            // If original had state info, try to match it
+            const originalLower = locationName.toLowerCase();
+            let bestMatch = data.results[0];
+            
+            // Try to find a better match based on state/country
+            if (originalLower.includes('ma') || originalLower.includes('massachusetts')) {
+              const maMatch = data.results.find(r => r.admin1?.toLowerCase().includes('massachusetts'));
+              if (maMatch) bestMatch = maMatch;
+            } else if (originalLower.includes('tx') || originalLower.includes('texas')) {
+              const txMatch = data.results.find(r => r.admin1?.toLowerCase().includes('texas'));
+              if (txMatch) bestMatch = txMatch;
+            } else if (originalLower.includes('ca') || originalLower.includes('california')) {
+              const caMatch = data.results.find(r => r.admin1?.toLowerCase().includes('california'));
+              if (caMatch) bestMatch = caMatch;
+            } else if (originalLower.includes('ny') || originalLower.includes('new york')) {
+              const nyMatch = data.results.find(r => r.admin1?.toLowerCase().includes('new york'));
+              if (nyMatch) bestMatch = nyMatch;
+            }
+            
+            console.log(`[Weather] Geocoded to: ${bestMatch.latitude}, ${bestMatch.longitude} (${bestMatch.name}, ${bestMatch.admin1 || bestMatch.country})`);
+            return {
+              latitude: bestMatch.latitude,
+              longitude: bestMatch.longitude,
+              name: bestMatch.name,
+              country: bestMatch.country,
+              admin1: bestMatch.admin1,
+              timezone: bestMatch.timezone
+            };
+          }
+        }
+        
+        console.error(`[Weather] Location not found after all variations: ${locationName}`);
+        throw new Error(`Location not found: ${locationName}`);
+      };
+
+      switch (toolName) {
+        case "search_location": {
+          const { query } = toolInput;
+          
+          // Try different variations - strip state/country suffix if needed
+          const variations = [
+            query,
+            query.split(',')[0].trim(),
+            query.replace(/,/g, ' ').trim()
+          ];
+          
+          for (const variation of variations) {
+            console.log(`[Weather] Searching location variation: ${variation}`);
+            const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(variation)}&count=5&language=en&format=json`;
+            const response = await fetch(url);
+            if (!response.ok) continue;
+            const data = await response.json();
+            
+            if (data.results && data.results.length > 0) {
+              return {
+                locations: data.results.map(r => ({
+                  name: r.name,
+                  country: r.country,
+                  admin1: r.admin1,
+                  latitude: r.latitude,
+                  longitude: r.longitude,
+                  timezone: r.timezone,
+                  population: r.population
+                }))
+              };
+            }
+          }
+          
+          return { error: `No locations found for: ${query}` };
+        }
+
+        case "get_current_weather": {
+          let lat, lon, locationName;
+          
+          // Handle case where toolInput might be null/undefined
+          if (!toolInput) {
+            console.error("[Weather] No input provided to get_current_weather");
+            return { error: "Please provide a location name or coordinates" };
+          }
+          
+          if (toolInput.latitude !== undefined && toolInput.longitude !== undefined) {
+            lat = toolInput.latitude;
+            lon = toolInput.longitude;
+            locationName = `${lat}, ${lon}`;
+          } else if (toolInput.location) {
+            const geo = await geocodeLocation(toolInput.location);
+            lat = geo.latitude;
+            lon = geo.longitude;
+            locationName = geo.admin1 ? `${geo.name}, ${geo.admin1}` : `${geo.name}, ${geo.country}`;
+          } else {
+            console.error("[Weather] Neither location nor coordinates provided");
+            return { error: "Please provide either a location name or coordinates" };
+          }
+
+          const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto`;
+          
+          const response = await fetch(url);
+          if (!response.ok) throw new Error("Failed to fetch weather");
+          const data = await response.json();
+          
+          const weatherCodes = {
+            0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+            45: "Fog", 48: "Depositing rime fog",
+            51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+            61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
+            71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow",
+            80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+            95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail"
+          };
+
+          const current = data.current;
+          return {
+            location: locationName,
+            temperature: `${Math.round(current.temperature_2m)}°F`,
+            feels_like: `${Math.round(current.apparent_temperature)}°F`,
+            conditions: weatherCodes[current.weather_code] || "Unknown",
+            humidity: `${current.relative_humidity_2m}%`,
+            wind: `${Math.round(current.wind_speed_10m)} mph`,
+            precipitation: `${current.precipitation}" in last hour`,
+            time: current.time
+          };
+        }
+
+        case "get_weather_forecast": {
+          let lat, lon, locationName;
+          
+          // Handle case where toolInput might be null/undefined
+          if (!toolInput) {
+            console.error("[Weather] No input provided to get_weather_forecast");
+            return { error: "Please provide a location name or coordinates" };
+          }
+          
+          const days = Math.min(toolInput.days || 7, 16);
+          
+          if (toolInput.latitude !== undefined && toolInput.longitude !== undefined) {
+            lat = toolInput.latitude;
+            lon = toolInput.longitude;
+            locationName = `${lat}, ${lon}`;
+          } else if (toolInput.location) {
+            const geo = await geocodeLocation(toolInput.location);
+            lat = geo.latitude;
+            lon = geo.longitude;
+            locationName = geo.admin1 ? `${geo.name}, ${geo.admin1}` : `${geo.name}, ${geo.country}`;
+          } else {
+            console.error("[Weather] Neither location nor coordinates provided");
+            return { error: "Please provide either a location name or coordinates" };
+          }
+
+          const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,precipitation_sum,precipitation_probability_max,sunrise,sunset,wind_speed_10m_max&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&forecast_days=${days}`;
+          
+          const response = await fetch(url);
+          if (!response.ok) throw new Error("Failed to fetch forecast");
+          const data = await response.json();
+          
+          const weatherCodes = {
+            0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+            45: "Foggy", 48: "Rime fog", 51: "Light drizzle", 53: "Drizzle", 55: "Dense drizzle",
+            61: "Light rain", 63: "Rain", 65: "Heavy rain", 71: "Light snow", 73: "Snow", 75: "Heavy snow",
+            80: "Rain showers", 81: "Mod. rain showers", 82: "Heavy showers",
+            95: "Thunderstorm", 96: "T-storm w/ hail", 99: "Severe t-storm"
+          };
+
+          const daily = data.daily;
+          const forecast = [];
+          
+          for (let i = 0; i < daily.time.length; i++) {
+            const date = new Date(daily.time[i]);
+            forecast.push({
+              date: daily.time[i],
+              day: date.toLocaleDateString("en-US", { weekday: "short" }),
+              conditions: weatherCodes[daily.weather_code[i]] || "Unknown",
+              high: `${Math.round(daily.temperature_2m_max[i])}°F`,
+              low: `${Math.round(daily.temperature_2m_min[i])}°F`,
+              precipitation_chance: `${daily.precipitation_probability_max[i]}%`,
+              precipitation: `${daily.precipitation_sum[i]}"`,
+              wind_max: `${Math.round(daily.wind_speed_10m_max[i])} mph`,
+              sunrise: daily.sunrise[i]?.split("T")[1],
+              sunset: daily.sunset[i]?.split("T")[1]
+            });
+          }
+
+          return {
+            location: locationName,
+            forecast_days: days,
+            forecast
+          };
+        }
+
+        default:
+          return { error: `Unknown weather tool: ${toolName}` };
+      }
+    } catch (err) {
+      console.error(`[Weather] Error executing ${toolName}:`, err.message);
+      return { error: err.message };
+    }
+  };
+
+  // Slack tools
+  const slackTools = [
+    {
+      name: "list_slack_channels",
+      description: "List Slack channels and direct messages in the connected workspace.",
+      input_schema: {
+        type: "object",
+        properties: {},
+        required: []
+      }
+    },
+    {
+      name: "get_slack_messages",
+      description: "Get recent messages from a Slack channel or DM.",
+      input_schema: {
+        type: "object",
+        properties: {
+          channel: { type: "string", description: "Channel name (e.g., #general) or channel ID" },
+          limit: { type: "number", description: "Number of messages to fetch (default 20)" }
+        },
+        required: ["channel"]
+      }
+    },
+    {
+      name: "send_slack_message",
+      description: "Send a message to a Slack channel or user. Always confirm with user before sending.",
+      input_schema: {
+        type: "object",
+        properties: {
+          channel: { type: "string", description: "Channel name (e.g., #general), channel ID, or user ID" },
+          message: { type: "string", description: "Message text to send" }
+        },
+        required: ["channel", "message"]
+      }
+    },
+    {
+      name: "search_slack_users",
+      description: "Search for Slack users in the workspace.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query (name or email)" }
+        },
+        required: []
+      }
+    }
+  ];
+
+  // Execute Slack tool
+  const executeSlackTool = async (toolName, toolInput, accessToken) => {
+    try {
+      switch (toolName) {
+        case "list_slack_channels": {
+          const channels = await fetchSlackChannels(accessToken);
+          return {
+            channels: channels.map(c => ({
+              id: c.id,
+              name: c.name || c.user,
+              type: c.is_channel ? "channel" : c.is_group ? "private" : c.is_im ? "dm" : "group_dm",
+              is_member: c.is_member,
+              num_members: c.num_members
+            })).slice(0, 50)
+          };
+        }
+
+        case "get_slack_messages": {
+          let channelId = toolInput.channel;
+          const limit = toolInput.limit || 20;
+
+          // If channel starts with #, find the channel ID
+          if (channelId.startsWith("#")) {
+            const channels = await fetchSlackChannels(accessToken);
+            const channel = channels.find(c => c.name === channelId.slice(1));
+            if (!channel) {
+              return { error: `Channel ${channelId} not found` };
+            }
+            channelId = channel.id;
+          }
+
+          const messages = await fetchSlackMessages(accessToken, channelId, limit);
+          
+          // Get user info for names
+          const users = await fetchSlackUsers(accessToken);
+          const userMap = new Map(users.map(u => [u.id, u.real_name || u.name]));
+
+          return {
+            messages: messages.map(m => ({
+              user: userMap.get(m.user) || m.user,
+              text: m.text,
+              timestamp: new Date(parseFloat(m.ts) * 1000).toISOString()
+            }))
+          };
+        }
+
+        case "send_slack_message": {
+          let channelId = toolInput.channel;
+          const message = toolInput.message;
+
+          // If channel starts with #, find the channel ID
+          if (channelId.startsWith("#")) {
+            const channels = await fetchSlackChannels(accessToken);
+            const channel = channels.find(c => c.name === channelId.slice(1));
+            if (!channel) {
+              return { error: `Channel ${channelId} not found` };
+            }
+            channelId = channel.id;
+          }
+
+          await sendSlackMessage(accessToken, channelId, message);
+          return { success: true, message: `Message sent to ${toolInput.channel}` };
+        }
+
+        case "search_slack_users": {
+          const users = await fetchSlackUsers(accessToken);
+          const query = (toolInput.query || "").toLowerCase();
+          
+          let filtered = users.filter(u => !u.deleted && !u.is_bot);
+          if (query) {
+            filtered = filtered.filter(u => 
+              (u.real_name || "").toLowerCase().includes(query) ||
+              (u.name || "").toLowerCase().includes(query) ||
+              (u.profile?.email || "").toLowerCase().includes(query)
+            );
+          }
+
+          return {
+            users: filtered.slice(0, 20).map(u => ({
+              id: u.id,
+              name: u.real_name || u.name,
+              username: u.name,
+              email: u.profile?.email,
+              title: u.profile?.title
+            }))
+          };
+        }
+
+        default:
+          return { error: `Unknown Slack tool: ${toolName}` };
+      }
+    } catch (err) {
+      return { error: err.message };
+    }
+  };
+
+  // Task tools - for creating and managing background tasks
+  const taskTools = [
+    {
+      name: "create_task",
+      description: "IMPORTANT: Only call this AFTER the user has explicitly confirmed they want to create the task. Do NOT call this immediately - first describe your proposed plan in plain text and ask 'Would you like me to create this task?' Then WAIT for the user to say yes/confirm/go ahead before calling this tool. This creates an autonomous background task that runs independently. CRITICAL: When you call create_task, do NOT also call send_email, send_imessage, or any other action tool - the task executor will handle ALL steps automatically. If you send a message AND create a task, duplicate messages will be sent.",
+      input_schema: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Short descriptive title for the task (e.g., 'Schedule lunch with Jeff')" },
+          originalRequest: { type: "string", description: "The user's original request verbatim - copy exactly what they said" },
+          messagingChannel: { 
+            type: "string", 
+            enum: ["imessage", "email", "slack"],
+            description: "REQUIRED: Which messaging channel to use. Detect from keywords in user's request: 'text'/'message'/'sms' = imessage, 'email'/'mail' = email, 'slack' = slack" 
+          },
+          plan: { 
+            type: "array", 
+            items: { type: "string" }, 
+            description: "Step-by-step plan to accomplish the task. Be specific about what each step does." 
+          },
+          context: { 
+            type: "object", 
+            description: "Key context needed for the task - emails, names, durations, dates, etc. Store anything the task needs to remember." 
+          }
+        },
+        required: ["title", "originalRequest", "messagingChannel", "plan"]
+      }
+    },
+    {
+      name: "list_tasks",
+      description: "List all existing tasks with their current status.",
+      input_schema: {
+        type: "object",
+        properties: {},
+        required: []
+      }
+    },
+    {
+      name: "cancel_task",
+      description: "Cancel an existing task by its ID.",
+      input_schema: {
+        type: "object",
+        properties: {
+          taskId: { type: "string", description: "The ID of the task to cancel" }
+        },
+        required: ["taskId"]
+      }
+    }
+  ];
+
+  // Execute task tool
+  const executeTaskTool = async (toolName, toolInput) => {
+    try {
+      switch (toolName) {
+        case "create_task": {
+          const task = await createTask(toolInput);
+          
+          // Auto-start the task immediately (don't await - let it run in background)
+          setTimeout(async () => {
+            console.log(`[Tasks] Auto-starting task: ${task.id}`);
+            await executeTaskStep(task.id);
+          }, 100);
+          
+          return {
+            success: true,
+            taskId: task.id,
+            message: `Task "${task.title}" created and started! The first step is now executing.`,
+            plan: task.plan
+          };
+        }
+        case "list_tasks": {
+          const tasks = await listTasks();
+          return {
+            tasks: tasks.map(t => ({
+              id: t.id,
+              title: t.title,
+              status: t.status,
+              currentStep: t.currentStep.step,
+              totalSteps: t.plan.length,
+              lastUpdated: t.lastUpdated
+            }))
+          };
+        }
+        case "cancel_task": {
+          const result = await cancelTask(toolInput.taskId);
+          if (result.error) {
+            return { error: result.error };
+          }
+          return { success: true, message: `Task cancelled successfully` };
+        }
+        default:
+          return { error: `Unknown task tool: ${toolName}` };
+      }
+    } catch (err) {
+      return { error: err.message };
+    }
+  };
+
+  // Execute Google tool
+  const executeGoogleTool = async (toolName, toolInput, accessToken) => {
+    try {
+      switch (toolName) {
+        case "get_calendar_events": {
+          const date = toolInput.date || new Date().toISOString().split("T")[0];
+          const days = toolInput.days || 1;
+          
+          const startDate = new Date(date);
+          startDate.setHours(0, 0, 0, 0);
+          const endDate = new Date(startDate);
+          endDate.setDate(endDate.getDate() + days);
+          
+          return await fetchCalendarEvents(accessToken, startDate, endDate);
+        }
+
+        case "create_calendar_event": {
+          const { title, start, end, description, location, attendees, sendNotifications = true } = toolInput;
+          
+          // Build event body
+          const eventBody = {
+            summary: title,
+            start: { dateTime: start },
+            end: { dateTime: end },
+            description,
+            location
+          };
+          
+          // Add attendees if provided
+          if (attendees && attendees.length > 0) {
+            eventBody.attendees = attendees.map(email => ({ email }));
+          }
+          
+          // Build URL with sendUpdates parameter
+          const url = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
+          if (attendees && attendees.length > 0) {
+            url.searchParams.set("sendUpdates", sendNotifications ? "all" : "none");
+          }
+          
+          const response = await fetch(url.toString(), {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${accessToken}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify(eventBody)
+          });
+          
+          if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            console.error("Calendar API error:", errorData);
+            throw new Error(errorData.error?.message || "Failed to create event");
+          }
+          
+          const event = await response.json();
+          const attendeeCount = attendees?.length || 0;
+          const attendeeMsg = attendeeCount > 0 ? ` with ${attendeeCount} attendee(s) invited` : "";
+          return { 
+            success: true, 
+            eventId: event.id, 
+            htmlLink: event.htmlLink,
+            message: `Created event: ${title}${attendeeMsg}` 
+          };
+        }
+
+        case "delete_calendar_event": {
+          const { eventId } = toolInput;
+          
+          const response = await fetch(
+            `https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}`,
+            {
+              method: "DELETE",
+              headers: { "Authorization": `Bearer ${accessToken}` }
+            }
+          );
+          
+          if (!response.ok && response.status !== 204) throw new Error("Failed to delete event");
+          return { success: true, message: "Event deleted" };
+        }
+
+        case "search_emails": {
+          const { query, maxResults = 10 } = toolInput;
+          
+          const url = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
+          url.searchParams.set("q", query);
+          url.searchParams.set("maxResults", maxResults.toString());
+          
+          const response = await fetch(url.toString(), {
+            headers: { "Authorization": `Bearer ${accessToken}` }
+          });
+          
+          if (!response.ok) throw new Error("Failed to search emails");
+          const data = await response.json();
+          return { messages: data.messages || [], resultCount: data.resultSizeEstimate || 0 };
+        }
+
+        case "get_email_content": {
+          const { messageId } = toolInput;
+          
+          const response = await fetch(
+            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full`,
+            { headers: { "Authorization": `Bearer ${accessToken}` } }
+          );
+          
+          if (!response.ok) throw new Error("Failed to get email");
+          const email = await response.json();
+          
+          const headers = email.payload?.headers || [];
+          const getHeader = (name) => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || "";
+          
+          let body = "";
+          const extractBody = (part) => {
+            if (part.body?.data) {
+              body = Buffer.from(part.body.data, "base64").toString("utf8");
+            }
+            if (part.parts) {
+              for (const p of part.parts) {
+                if (p.mimeType === "text/plain") extractBody(p);
+              }
+            }
+          };
+          extractBody(email.payload);
+          
+          return {
+            id: email.id,
+            threadId: email.threadId, // For replying in the same thread
+            messageId: getHeader("Message-ID"), // For In-Reply-To header
+            subject: getHeader("Subject"),
+            from: getHeader("From"),
+            to: getHeader("To"),
+            date: getHeader("Date"),
+            body: body.substring(0, 2000)
+          };
+        }
+
+        case "send_email": {
+          const { to, subject, body, cc, bcc, threadId, replyToMessageId } = toolInput;
+          
+          let emailContent = `To: ${to}\r\n`;
+          if (cc) emailContent += `Cc: ${cc}\r\n`;
+          if (bcc) emailContent += `Bcc: ${bcc}\r\n`;
+          
+          // For replies, add In-Reply-To and References headers to maintain thread
+          if (replyToMessageId) {
+            emailContent += `In-Reply-To: ${replyToMessageId}\r\n`;
+            emailContent += `References: ${replyToMessageId}\r\n`;
+          }
+          
+          emailContent += `Subject: ${subject}\r\n`;
+          emailContent += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
+          emailContent += body;
+          
+          const encodedEmail = Buffer.from(emailContent).toString("base64")
+            .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+          
+          // Build request body - include threadId for replies
+          const requestBody = { raw: encodedEmail };
+          if (threadId) {
+            requestBody.threadId = threadId;
+          }
+          
+          const response = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${accessToken}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify(requestBody)
+          });
+          
+          if (!response.ok) {
+            const errData = await response.text();
+            throw new Error(`Failed to send email: ${errData}`);
+          }
+          
+          const result = await response.json();
+          return { 
+            success: true, 
+            message: `Email sent to ${to}`,
+            messageId: result.id,
+            threadId: result.threadId
+          };
+        }
+
+        case "list_drive_files": {
+          const { query, maxResults = 10 } = toolInput;
+          
+          const url = new URL("https://www.googleapis.com/drive/v3/files");
+          url.searchParams.set("pageSize", maxResults.toString());
+          if (query) url.searchParams.set("q", `name contains '${query}'`);
+          
+          const response = await fetch(url.toString(), {
+            headers: { "Authorization": `Bearer ${accessToken}` }
+          });
+          
+          if (!response.ok) throw new Error("Failed to list files");
+          const data = await response.json();
+          return { files: data.files || [] };
+        }
+
+        default:
+          return { error: `Unknown tool: ${toolName}` };
+      }
+    } catch (err) {
+      return { error: err.message };
+    }
+  };
+
+  // Execute profile tool
+  const executeProfileTool = async (toolName, toolInput) => {
+    try {
+      const profilePath = await getUserProfilePath();
+      const markdown = await fs.readFile(profilePath, "utf8");
+      const profile = parseUserProfile(markdown);
+
+      if (toolName === "get_user_profile") {
+        return profile;
+      }
+
+      if (toolName === "update_user_profile") {
+        // Handle addNote
+        if (toolInput.addNote) {
+          if (!profile.notes) {
+            profile.notes = [];
+          }
+          // Check if similar note already exists
+          const existingIndex = profile.notes.findIndex(n => 
+            n.toLowerCase().includes(toolInput.addNote.toLowerCase().split(':')[0])
+          );
+          if (existingIndex >= 0) {
+            // Update existing note
+            profile.notes[existingIndex] = toolInput.addNote;
+          } else {
+            // Add new note
+            profile.notes.push(toolInput.addNote);
+          }
+          delete toolInput.addNote;
+        }
+
+        // Handle removeNote
+        if (toolInput.removeNote) {
+          if (profile.notes) {
+            profile.notes = profile.notes.filter(n => 
+              !n.toLowerCase().includes(toolInput.removeNote.toLowerCase())
+            );
+          }
+          delete toolInput.removeNote;
+        }
+
+        // Update other fields
+        const { addNote, removeNote, ...otherFields } = toolInput;
+        Object.assign(profile, otherFields);
+        
+        const newMarkdown = serializeUserProfile(profile);
+        await fs.writeFile(profilePath, newMarkdown, "utf8");
+        return { success: true, profile, message: "Profile updated successfully" };
+      }
+
+      return { error: "Unknown profile tool" };
+    } catch (err) {
+      return { error: err.message };
+    }
+  };
+
+  // Execute iMessage tool
+  const executeIMessageTool = async (toolName, toolInput) => {
+    const { exec } = require("child_process");
+    const dbPath = path.join(os.homedir(), "Library", "Messages", "chat.db");
+
+    if (process.platform !== "darwin") {
+      return { error: "iMessage is only available on macOS" };
+    }
+
+    try {
+      await fs.access(dbPath);
+    } catch {
+      return { error: "Cannot access Messages database. Grant Full Disk Access." };
+    }
+
+    // Helper to find contacts by name - returns structured contact data
+    const findContactsByName = (name) => {
+      return new Promise((resolve) => {
+        const searchName = name.toLowerCase().replace(/'/g, "''");
+        console.log(`[iMessage] Looking up contact: ${name}`);
+        
+        // AppleScript that outputs JSON-like format - launches Contacts if needed
+        const appleScript = `
+          tell application "Contacts"
+            launch
+            delay 0.5
+            set matchedContacts to {}
+            repeat with aPerson in people
+              try
+                set firstName to first name of aPerson as string
+              on error
+                set firstName to ""
+              end try
+              try
+                set lastName to last name of aPerson as string
+              on error
+                set lastName to ""
+              end try
+              set fullName to firstName & " " & lastName
+              set lowerFullName to do shell script "echo " & quoted form of fullName & " | tr '[:upper:]' '[:lower:]'"
+              set lowerFirst to do shell script "echo " & quoted form of firstName & " | tr '[:upper:]' '[:lower:]'"
+              set lowerLast to do shell script "echo " & quoted form of lastName & " | tr '[:upper:]' '[:lower:]'"
+              
+              if lowerFullName contains "${searchName}" or lowerFirst contains "${searchName}" or lowerLast contains "${searchName}" then
+                set phoneList to {}
+                repeat with aPhone in phones of aPerson
+                  try
+                    set phoneLabel to label of aPhone as string
+                    set phoneValue to value of aPhone as string
+                    set end of phoneList to phoneLabel & ":" & phoneValue
+                  end try
+                end repeat
+                if (count of phoneList) > 0 then
+                  set end of matchedContacts to fullName & "|" & (phoneList as string)
+                end if
+              end if
+            end repeat
+            return matchedContacts
+          end tell
+        `;
+        
+        exec(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, { timeout: 15000 }, (error, stdout) => {
+          if (error) {
+            console.error(`[iMessage] Contact lookup error: ${error.message}`);
+            resolve([]);
+            return;
+          }
+          
+          const output = stdout.trim();
+          console.log(`[iMessage] Contact lookup raw output: ${output}`);
+          
+          if (!output || output === "{}") {
+            resolve([]);
+            return;
+          }
+          
+          // Parse the output - format: "Name|phone:number, phone:number, Name2|phone:number"
+          const contacts = [];
+          // Split by comma that's followed by a name (not part of a phone number)
+          const entries = output.split(/,\s*(?=[A-Za-z])/);
+          
+          for (const entry of entries) {
+            const parts = entry.trim().split("|");
+            if (parts.length >= 2) {
+              const name = parts[0].trim();
+              const phonesStr = parts.slice(1).join("|");
+              
+              // Extract phone numbers
+              const phones = [];
+              const phoneMatches = phonesStr.match(/([^:,]+):([^,]+)/g) || [];
+              for (const pm of phoneMatches) {
+                const [label, number] = pm.split(":");
+                if (number) {
+                  phones.push({
+                    label: label?.trim() || "phone",
+                    number: number.trim()
+                  });
+                }
+              }
+              
+              // Also try to extract any remaining phone numbers
+              const extraPhones = phonesStr.match(/\+?\d[\d\s()-]{6,}/g) || [];
+              for (const phone of extraPhones) {
+                const cleanPhone = phone.replace(/[\s()-]/g, "");
+                if (!phones.some(p => p.number.replace(/[\s()-]/g, "") === cleanPhone)) {
+                  phones.push({ label: "phone", number: cleanPhone });
+                }
+              }
+              
+              if (phones.length > 0) {
+                contacts.push({ name, phones });
+              }
+            }
+          }
+          
+          console.log(`[iMessage] Found ${contacts.length} contacts:`, JSON.stringify(contacts));
+          resolve(contacts);
+        });
+      });
+    };
+    
+    // Legacy helper for backward compatibility
+    const findPhoneByName = async (name) => {
+      const contacts = await findContactsByName(name);
+      if (contacts.length > 0) {
+        // Return first phone number of first contact
+        return contacts.flatMap(c => c.phones.map(p => p.number));
+      }
+      return [];
+    };
+
+    try {
+      switch (toolName) {
+        case "get_recent_messages": {
+          const hours = toolInput.hours || 24;
+          const contactFilter = toolInput.contact || null;
+          const limit = toolInput.limit || 50;
+
+          const cutoffDate = new Date();
+          cutoffDate.setHours(cutoffDate.getHours() - hours);
+          const appleEpoch = new Date("2001-01-01T00:00:00Z").getTime();
+          const cutoffTimestamp = (cutoffDate.getTime() - appleEpoch) * 1000000;
+
+          let whereClause = `m.date > ${cutoffTimestamp}`;
+          
+          // If contact filter provided, try to resolve it to phone numbers
+          let contactPhones = [];
+          if (contactFilter) {
+            // Check if it's a name (contains letters) or a phone number
+            if (/[a-zA-Z]/.test(contactFilter)) {
+              contactPhones = await findPhoneByName(contactFilter);
+            }
+            
+            if (contactPhones.length > 0) {
+              // Match any of the found phone numbers
+              const phoneConditions = contactPhones.map(phone => {
+                const digits = phone.replace(/\D/g, "");
+                return `h.id LIKE '%${digits.slice(-10)}%'`;
+              }).join(" OR ");
+              whereClause += ` AND (${phoneConditions})`;
+            } else {
+              // Fall back to direct matching
+              const cleanContact = contactFilter.replace(/'/g, "''").replace(/\D/g, "");
+              whereClause += ` AND (h.id LIKE '%${cleanContact}%' OR h.id LIKE '%${contactFilter.replace(/'/g, "''")}%')`;
+            }
+          }
+
+          const query = `SELECT m.text, m.is_from_me, datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date, h.id as contact FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID WHERE ${whereClause} ORDER BY m.date DESC LIMIT ${limit};`;
+
+          return new Promise((resolve) => {
+            exec(`sqlite3 -json "${dbPath}" "${query.replace(/"/g, '\\"')}"`, { maxBuffer: 10 * 1024 * 1024 }, async (error, stdout) => {
+              if (error) {
+                resolve({ error: `Query failed: ${error.message}` });
+                return;
+              }
+              try {
+                const rows = stdout.trim() ? JSON.parse(stdout) : [];
+                
+                // Get unique contact identifiers and resolve names
+                const contactIds = rows.filter(r => !r.is_from_me && r.contact).map(r => r.contact);
+                const contactNames = await lookupContactNames(contactIds);
+                
+                const messages = rows.map(row => {
+                  const contactName = row.contact ? contactNames.get(row.contact) : null;
+                  return {
+                    text: row.text || "(attachment)",
+                    from: row.is_from_me ? "Me" : (contactName || row.contact || "Unknown"),
+                    phone: row.is_from_me ? null : row.contact,
+                    date: row.date,
+                    direction: row.is_from_me ? "sent" : "received"
+                  };
+                });
+                resolve({ messages, count: messages.length });
+              } catch (e) {
+                resolve({ error: "Failed to parse results: " + e.message });
+              }
+            });
+          });
+        }
+
+        case "search_messages": {
+          const searchQuery = toolInput.query.replace(/'/g, "''");
+          const contactFilter = toolInput.contact || null;
+          const limit = toolInput.limit || 20;
+
+          let whereClause = `m.text LIKE '%${searchQuery}%'`;
+          
+          // Handle contact filter
+          if (contactFilter) {
+            let contactPhones = [];
+            if (/[a-zA-Z]/.test(contactFilter)) {
+              contactPhones = await findPhoneByName(contactFilter);
+            }
+            
+            if (contactPhones.length > 0) {
+              const phoneConditions = contactPhones.map(phone => {
+                const digits = phone.replace(/\D/g, "");
+                return `h.id LIKE '%${digits.slice(-10)}%'`;
+              }).join(" OR ");
+              whereClause += ` AND (${phoneConditions})`;
+            } else {
+              const cleanContact = contactFilter.replace(/'/g, "''").replace(/\D/g, "");
+              whereClause += ` AND (h.id LIKE '%${cleanContact}%')`;
+            }
+          }
+
+          const query = `SELECT m.text, m.is_from_me, datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date, h.id as contact FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID WHERE ${whereClause} ORDER BY m.date DESC LIMIT ${limit};`;
+
+          return new Promise((resolve) => {
+            exec(`sqlite3 -json "${dbPath}" "${query.replace(/"/g, '\\"')}"`, { maxBuffer: 10 * 1024 * 1024 }, async (error, stdout) => {
+              if (error) {
+                resolve({ error: `Search failed: ${error.message}` });
+                return;
+              }
+              try {
+                const rows = stdout.trim() ? JSON.parse(stdout) : [];
+                
+                // Resolve contact names
+                const contactIds = rows.filter(r => !r.is_from_me && r.contact).map(r => r.contact);
+                const contactNames = await lookupContactNames(contactIds);
+                
+                const messages = rows.map(row => {
+                  const contactName = row.contact ? contactNames.get(row.contact) : null;
+                  return {
+                    text: row.text,
+                    from: row.is_from_me ? "Me" : (contactName || row.contact || "Unknown"),
+                    phone: row.is_from_me ? null : row.contact,
+                    date: row.date,
+                    direction: row.is_from_me ? "sent" : "received"
+                  };
+                });
+                resolve({ messages, count: messages.length, searchQuery: toolInput.query });
+              } catch (e) {
+                resolve({ error: "Failed to parse results: " + e.message });
+              }
+            });
+          });
+        }
+
+        case "lookup_contact": {
+          const { name } = toolInput;
+          console.log(`[iMessage] lookup_contact called for: ${name}`);
+          
+          const contacts = await findContactsByName(name);
+          
+          if (contacts.length === 0) {
+            return { 
+              found: false, 
+              message: `No contacts found matching "${name}"`,
+              suggestion: "Try a different spelling or partial name"
+            };
+          }
+          
+          return {
+            found: true,
+            searchedFor: name,
+            contacts: contacts.map(c => ({
+              name: c.name,
+              phones: c.phones
+            })),
+            hint: "Use the phone number to send a message with send_imessage"
+          };
+        }
+
+        case "send_imessage": {
+          let { recipient, message } = toolInput;
+          const originalRecipient = recipient;
+          
+          console.log(`[iMessage] send_imessage called - recipient: ${recipient}, message: ${message}`);
+
+          // If recipient looks like a name (has letters and no @ or +), try to find their phone number
+          if (/[a-zA-Z]/.test(recipient) && !/[@+]/.test(recipient)) {
+            console.log(`[iMessage] Recipient looks like a name, looking up contact...`);
+            const contacts = await findContactsByName(recipient);
+            
+            if (contacts.length > 0 && contacts[0].phones.length > 0) {
+              // Use the first phone number found (prefer mobile)
+              const mobilePhone = contacts[0].phones.find(p => 
+                p.label.toLowerCase().includes('mobile') || 
+                p.label.toLowerCase().includes('iphone') ||
+                p.label.toLowerCase().includes('cell')
+              );
+              recipient = mobilePhone ? mobilePhone.number : contacts[0].phones[0].number;
+              console.log(`[iMessage] Resolved "${originalRecipient}" to ${recipient} (${contacts[0].name})`);
+            } else {
+              console.log(`[iMessage] Could not find phone number for "${recipient}"`);
+              return { 
+                error: `Could not find a phone number for "${recipient}". Please use lookup_contact first to find their number.`,
+                suggestion: "Try using lookup_contact to find the correct contact and phone number"
+              };
+            }
+          }
+
+          // Clean up phone number - remove spaces, dashes, parentheses
+          if (/^\+?\d/.test(recipient)) {
+            recipient = recipient.replace(/[\s()-]/g, "");
+          }
+
+          return new Promise((resolve) => {
+            const escapedMessage = message.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+            const escapedRecipient = recipient.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+            // Try multiple approaches for sending
+            const appleScript = `
+              tell application "Messages"
+                -- Try to find existing conversation first
+                set targetBuddy to null
+                try
+                  set targetService to 1st service whose service type = iMessage
+                  set targetBuddy to buddy "${escapedRecipient}" of targetService
+                on error
+                  -- Try SMS service if iMessage fails
+                  try
+                    set targetService to 1st service whose service type = SMS
+                    set targetBuddy to buddy "${escapedRecipient}" of targetService
+                  end try
+                end try
+                
+                if targetBuddy is not null then
+                  send "${escapedMessage}" to targetBuddy
+                  return "sent"
+                else
+                  return "no buddy found"
+                end if
+              end tell
+            `;
+
+            exec(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, { timeout: 15000 }, (error, stdout) => {
+              if (error) {
+                console.error(`[iMessage] Send failed: ${error.message}`);
+                resolve({ error: `Failed to send message: ${error.message}` });
+              } else if (stdout.trim() === "no buddy found") {
+                resolve({ error: `Could not find a conversation with "${recipient}". They may not be in your Messages contacts.` });
+              } else {
+                console.log(`[iMessage] Message sent successfully to ${recipient}`);
+                resolve({ 
+                  success: true, 
+                  message: `Message sent to ${originalRecipient}${originalRecipient !== recipient ? ` (${recipient})` : ""}`,
+                  sentTo: recipient
+                });
+              }
+            });
+          });
+        }
+
+        default:
+          return { error: `Unknown tool: ${toolName}` };
+      }
+    } catch (err) {
+      return { error: err.message };
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Full Task Executor (with access to all tools)
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  setTaskExecutor(async (taskId) => {
+    console.log(`[Tasks] Executing step for task: ${taskId}`);
+    
+    const task = await getTask(taskId);
+    if (!task) {
+      console.error(`[Tasks] Task ${taskId} not found`);
+      return { error: "Task not found" };
+    }
+
+    // Skip if task is not in an executable state
+    if (task.status !== "active" && task.status !== "waiting") {
+      console.log(`[Tasks] Task ${taskId} is not in executable state: ${task.status}`);
+      return { skipped: true, reason: `Task status is ${task.status}` };
+    }
+
+    // Get settings for API keys
+    const settingsPath = await getSettingsPath();
+    let apiKeys = {};
+    try {
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      apiKeys = settings.apiKeys || {};
+    } catch {
+      console.error("[Tasks] No API keys configured");
+      await updateTask(taskId, {
+        status: "failed",
+        logEntry: "No API keys configured"
+      });
+      return { error: "No API keys configured" };
+    }
+
+    if (!apiKeys.anthropic) {
+      await updateTask(taskId, {
+        status: "failed",
+        logEntry: "Anthropic API key required for task execution"
+      });
+      return { error: "Anthropic API key required" };
+    }
+
+    // Task state management tool (specific to task executor)
+    const taskStateManagementTool = {
+      name: "update_task_state",
+      description: "Update the task state after completing actions. ALWAYS call this at the end of execution to report what happened and set the next state.",
+      input_schema: {
+        type: "object",
+        properties: {
+          logMessage: { type: "string", description: "What happened during this execution (be specific)" },
+          nextStatus: { 
+            type: "string", 
+            enum: ["active", "waiting", "completed", "failed"],
+            description: "active=continue to next step now, waiting=wait for external event (set pollIntervalMs), completed=all done, failed=error" 
+          },
+          nextStep: { type: "number", description: "The next step number (current step + 1 if advancing)" },
+          pollIntervalMs: { type: "number", description: "If waiting, milliseconds until next check. Use 3600000 for 1 hour, 86400000 for 1 day" },
+          contextUpdates: { type: "object", description: "Key-value pairs to remember for future steps" },
+          notifyUser: { type: "string", description: "Message to show the user in chat (optional)" }
+        },
+        required: ["logMessage", "nextStatus"]
+      }
+    };
+
+    // Use shared tool builder - ensures tasks have same tools as chat
+    const { tools: integrationTools, executeTool, googleAccessToken, slackAccessToken, weatherEnabled } = await loadIntegrationsAndBuildTools({
+      includeProfileTools: false,  // Tasks don't need profile tools
+      includeTaskTools: false,     // Tasks don't create other tasks
+      includeMemoryTools: false    // Tasks don't need memory search
+    });
+    
+    // Combine task-specific tool with integration tools
+    const executorTools = [taskStateManagementTool, ...integrationTools];
+
+    // Build system prompt with current date
+    const now = new Date();
+    const currentDateStr = now.toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+    
+    // Determine messaging channel for this task
+    const taskMessagingChannel = task.messagingChannel || task.contextMemory?.messaging_channel;
+    const channelTools = {
+      imessage: "send_imessage (for text/SMS)",
+      email: "send_email (for email/Gmail)",
+      slack: "send_slack_message (for Slack)"
+    };
+    
+    // Check for skill constraints
+    const skillName = task.contextMemory?.skill_name;
+    const skillConstraints = task.contextMemory?.skill_constraints;
+    
+    const systemPrompt = `You are an autonomous Task Executor Agent. You execute tasks step by step on behalf of the user.
+
+CURRENT DATE/TIME: ${currentDateStr} at ${now.toLocaleTimeString()}
+(Use this date for all scheduling - do NOT use dates from old context data)
+
+TASK INFORMATION:
+- Task ID: ${task.id}
+- Title: ${task.title}
+- Original Request: "${task.originalRequest}"
+- Current Step: ${task.currentStep.step} of ${task.plan.length}
+${taskMessagingChannel ? `\n*** MESSAGING CHANNEL: ${taskMessagingChannel.toUpperCase()} ***
+YOU MUST USE: ${channelTools[taskMessagingChannel] || taskMessagingChannel}
+DO NOT USE email if the channel is imessage. DO NOT USE imessage if the channel is email.` : ""}
+${skillName ? `\n*** SKILL: ${skillName} ***
+CONSTRAINTS YOU MUST FOLLOW:
+${skillConstraints ? skillConstraints.split("; ").map(c => `- ${c}`).join("\n") : "None"}` : ""}
+
+PLAN:
+${task.plan.map((step, i) => `${i + 1}. ${step}${i + 1 === task.currentStep.step ? " ← CURRENT STEP" : ""}`).join("\n")}
+
+SAVED CONTEXT:
+${Object.entries(task.contextMemory).map(([k, v]) => `- ${k}: ${v}`).join("\n") || "None yet"}
+
+RECENT LOG:
+${task.executionLog.slice(-3).map(e => `- ${e.message}`).join("\n") || "Task just started"}
+
+INSTRUCTIONS:
+1. Execute the CURRENT STEP using the available tools
+2. After completing the step's action, ALWAYS call update_task_state to:
+   - Log what you did
+   - Set nextStatus: "waiting" if waiting for a response, "active" to continue immediately, "completed" if all done
+   - Set nextStep to current step + 1 if advancing
+   - Set pollIntervalMs if waiting (e.g., 60000 = 1 minute - lightweight checks are free)
+   - Save any important info in contextUpdates
+
+3. CRITICAL - When SENDING a message and waiting for a reply:
+   - Set contextUpdates.waiting_via = the messaging channel you used:
+     * "email" if you used send_email
+     * "imessage" if you used send_imessage
+     * "slack" if you used send_slack_message
+   - Set contextUpdates.waiting_for_contact = the contact identifier (email address, phone/name, or Slack user)
+   - Set contextUpdates.last_message_time = current ISO date ("${new Date().toISOString()}")
+   - Use pollIntervalMs: 60000 (1 minute) - all lightweight checks are free
+   - Set nextStatus: "waiting" to wait for the reply
+
+4. IMPORTANT - Use the MESSAGING CHANNEL specified above (if any):
+   - If MESSAGING CHANNEL says IMESSAGE → use send_imessage (NEVER send_email)
+   - If MESSAGING CHANNEL says EMAIL → use send_email (NEVER send_imessage)
+   - If MESSAGING CHANNEL says SLACK → use send_slack_message
+   - Use the SAME channel throughout the entire task
+   - IGNORE any defaults - strictly follow the MESSAGING CHANNEL
+
+5. CRITICAL - REPLY DETECTED: If the SAVED CONTEXT shows "new_reply_detected: true":
+   *** A REPLY HAS BEEN RECEIVED - YOU MUST PROCESS IT NOW ***
+   - First, use list_emails or get_recent_messages to READ the new message content
+   - Process the reply content to determine next actions
+   - Clear the reply flag: contextUpdates.new_reply_detected = false
+   - ADVANCE TO THE NEXT STEP: set nextStatus: "active" and nextStep = current step + 1
+   - Do NOT stay on the same step - the reply means this step is complete
+
+6. AUTO-PROGRESSION: After completing each step that doesn't require waiting:
+   - ALWAYS set nextStatus: "active" and nextStep to the next step number
+   - This ensures the task continues immediately without waiting for the scheduler
+   - Only use nextStatus: "waiting" when you've JUST sent a message and need to wait for a reply
+
+IMPORTANT: You MUST call update_task_state before finishing. Always advance to the next step after completing the current one.`;
+
+    // Build user message - make it clear if a reply was received
+    const replyDetected = task.contextMemory?.new_reply_detected;
+    const waitingVia = task.contextMemory?.waiting_via;
+    const waitingFor = task.contextMemory?.waiting_for_contact;
+    
+    let userPrompt;
+    if (replyDetected && waitingVia && waitingFor) {
+      userPrompt = `🔔 A REPLY HAS BEEN RECEIVED from ${waitingFor} via ${waitingVia}!
+
+Your current step is ${task.currentStep.step}: "${task.plan[task.currentStep.step - 1]}"
+
+ACTION REQUIRED:
+1. First, READ the reply using ${waitingVia === "email" ? "list_emails with from:" + waitingFor : waitingVia === "slack" ? "list_slack_messages" : "get_recent_messages"}
+2. Process what they said
+3. Call update_task_state with:
+   - logMessage describing what they replied
+   - nextStatus: "active" 
+   - nextStep: ${task.currentStep.step + 1}
+   - contextUpdates.new_reply_detected = false
+
+DO NOT stay on this step. ADVANCE to the next step.`;
+    } else {
+      userPrompt = `Execute step ${task.currentStep.step}: "${task.plan[task.currentStep.step - 1]}"\n\nDo the action required for this step, then call update_task_state with the results.`;
+    }
+    
+    const messages = [
+      { 
+        role: "user", 
+        content: userPrompt
+      }
+    ];
+
+    try {
+      let currentMessages = [...messages];
+      
+      // Agentic loop - up to 5 iterations
+      for (let iteration = 0; iteration < 5; iteration++) {
+        console.log(`[Tasks] Executor iteration ${iteration + 1} for task ${taskId}`);
+        
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKeys.anthropic,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 4096,
+            system: systemPrompt,
+            messages: currentMessages,
+            tools: executorTools
+          })
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`API error: ${errText}`);
+        }
+
+        const result = await response.json();
+        
+        // Check for tool use
+        const toolUseBlocks = result.content.filter(b => b.type === "tool_use");
+        
+        if (toolUseBlocks.length === 0) {
+          // No tools called - check if we got a text response
+          const textContent = result.content.find(b => b.type === "text")?.text || "";
+          console.log(`[Tasks] No tools called, text response: ${textContent.slice(0, 100)}`);
+          
+          await updateTask(taskId, {
+            logEntry: `Execution completed without state update: ${textContent.slice(0, 100)}`
+          });
+          break;
+        }
+
+        // Process tool calls
+        const toolResults = [];
+        
+        for (const toolUse of toolUseBlocks) {
+          console.log(`[Tasks] Tool call: ${toolUse.name}`, JSON.stringify(toolUse.input).slice(0, 200));
+          let toolResult;
+
+          if (toolUse.name === "update_task_state") {
+            // Apply state update
+            const input = toolUse.input;
+            const updates = {
+              status: input.nextStatus,
+              logEntry: input.logMessage
+            };
+
+            if (input.nextStep) {
+              updates.currentStep = {
+                step: input.nextStep,
+                description: task.plan[input.nextStep - 1] || "",
+                state: input.nextStatus,
+                pollInterval: input.pollIntervalMs || null
+              };
+            }
+
+            if (input.pollIntervalMs && input.nextStatus === "waiting") {
+              updates.nextCheck = Date.now() + input.pollIntervalMs;
+            }
+
+            if (input.contextUpdates) {
+              updates.contextMemory = { ...task.contextMemory, ...input.contextUpdates };
+            }
+
+            await updateTask(taskId, updates);
+
+            // PROACTIVE NOTIFICATIONS - Always notify user of important task events
+            if (win) {
+              let notificationMessage = null;
+              let notificationEmoji = "📋";
+              
+              // Completed tasks get special notification
+              if (input.nextStatus === "completed") {
+                notificationEmoji = "✅";
+                notificationMessage = `Task completed!\n\n${input.logMessage}`;
+              }
+              // Failed tasks get alert notification
+              else if (input.nextStatus === "failed") {
+                notificationEmoji = "❌";
+                notificationMessage = `Task failed: ${input.logMessage}`;
+              }
+              // Step advancement (not just waiting on same step)
+              else if (input.nextStep && input.nextStep > task.currentStep.step) {
+                notificationEmoji = "📝";
+                const nextStepDesc = task.plan[input.nextStep - 1] || "";
+                notificationMessage = `Step ${task.currentStep.step} complete: ${input.logMessage}\n\nMoving to step ${input.nextStep}: ${nextStepDesc}`;
+              }
+              // Waiting for reply - brief update
+              else if (input.nextStatus === "waiting" && task.contextMemory?.waiting_for_contact) {
+                notificationEmoji = "⏳";
+                notificationMessage = `${input.logMessage}\n\nWaiting for reply from ${task.contextMemory.waiting_for_contact || input.contextUpdates?.waiting_for_contact}...`;
+              }
+              // Custom notification from executor
+              else if (input.notifyUser) {
+                notificationMessage = input.notifyUser;
+              }
+              
+              // Send notification to chat if we have one
+              if (notificationMessage) {
+                addTaskUpdate(taskId, notificationMessage);
+                win.webContents.send("chat:newMessage", {
+                  role: "assistant",
+                  content: `${notificationEmoji} **Task: ${task.title}**\n\n${notificationMessage}`,
+                  source: "task"
+                });
+              }
+            }
+
+            console.log(`[Tasks] Task ${taskId} state updated: status=${input.nextStatus}, step=${input.nextStep || task.currentStep.step}`);
+            toolResult = { success: true, message: "Task state updated" };
+            
+            // If status is "active", immediately continue to next step (don't wait for scheduler)
+            if (input.nextStatus === "active" && input.nextStep && input.nextStep <= task.plan.length) {
+              console.log(`[Tasks] Auto-continuing to step ${input.nextStep} for task ${taskId}`);
+              // Schedule immediate continuation (use setTimeout to avoid deep recursion)
+              setTimeout(() => executeTaskStep(taskId), 100);
+            }
+            
+            // State was updated, we can exit the loop
+            return { success: true, stateUpdate: input };
+            
+          } else {
+            // Use shared tool executor for all other tools
+            toolResult = await executeTool(toolUse.name, toolUse.input);
+          }
+
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: toolUse.id,
+            content: JSON.stringify(toolResult)
+          });
+        }
+
+        // Continue the conversation with tool results
+        currentMessages.push({ role: "assistant", content: result.content });
+        currentMessages.push({ role: "user", content: toolResults });
+      }
+
+      // If we exited without updating state, mark as needing attention
+      await updateTask(taskId, {
+        logEntry: "Execution completed but state was not explicitly updated"
+      });
+      
+      return { success: false, message: "Max iterations reached without state update" };
+
+    } catch (err) {
+      console.error(`[Tasks] Execution error for ${taskId}:`, err.message);
+      await updateTask(taskId, {
+        status: "failed",
+        logEntry: `Execution failed: ${err.message}`
+      });
+      return { error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Shared Tool Builder - Used by both Chat and Task Executor
+  // ─────────────────────────────────────────────────────────────────────────────
+  
+  /**
+   * Builds the list of available tools based on enabled integrations
+   * @param {Object} options - Configuration options
+   * @param {string} options.googleAccessToken - Google OAuth token (if available)
+   * @param {string} options.slackAccessToken - Slack OAuth token (if available)
+   * @param {boolean} options.weatherEnabled - Whether weather is enabled
+   * @param {boolean} options.iMessageEnabled - Whether iMessage is enabled
+   * @param {boolean} options.includeProfileTools - Include profile management tools
+   * @param {boolean} options.includeTaskTools - Include task management tools
+   * @param {boolean} options.includeMemoryTools - Include memory search tools
+   * @param {Array} options.additionalTools - Extra tools to include
+   * @returns {Object} { tools: Array, executeTool: Function }
+   */
+  const buildToolsAndExecutor = (options = {}) => {
+    const {
+      googleAccessToken = null,
+      slackAccessToken = null,
+      weatherEnabled = true,
+      iMessageEnabled = false,
+      includeProfileTools = true,
+      includeTaskTools = true,
+      includeMemoryTools = true,
+      additionalTools = []
+    } = options;
+
+    // Build tools list
+    const tools = [];
+    
+    if (includeProfileTools) tools.push(...profileTools);
+    if (includeTaskTools) tools.push(...taskTools);
+    if (includeMemoryTools) tools.push(...memoryTools);
+    if (googleAccessToken) tools.push(...googleWorkspaceTools);
+    if (iMessageEnabled) tools.push(...iMessageTools);
+    if (weatherEnabled) tools.push(...weatherTools);
+    if (slackAccessToken) tools.push(...slackTools);
+    if (additionalTools.length > 0) tools.push(...additionalTools);
+
+    // Tool execution router
+    const executeTool = async (toolName, toolInput) => {
+      // Profile tools
+      if (profileTools.find(t => t.name === toolName)) {
+        return await executeProfileTool(toolName, toolInput);
+      }
+      // Task tools
+      if (taskTools.find(t => t.name === toolName)) {
+        return await executeTaskTool(toolName, toolInput);
+      }
+      // Memory tools
+      if (memoryTools.find(t => t.name === toolName)) {
+        return await executeMemorySearch(toolInput.query, toolInput.date_range);
+      }
+      // Google tools
+      if (googleAccessToken && googleWorkspaceTools.find(t => t.name === toolName)) {
+        return await executeGoogleTool(toolName, toolInput, googleAccessToken);
+      }
+      // iMessage tools
+      if (iMessageEnabled && iMessageTools.find(t => t.name === toolName)) {
+        return await executeIMessageTool(toolName, toolInput);
+      }
+      // Weather tools
+      if (weatherEnabled && weatherTools.find(t => t.name === toolName)) {
+        return await executeWeatherTool(toolName, toolInput);
+      }
+      // Slack tools
+      if (slackAccessToken && slackTools.find(t => t.name === toolName)) {
+        return await executeSlackTool(toolName, toolInput, slackAccessToken);
+      }
+      
+      return { error: `Tool ${toolName} not available` };
+    };
+
+    return { tools, executeTool };
+  };
+
+  /**
+   * Loads integration settings and builds tools
+   * @returns {Object} { tools, executeTool, googleAccessToken, slackAccessToken, weatherEnabled, iMessageEnabled }
+   */
+  const loadIntegrationsAndBuildTools = async (options = {}) => {
+    const settingsPath = await getSettingsPath();
+    
+    // Load Google token
+    let googleAccessToken = null;
+    try {
+      googleAccessToken = await getGoogleAccessToken();
+    } catch {
+      // No Google
+    }
+
+    // Load Slack token
+    let slackAccessToken = null;
+    try {
+      slackAccessToken = await getSlackAccessToken();
+    } catch {
+      // No Slack
+    }
+
+    // Check weather enabled
+    let weatherEnabled = true;
+    try {
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      weatherEnabled = settings.weatherEnabled !== false;
+    } catch {
+      // Default enabled
+    }
+
+    // Check iMessage enabled - available on macOS by default
+    let iMessageEnabled = process.platform === "darwin";
+    try {
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      // Allow user to explicitly disable iMessage if they want
+      if (settings.iMessageEnabled === false) {
+        iMessageEnabled = false;
+      }
+    } catch {
+      // Default to platform check
+    }
+
+    const { tools, executeTool } = buildToolsAndExecutor({
+      googleAccessToken,
+      slackAccessToken,
+      weatherEnabled,
+      iMessageEnabled,
+      ...options
+    });
+
+    return {
+      tools,
+      executeTool,
+      googleAccessToken,
+      slackAccessToken,
+      weatherEnabled,
+      iMessageEnabled
+    };
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Register Messaging Integrations
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Register Email/Gmail integration
+  registerMessagingIntegration({
+    id: "email",
+    name: "Email (Gmail)",
+    keywords: ["email", "gmail", "mail"],
+    enabled: true,  // Will check for token at execution time
+    
+    sendMessage: async (recipient, message, subject, accessToken) => {
+      return await executeGoogleTool("send_email", { 
+        to: recipient, 
+        subject: subject || "Message from Wovly", 
+        body: message 
+      }, accessToken);
+    },
+    
+    checkForNewMessages: async (contact, afterTimestamp, accessToken) => {
+      if (!accessToken) return { hasNew: false, reason: "no access token" };
+      return await checkForNewEmails(accessToken, contact, afterTimestamp);
+    },
+    
+    getMessages: async (contact, options, accessToken) => {
+      return await executeGoogleTool("list_emails", { from: contact, ...options }, accessToken);
+    }
+  });
+
+  // Register iMessage/SMS integration
+  registerMessagingIntegration({
+    id: "imessage",
+    name: "iMessage/SMS",
+    keywords: ["text", "imessage", "sms", "message her", "message him", "message them"],
+    enabled: process.platform === "darwin",
+    
+    sendMessage: async (recipient, message) => {
+      return await executeIMessageTool("send_imessage", { recipient, message });
+    },
+    
+    checkForNewMessages: async (contact, afterTimestamp) => {
+      return await checkForNewIMessages(contact, afterTimestamp);
+    },
+    
+    getMessages: async (contact, options) => {
+      return await executeIMessageTool("get_recent_messages", { contact, ...options });
+    },
+    
+    resolveContact: async (name) => {
+      return await findContactsByName(name);
+    }
+  });
+
+  // Register Slack integration
+  registerMessagingIntegration({
+    id: "slack",
+    name: "Slack",
+    keywords: ["slack"],
+    enabled: true,  // Will check for token at execution time
+    
+    sendMessage: async (recipient, message, _subject, accessToken) => {
+      return await executeSlackTool("send_slack_message", { 
+        channel: recipient, 
+        text: message 
+      }, accessToken);
+    },
+    
+    checkForNewMessages: async (contact, afterTimestamp, accessToken) => {
+      if (!accessToken) return { hasNew: false, reason: "no access token" };
+      return await checkForNewSlackMessages(contact, afterTimestamp, accessToken);
+    },
+    
+    getMessages: async (contact, options, accessToken) => {
+      return await executeSlackTool("get_slack_messages", { 
+        channel: contact, 
+        ...options 
+      }, accessToken);
+    },
+    
+    resolveContact: async (name, accessToken) => {
+      return await executeSlackTool("search_slack_users", { query: name }, accessToken);
+    }
+  });
+
+  console.log(`[Messaging] Registered ${Object.keys(messagingIntegrations).length} messaging integrations`);
+
+  // Chat handler with agentic workflow
+  ipcMain.handle("chat:send", async (_event, { messages }) => {
+    try {
+      const settingsPath = await getSettingsPath();
+      let apiKeys = {};
+      let models = {};
+      let activeProvider = "anthropic";
+      try {
+        const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+        apiKeys = settings.apiKeys || {};
+        models = settings.models || {};
+        activeProvider = settings.activeProvider || "anthropic";
+      } catch {
+        return { ok: false, error: "No API keys configured" };
+      }
+
+      if (!apiKeys.anthropic && !apiKeys.openai && !apiKeys.google) {
+        return { ok: false, error: "No API keys configured. Go to Settings to add your API key." };
+      }
+
+      // Get user profile for context
+      let profile = null;
+      try {
+        const profilePath = await getUserProfilePath();
+        const markdown = await fs.readFile(profilePath, "utf8");
+        profile = parseUserProfile(markdown);
+      } catch {
+        // No profile
+      }
+
+      // Check Google auth
+      const accessToken = await getGoogleAccessToken();
+      const hasGoogleTools = !!accessToken;
+      const hasIMessageTools = process.platform === "darwin";
+
+      // Load conversation context (historical memory)
+      let conversationContext = { todayMessages: "", yesterdayMessages: "", recentSummaries: "" };
+      try {
+        conversationContext = await loadConversationContext();
+      } catch (err) {
+        console.error("[Memory] Error loading conversation context:", err.message);
+      }
+
+      // Load skills and find best match for user's message
+      let matchedSkill = null;
+      try {
+        const userMessage = messages[messages.length - 1]?.content || "";
+        const skills = await loadAllSkills();
+        if (skills.length > 0 && userMessage) {
+          matchedSkill = await findBestSkill(userMessage, skills);
+        }
+      } catch (err) {
+        console.error("[Skills] Error matching skill:", err.message);
+      }
+
+      // Build system prompt
+      let systemPrompt = `You are Wovly, a warm and helpful AI assistant. You have a friendly, supportive personality.`;
+
+      if (profile) {
+        systemPrompt += `\n\nUser Profile:\n- Name: ${profile.firstName} ${profile.lastName}\n- Occupation: ${profile.occupation || "Not specified"}\n- City: ${profile.city || "Not specified"}\n- Home Life: ${profile.homeLife || "Not specified"}`;
+      }
+
+      // Add conversation history context
+      if (conversationContext.todayMessages || conversationContext.yesterdayMessages || conversationContext.recentSummaries) {
+        systemPrompt += `\n\n## Recent Conversation History\nUse this context to provide personalized responses and recall past conversations.`;
+        
+        if (conversationContext.todayMessages) {
+          systemPrompt += `\n\n### Earlier Today:\n${conversationContext.todayMessages}`;
+        }
+        
+        if (conversationContext.yesterdayMessages) {
+          systemPrompt += `\n\n### Yesterday:\n${conversationContext.yesterdayMessages}`;
+        }
+        
+        if (conversationContext.recentSummaries) {
+          systemPrompt += `\n\n### Summary of Recent Days (past 2 weeks):\n${conversationContext.recentSummaries}`;
+        }
+      }
+
+      // Add matched skill context (Advisory Mode)
+      if (matchedSkill && matchedSkill.confidence >= 0.3) {
+        const skill = matchedSkill.skill;
+        systemPrompt += `\n\n## Active Skill: ${skill.name}
+
+You have expertise in this area. Use this knowledge to guide the user:
+
+**Recommended Approach:**
+${skill.procedure.map((step, i) => `${i + 1}. ${step}`).join("\n")}
+
+**Important Constraints:**
+${skill.constraints.map(c => `- ${c}`).join("\n")}
+
+Use this as advisory guidance. When the user asks about this topic, explain the recommended process and offer to help them through each step. If they want you to execute the full process autonomously, suggest creating a task.`;
+      }
+
+      if (hasGoogleTools) {
+        systemPrompt += `\n\nYou have access to Google Workspace tools (calendar, email, drive). Use them when relevant.`;
+      }
+
+      if (hasIMessageTools) {
+        systemPrompt += `\n\nYou have access to iMessage/SMS tools:
+- lookup_contact: Look up phone numbers from Apple Contacts by name. Use this to find someone's phone number.
+- send_imessage: Send a text message. You can use a contact name directly (e.g., "Adaira") and it will auto-lookup their phone number from Contacts.
+- get_recent_messages: Read recent text messages.
+- search_messages: Search through message history.
+
+When sending messages: You can pass a contact name directly to send_imessage - it will automatically look up their phone number. Always confirm with the user before sending.`;
+      }
+
+      // Weather system prompt (added before checking if enabled)
+      systemPrompt += `\n\nYou have access to weather tools. You can look up weather forecasts, current conditions, and find location coordinates. Use these when the user asks about weather.`;
+
+      // Slack system prompt will be added after we check if connected
+
+      // Check if weather is enabled
+      let weatherEnabled = true; // Weather is always available (no API key needed)
+      try {
+        const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+        weatherEnabled = settings.weatherEnabled !== false; // Default to enabled
+      } catch {
+        // Use default
+      }
+
+      // Check if Slack is connected
+      let slackAccessToken = null;
+      let hasSlackTools = false;
+      try {
+        slackAccessToken = await getSlackAccessToken();
+        hasSlackTools = !!slackAccessToken;
+      } catch {
+        // No Slack
+      }
+
+      // Add Slack system prompt if connected
+      if (hasSlackTools) {
+        systemPrompt += `\n\nYou have access to Slack. You can list channels, read messages, send messages, and search for users. Always confirm before sending messages.`;
+      }
+
+      // Add task system prompt
+      systemPrompt += `\n\nYou can create autonomous background TASKS for things that require multiple steps over time, waiting for external responses, or follow-up actions. 
+
+*** WHEN TO OFFER TASK CREATION ***
+You MUST offer to create a task when the user's request involves ANY of these patterns:
+- SCHEDULING: "schedule a meeting", "set up a call", "arrange dinner", "find a time to meet", "schedule lunch"
+- FOLLOW-UP: "follow up with", "check back with", "remind them", "make sure they respond"
+- COORDINATION: "coordinate with", "work out the details with", "negotiate a time"
+- BACK-AND-FORTH: Any request that will likely require waiting for someone's reply
+
+Examples that MUST trigger task offer:
+- "email jeff@wovly.ai to schedule a meeting" → TASK (scheduling requires back-and-forth)
+- "text adaira to schedule dinner" → TASK
+- "email bob to set up a call next week" → TASK
+- "message sarah to find a time for lunch" → TASK
+
+Examples that are ONE-SHOT (no task needed):
+- "send a thank you email to jeff" → Just send the email
+- "email bob the document" → Just send it
+- "text adaira happy birthday" → Just send it
+
+CRITICAL TASK CREATION RULES:
+1. When you recognize a SCHEDULING or FOLLOW-UP request, DO NOT draft an email directly
+2. Instead, FIRST describe your proposed plan in plain text in your response
+3. Ask the user: "Would you like me to create this task to handle the scheduling?"
+4. WAIT for the user's response - they must say yes/confirm/go ahead
+5. ONLY AFTER they confirm, call the create_task tool
+
+VERY IMPORTANT - When creating a task:
+- Do NOT send any messages or perform any actions yourself
+- Do NOT call send_email, send_imessage, send_slack_message, create_calendar_event, or any other action tools
+- Do NOT draft the email - the task executor will compose and send it
+- ONLY call the create_task tool
+- The task executor will automatically handle ALL steps including the first one
+- If you send a message AND create a task, TWO messages will be sent (this is a bug)
+- PLAN: Pass an EMPTY array [] for the plan - the system will auto-select the appropriate skill procedure
+
+MESSAGING CHANNEL DETECTION - When calling create_task, you MUST set the messagingChannel parameter:
+- User says "text", "message her/him", "iMessage", "SMS" → messagingChannel: "imessage"
+- User says "email", "mail", "gmail" → messagingChannel: "email"
+- User says "slack" → messagingChannel: "slack"
+- If unclear, ASK which channel they prefer before creating the task.
+
+Example: "text adaira to schedule dinner" → messagingChannel: "imessage"
+Example: "email jeff about the meeting" → messagingChannel: "email"
+
+NEVER create a task without explicit user confirmation first. Only create ONE task per request.`;
+
+      // Combine tools
+      const allTools = [...profileTools, ...taskTools, ...memoryTools];
+      if (hasGoogleTools) allTools.push(...googleWorkspaceTools);
+      if (hasIMessageTools) allTools.push(...iMessageTools);
+      if (weatherEnabled) allTools.push(...weatherTools);
+      if (hasSlackTools) allTools.push(...slackTools);
+
+      // Determine which provider to use
+      const useProvider = apiKeys[activeProvider] ? activeProvider : 
+                          apiKeys.anthropic ? "anthropic" : 
+                          apiKeys.openai ? "openai" : 
+                          apiKeys.google ? "google" : null;
+      
+      if (!useProvider) {
+        return { ok: false, error: "No API keys configured" };
+      }
+
+      // Call LLM with tools
+      if (useProvider === "anthropic" && apiKeys.anthropic) {
+        const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
+        let currentMessages = messages.map(m => ({ role: m.role, content: m.content }));
+        
+        for (let iteration = 0; iteration < 5; iteration++) {
+          const response = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": apiKeys.anthropic,
+              "anthropic-version": "2023-06-01"
+            },
+            body: JSON.stringify({
+              model: anthropicModel,
+              max_tokens: 4096,
+              system: systemPrompt,
+              tools: allTools,
+              messages: currentMessages
+            })
+          });
+
+          if (!response.ok) {
+            const error = await response.text();
+            return { ok: false, error: `API error: ${error}` };
+          }
+
+          const data = await response.json();
+
+          if (data.stop_reason === "end_turn" || !data.content.some(b => b.type === "tool_use")) {
+            const textBlock = data.content.find(b => b.type === "text");
+            return { ok: true, response: textBlock?.text || "" };
+          }
+
+          // Handle tool calls
+          const toolUseBlocks = data.content.filter(b => b.type === "tool_use");
+          const toolResults = [];
+
+          // Build tool executor with current context
+          const chatToolExecutor = buildToolsAndExecutor({
+            googleAccessToken: accessToken,
+            slackAccessToken,
+            weatherEnabled,
+            iMessageEnabled: hasIMessageTools
+          });
+
+          for (const toolUse of toolUseBlocks) {
+            console.log(`Tool: ${toolUse.name}`, toolUse.input);
+            const result = await chatToolExecutor.executeTool(toolUse.name, toolUse.input);
+
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: toolUse.id,
+              content: JSON.stringify(result)
+            });
+          }
+
+          currentMessages.push({ role: "assistant", content: data.content });
+          currentMessages.push({ role: "user", content: toolResults });
+        }
+
+        return { ok: false, error: "Max iterations reached" };
+      }
+
+      // OpenAI
+      if (useProvider === "openai" && apiKeys.openai) {
+        const openaiModel = models.openai || "gpt-4o";
+        const openaiTools = allTools.map(t => ({
+          type: "function",
+          function: { name: t.name, description: t.description, parameters: t.input_schema }
+        }));
+
+        let currentMessages = [
+          { role: "system", content: systemPrompt },
+          ...messages.map(m => ({ role: m.role, content: m.content }))
+        ];
+
+        for (let iteration = 0; iteration < 5; iteration++) {
+          const response = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${apiKeys.openai}`
+            },
+            body: JSON.stringify({
+              model: openaiModel,
+              messages: currentMessages,
+              tools: openaiTools
+            })
+          });
+
+          if (!response.ok) {
+            const error = await response.text();
+            return { ok: false, error: `API error: ${error}` };
+          }
+
+          const data = await response.json();
+          const choice = data.choices[0];
+
+          if (choice.finish_reason === "stop" || !choice.message.tool_calls) {
+            return { ok: true, response: choice.message.content || "" };
+          }
+
+          currentMessages.push(choice.message);
+
+          // Build tool executor with current context
+          const openaiToolExecutor = buildToolsAndExecutor({
+            googleAccessToken: accessToken,
+            slackAccessToken,
+            weatherEnabled,
+            iMessageEnabled: hasIMessageTools
+          });
+
+          for (const toolCall of choice.message.tool_calls) {
+            const toolInput = JSON.parse(toolCall.function.arguments);
+            const result = await openaiToolExecutor.executeTool(toolCall.function.name, toolInput);
+
+            currentMessages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: JSON.stringify(result)
+            });
+          }
+        }
+
+        return { ok: false, error: "Max iterations reached" };
+      }
+
+      // Google Gemini
+      if (useProvider === "google" && apiKeys.google) {
+        const geminiModel = models.google || "gemini-1.5-pro";
+        
+        // Gemini doesn't support tools in the same way, so we do a simple chat
+        const geminiMessages = messages.map(m => ({
+          role: m.role === "assistant" ? "model" : "user",
+          parts: [{ text: m.content }]
+        }));
+
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKeys.google}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: geminiMessages,
+              systemInstruction: { parts: [{ text: systemPrompt }] }
+            })
+          }
+        );
+
+        if (!response.ok) {
+          const error = await response.text();
+          return { ok: false, error: `Gemini API error: ${error}` };
+        }
+
+        const data = await response.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        return { ok: true, response: text };
+      }
+
+      return { ok: false, error: "No API key available for selected provider" };
+    } catch (err) {
+      console.error("Chat error:", err);
+      return { ok: false, error: err.message };
+    }
+  });
+});
+
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") app.quit();
+});
+
+app.on("activate", () => {
+  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+});

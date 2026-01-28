@@ -1,0 +1,23 @@
+{
+  "name": "@wovly/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "main": "main.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "electron .",
+    "build": "echo \"Build step placeholder\"",
+    "lint": "echo \"No lint configured\""
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "@wovly/agent-core": "*",
+    "@wovly/llm": "*",
+    "@wovly/memory": "*",
+    "@wovly/tools": "*",
+    "electron": "^40.0.0",
+    "esbuild": "^0.27.2",
+    "esbuild-register": "^3.6.0",
+    "qrcode": "^1.5.4"
+  }
+}
