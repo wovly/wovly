@@ -1,8 +1,13 @@
 # Wovly AI Assistant
 
-A powerful, privacy-focused personal AI assistant that runs locally on your desktop. Wovly combines multiple LLM providers with deep integrations into your daily tools, enabling autonomous task execution and intelligent scheduling.
+A powerful, privacy-focused personal AI assistant that runs locally on your desktop. Wovly combines multiple LLM providers with deep integrations into your daily tools, enabling autonomous task execution, context rich advisor, and intelligent scheduling.
 
-## Features
+### Features
+
+### Example use cases
+- Say "Schedule a meeting with John", and Wovly will automatically email back and forth with John, sync with your calendar, find the right time, and create the calendar event.
+- Say "Alert me when a blizzard is coming" and Wovly will alert you when it detects a blizzard is approaching
+- Say "Based on the PRD docs and recent slack messages, write a Slack message to the sales team"
 
 ### Multi-LLM Support
 - **Anthropic Claude** (Sonnet 4, 3.5 Sonnet, Opus)
@@ -10,10 +15,11 @@ A powerful, privacy-focused personal AI assistant that runs locally on your desk
 - **Google Gemini** (1.5 Pro, 1.5 Flash)
 
 ### Integrations
-- **Google Workspace** - Gmail, Calendar (read, write, send emails, create events with attendees)
+- **Google Workspace** - Gmail, Calendar, Docs (read, write, send emails, create events with attendees)
 - **Slack** - Send messages as yourself (user OAuth), read channels, DMs
 - **iMessage** - Send texts, read conversations (macOS only)
 - **Weather** - Current conditions and forecasts via Open-Meteo
+- **Whatsapp** - Talk to Wovly anywhere via Whatsapp!
 
 ### Skill-Based Task System
 - Create autonomous background tasks that execute multi-step workflows
