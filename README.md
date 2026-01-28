@@ -6,8 +6,8 @@ A powerful, privacy-focused personal AI assistant that runs locally on your desk
 
 ### Example use cases
 - Say "Schedule a meeting with John", and Wovly will automatically email back and forth with John, sync with your calendar, find the right time, and create the calendar event.
-- Say "Alert me when a blizzard is coming" and Wovly will alert you when it detects a blizzard is approaching
-- Say "Based on the PRD docs and recent slack messages, write a Slack message to the sales team"
+- Say "Text my wife to coordinate who is doing kid pickup today" and Wovly will converse with your wife to align your schedules
+- Say "Based on the PRD docs and recent slack messages, write a Slack message to the sales team" and Wovly will summarize and send an encouraging message to the team
 
 ### Multi-LLM Support
 - **Anthropic Claude** (Sonnet 4, 3.5 Sonnet, Opus)
@@ -21,13 +21,13 @@ A powerful, privacy-focused personal AI assistant that runs locally on your desk
 - **Weather** - Current conditions and forecasts via Open-Meteo
 - **Whatsapp** - Talk to Wovly anywhere via Whatsapp!
 
-### Skill-Based Task System
+### Customizable Skill-Based Task System
 - Create autonomous background tasks that execute multi-step workflows
 - Skills are markdown files that define procedures (e.g., scheduling, email drafting)
 - Tasks automatically detect replies and progress through steps
 - Real-time notifications in chat as tasks progress
 
-### Memory System
+### Memory System for efficient context
 - Daily conversation logs stored as markdown
 - Automatic summarization of older conversations
 - Long-term memory for context retention
