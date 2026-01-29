@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld("wovly", {
   },
   chat: {
     send: (messages) => ipcRenderer.invoke("chat:send", { messages }),
+    executeInline: (decomposition, originalMessage) => ipcRenderer.invoke("chat:executeInline", { decomposition, originalMessage }),
     // Subscribe to new messages (from WhatsApp sync)
     onNewMessage: (callback) => {
       const handler = (_event, data) => callback(data);
@@ -32,7 +33,13 @@ contextBridge.exposeInMainWorld("wovly", {
     checkSlackAuth: () => ipcRenderer.invoke("integrations:checkSlackAuth"),
     disconnectSlack: () => ipcRenderer.invoke("integrations:disconnectSlack"),
     setWeatherEnabled: (enabled) => ipcRenderer.invoke("integrations:setWeatherEnabled", { enabled }),
-    getWeatherEnabled: () => ipcRenderer.invoke("integrations:getWeatherEnabled")
+    getWeatherEnabled: () => ipcRenderer.invoke("integrations:getWeatherEnabled"),
+    // Playwright Browser Automation
+    setPlaywrightEnabled: (enabled) => ipcRenderer.invoke("integrations:setPlaywrightEnabled", { enabled }),
+    getPlaywrightEnabled: () => ipcRenderer.invoke("integrations:getPlaywrightEnabled"),
+    testPlaywright: () => ipcRenderer.invoke("integrations:testPlaywright"),
+    getAvailableBrowsers: () => ipcRenderer.invoke("integrations:getAvailableBrowsers"),
+    setPlaywrightBrowser: (browser) => ipcRenderer.invoke("integrations:setPlaywrightBrowser", { browser })
   },
   profile: {
     get: () => ipcRenderer.invoke("profile:get"),

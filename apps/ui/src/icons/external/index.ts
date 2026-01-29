@@ -13,3 +13,4 @@ export { ClaudeIcon } from "./Claude";
 export { GeminiIcon } from "./Gemini";
 export { OpenAIIcon } from "./OpenAI";
 export { WovlyIcon } from "./Wovly";
+export { PlaywrightIcon } from "./Playwright";

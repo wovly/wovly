@@ -10,6 +10,8 @@
     "lint": "echo \"No lint configured\""
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@playwright/mcp": "^0.0.61",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "@wovly/agent-core": "*",
     "@wovly/llm": "*",

@@ -19,6 +19,7 @@ export {
   GeminiIcon,
   OpenAIIcon,
   WovlyIcon,
+  PlaywrightIcon,
 } from "./external";
 
 // Navigation icons

@@ -6,8 +6,291 @@ const http = require("http");
 const { URL, URLSearchParams } = require("url");
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
 const QRCode = require("qrcode");
+const { spawn } = require("child_process");
 
 let win;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Playwright MCP State
+// ─────────────────────────────────────────────────────────────────────────────
+let playwrightMcpProcess = null;
+let playwrightMcpClient = null;
+let playwrightTools = [];
+let playwrightEnabled = false;
+let playwrightRequestId = 0;
+let playwrightPendingRequests = new Map(); // Map of requestId -> { resolve, reject }
+
+// MCP JSON-RPC message parser state
+let playwrightMcpBuffer = "";
+
+/**
+ * Start the Playwright MCP server process and establish connection
+ */
+async function startPlaywrightMcp(options = {}) {
+  if (playwrightMcpProcess) {
+    console.log("[Playwright MCP] Already running");
+    return true;
+  }
+
+  console.log("[Playwright MCP] Starting server...");
+  
+  try {
+    const args = ["@playwright/mcp@latest"];
+    
+    // Add options
+    if (options.headless) {
+      args.push("--headless");
+    }
+    if (options.browser) {
+      args.push("--browser", options.browser);
+    }
+
+    playwrightMcpProcess = spawn("npx", args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env }
+    });
+
+    playwrightMcpBuffer = "";
+
+    // Handle stdout (MCP responses)
+    playwrightMcpProcess.stdout.on("data", (data) => {
+      playwrightMcpBuffer += data.toString();
+      
+      // Try to parse complete JSON-RPC messages (newline delimited)
+      const lines = playwrightMcpBuffer.split("\n");
+      playwrightMcpBuffer = lines.pop() || ""; // Keep incomplete line in buffer
+      
+      for (const line of lines) {
+        if (line.trim()) {
+          try {
+            const message = JSON.parse(line);
+            handlePlaywrightMcpMessage(message);
+          } catch (e) {
+            // Not valid JSON, might be log output
+            console.log("[Playwright MCP stdout]", line);
+          }
+        }
+      }
+    });
+
+    // Handle stderr
+    playwrightMcpProcess.stderr.on("data", (data) => {
+      const msg = data.toString().trim();
+      if (msg) {
+        console.log("[Playwright MCP stderr]", msg);
+      }
+    });
+
+    // Handle process exit
+    playwrightMcpProcess.on("close", (code) => {
+      console.log(`[Playwright MCP] Process exited with code ${code}`);
+      playwrightMcpProcess = null;
+      playwrightMcpClient = null;
+      playwrightTools = [];
+      
+      // Reject any pending requests
+      for (const [id, { reject }] of playwrightPendingRequests) {
+        reject(new Error("MCP process closed"));
+      }
+      playwrightPendingRequests.clear();
+    });
+
+    playwrightMcpProcess.on("error", (err) => {
+      console.error("[Playwright MCP] Process error:", err);
+      playwrightMcpProcess = null;
+    });
+
+    // Wait a moment for the process to start
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Initialize the MCP connection
+    await sendPlaywrightMcpRequest("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: {
+        name: "wovly-assistant",
+        version: "1.0.0"
+      }
+    });
+
+    // Send initialized notification
+    sendPlaywrightMcpNotification("notifications/initialized", {});
+
+    // Discover available tools
+    await discoverPlaywrightTools();
+
+    console.log(`[Playwright MCP] Started successfully with ${playwrightTools.length} tools`);
+    playwrightEnabled = true;
+    return true;
+  } catch (error) {
+    console.error("[Playwright MCP] Failed to start:", error);
+    await stopPlaywrightMcp();
+    return false;
+  }
+}
+
+/**
+ * Stop the Playwright MCP server process
+ */
+async function stopPlaywrightMcp() {
+  if (playwrightMcpProcess) {
+    console.log("[Playwright MCP] Stopping server...");
+    playwrightMcpProcess.kill();
+    playwrightMcpProcess = null;
+  }
+  playwrightMcpClient = null;
+  playwrightTools = [];
+  playwrightEnabled = false;
+  playwrightPendingRequests.clear();
+}
+
+/**
+ * Send a JSON-RPC request to the MCP server
+ */
+function sendPlaywrightMcpRequest(method, params = {}) {
+  return new Promise((resolve, reject) => {
+    if (!playwrightMcpProcess || !playwrightMcpProcess.stdin.writable) {
+      reject(new Error("MCP process not running"));
+      return;
+    }
+
+    const id = ++playwrightRequestId;
+    const request = {
+      jsonrpc: "2.0",
+      id,
+      method,
+      params
+    };
+
+    playwrightPendingRequests.set(id, { resolve, reject });
+
+    // Set timeout for request
+    setTimeout(() => {
+      if (playwrightPendingRequests.has(id)) {
+        playwrightPendingRequests.delete(id);
+        reject(new Error(`MCP request timeout: ${method}`));
+      }
+    }, 60000); // 60 second timeout for browser operations
+
+    const message = JSON.stringify(request) + "\n";
+    playwrightMcpProcess.stdin.write(message);
+  });
+}
+
+/**
+ * Send a JSON-RPC notification (no response expected)
+ */
+function sendPlaywrightMcpNotification(method, params = {}) {
+  if (!playwrightMcpProcess || !playwrightMcpProcess.stdin.writable) {
+    return;
+  }
+
+  const notification = {
+    jsonrpc: "2.0",
+    method,
+    params
+  };
+
+  const message = JSON.stringify(notification) + "\n";
+  playwrightMcpProcess.stdin.write(message);
+}
+
+/**
+ * Handle incoming MCP messages
+ */
+function handlePlaywrightMcpMessage(message) {
+  // Check if it's a response to a pending request
+  if (message.id !== undefined && playwrightPendingRequests.has(message.id)) {
+    const { resolve, reject } = playwrightPendingRequests.get(message.id);
+    playwrightPendingRequests.delete(message.id);
+
+    if (message.error) {
+      reject(new Error(message.error.message || "MCP error"));
+    } else {
+      resolve(message.result);
+    }
+  } else if (message.method) {
+    // It's a notification or request from the server
+    console.log("[Playwright MCP] Server notification:", message.method);
+  }
+}
+
+/**
+ * Discover available tools from the Playwright MCP server
+ */
+async function discoverPlaywrightTools() {
+  try {
+    const result = await sendPlaywrightMcpRequest("tools/list", {});
+    
+    if (result && result.tools) {
+      // Convert MCP tool format to our tool format
+      playwrightTools = result.tools.map(tool => ({
+        name: tool.name,
+        description: tool.description || "",
+        input_schema: tool.inputSchema || { type: "object", properties: {} }
+      }));
+
+      console.log("[Playwright MCP] Discovered tools:", playwrightTools.map(t => t.name).join(", "));
+    }
+  } catch (error) {
+    console.error("[Playwright MCP] Failed to discover tools:", error);
+    playwrightTools = [];
+  }
+}
+
+/**
+ * Execute a Playwright MCP tool
+ */
+async function executePlaywrightTool(toolName, toolInput) {
+  if (!playwrightMcpProcess) {
+    return { error: "Playwright MCP not running. Enable it in Settings > Integrations." };
+  }
+
+  console.log(`[Playwright MCP] Executing tool: ${toolName}`, toolInput);
+
+  try {
+    const result = await sendPlaywrightMcpRequest("tools/call", {
+      name: toolName,
+      arguments: toolInput
+    });
+
+    console.log(`[Playwright MCP] Tool result:`, JSON.stringify(result).slice(0, 500));
+
+    // MCP returns content array, extract the text/data
+    if (result && result.content) {
+      const textContent = result.content.find(c => c.type === "text");
+      if (textContent) {
+        return { success: true, result: textContent.text };
+      }
+      
+      const imageContent = result.content.find(c => c.type === "image");
+      if (imageContent) {
+        return { success: true, image: imageContent.data, mimeType: imageContent.mimeType };
+      }
+      
+      return { success: true, content: result.content };
+    }
+
+    return { success: true, result: result };
+  } catch (error) {
+    console.error(`[Playwright MCP] Tool error:`, error);
+    return { error: error.message };
+  }
+}
+
+/**
+ * Get the list of Playwright tools (for building tool arrays)
+ */
+function getPlaywrightTools() {
+  return playwrightTools;
+}
+
+/**
+ * Check if Playwright MCP is running
+ */
+function isPlaywrightMcpRunning() {
+  return !!playwrightMcpProcess;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WhatsApp State
@@ -899,8 +1182,44 @@ const createTask = async (taskData) => {
   
   // Try to match a skill to the original request
   let matchedSkill = null;
-  let skillPlan = taskData.plan || [];
+  let skillPlan = taskData.plan && taskData.plan.length > 0 ? taskData.plan : [];
   let skillContext = {};
+  
+  // If no plan was provided, generate a basic plan from the original request
+  if (skillPlan.length === 0 && taskData.originalRequest) {
+    console.log(`[Tasks] No plan provided, generating from original request`);
+    // Create a simple default plan based on common patterns
+    const request = taskData.originalRequest.toLowerCase();
+    if (request.includes("email") || request.includes("mail")) {
+      skillPlan = [
+        "Send initial email with the request",
+        "Wait for response",
+        "If no response, send follow-up email",
+        "Process response and complete task"
+      ];
+    } else if (request.includes("slack")) {
+      skillPlan = [
+        "Send initial Slack message",
+        "Wait for response",
+        "If no response, send follow-up",
+        "Process response and complete task"
+      ];
+    } else if (request.includes("text") || request.includes("imessage") || request.includes("sms")) {
+      skillPlan = [
+        "Send initial text message",
+        "Wait for response",
+        "If no response, send follow-up",
+        "Process response and complete task"
+      ];
+    } else {
+      skillPlan = [
+        "Execute the requested action",
+        "Verify completion",
+        "Report results"
+      ];
+    }
+    console.log(`[Tasks] Generated default plan with ${skillPlan.length} steps`);
+  }
   
   try {
     const skills = await loadAllSkills();
@@ -923,10 +1242,14 @@ const createTask = async (taskData) => {
     console.error(`[Tasks] Error matching skill:`, err.message);
   }
   
+  // Determine task type (default to discrete for backward compatibility)
+  const taskType = taskData.taskType || taskData.task_type || "discrete";
+  
   const task = {
     id: taskId,
     title: taskData.title || "Untitled Task",
     status: "active",
+    taskType: taskType, // "discrete" or "continuous"
     created: new Date().toISOString(),
     lastUpdated: new Date().toISOString(),
     nextCheck: null,
@@ -941,12 +1264,21 @@ const createTask = async (taskData) => {
     },
     executionLog: [{
       timestamp: new Date().toISOString(),
-      message: `Task created and starting execution${messagingChannel ? ` (using ${messagingChannel})` : ""}${matchedSkill ? ` (skill: ${matchedSkill.name})` : ""}`
+      message: `Task created and starting execution${messagingChannel ? ` (using ${messagingChannel})` : ""}${matchedSkill ? ` (skill: ${matchedSkill.name})` : ""}${taskType === "continuous" ? " (continuous monitoring)" : ""}`
     }],
     contextMemory: {
       ...taskData.context,
       ...(messagingChannel ? { messaging_channel: messagingChannel } : {}),
-      ...skillContext
+      ...skillContext,
+      // For continuous tasks, store monitoring info
+      ...(taskType === "continuous" ? {
+        task_type: "continuous",
+        monitoring_condition: taskData.monitoringCondition || taskData.monitoring_condition || null,
+        trigger_action: taskData.triggerAction || taskData.trigger_action || null
+      } : {
+        task_type: "discrete",
+        success_criteria: taskData.successCriteria || taskData.success_criteria || null
+      })
     }
   };
 
@@ -1538,8 +1870,30 @@ const checkForNewSlackMessages = async (channelOrUser, afterTimestamp, accessTok
     // If it's a user name/ID, we need to find their DM channel first
     let channelId = channelOrUser;
     
-    // If it doesn't look like a channel ID (starts with C, D, or G), try to resolve it
-    if (!/^[CDG][A-Z0-9]+$/i.test(channelOrUser)) {
+    // Check if it's a user ID (starts with U) - need to open DM channel
+    if (/^U[A-Z0-9]+$/i.test(channelOrUser)) {
+      console.log(`[Messaging] Slack: Opening DM channel with user ${channelOrUser}`);
+      // Open/get DM channel with user ID
+      const dmResponse = await fetch("https://slack.com/api/conversations.open", {
+        method: "POST",
+        headers: { 
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ users: channelOrUser })
+      });
+      const dmData = await dmResponse.json();
+      if (dmData.ok && dmData.channel) {
+        channelId = dmData.channel.id;
+        console.log(`[Messaging] Slack: DM channel ID is ${channelId}`);
+      } else {
+        console.error(`[Messaging] Slack: Failed to open DM:`, dmData.error);
+        return { hasNew: false, reason: `failed to open DM: ${dmData.error}` };
+      }
+    }
+    // If it doesn't look like a channel ID (starts with C, D, or G) or user ID, try to resolve by name
+    else if (!/^[CDG][A-Z0-9]+$/i.test(channelOrUser)) {
+      console.log(`[Messaging] Slack: Searching for user by name: ${channelOrUser}`);
       // Search for user and get DM channel
       const usersResponse = await fetch(`https://slack.com/api/users.list?limit=200`, {
         headers: { "Authorization": `Bearer ${accessToken}` }
@@ -1553,6 +1907,7 @@ const checkForNewSlackMessages = async (channelOrUser, afterTimestamp, accessTok
         );
         
         if (user) {
+          console.log(`[Messaging] Slack: Found user ${user.real_name} (${user.id})`);
           // Open/get DM channel with user
           const dmResponse = await fetch("https://slack.com/api/conversations.open", {
             method: "POST",
@@ -1565,7 +1920,10 @@ const checkForNewSlackMessages = async (channelOrUser, afterTimestamp, accessTok
           const dmData = await dmResponse.json();
           if (dmData.ok && dmData.channel) {
             channelId = dmData.channel.id;
+            console.log(`[Messaging] Slack: DM channel ID is ${channelId}`);
           }
+        } else {
+          console.log(`[Messaging] Slack: User not found by name: ${channelOrUser}`);
         }
       }
     }
@@ -2525,6 +2883,183 @@ Generate ONLY the welcome message, nothing else.`;
     }
   });
 
+  // Playwright Browser Automation enable/disable handler
+  ipcMain.handle("integrations:setPlaywrightEnabled", async (_event, { enabled }) => {
+    try {
+      const settingsPath = await getSettingsPath();
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch {
+        // No existing settings
+      }
+      settings.playwrightEnabled = enabled;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      
+      // Start or stop Playwright MCP based on setting
+      if (enabled) {
+        const options = {
+          ...(settings.playwrightOptions || {}),
+          browser: settings.playwrightBrowser || "chrome"
+        };
+        await startPlaywrightMcp(options);
+      } else {
+        await stopPlaywrightMcp();
+      }
+      
+      return { ok: true, running: isPlaywrightMcpRunning() };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("integrations:getPlaywrightEnabled", async () => {
+    try {
+      const settingsPath = await getSettingsPath();
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      return { 
+        ok: true, 
+        enabled: settings.playwrightEnabled === true,
+        running: isPlaywrightMcpRunning(),
+        toolCount: getPlaywrightTools().length,
+        browser: settings.playwrightBrowser || "chromium"
+      };
+    } catch {
+      return { ok: true, enabled: false, running: false, toolCount: 0, browser: "chrome" };
+    }
+  });
+
+  ipcMain.handle("integrations:getAvailableBrowsers", async () => {
+    try {
+      const { execSync } = require("child_process");
+      
+      // List of Playwright-supported browsers
+      // "chrome" uses the system Chrome with existing logins
+      // "chromium" uses isolated Chromium for Testing
+      const browsers = [
+        { id: "chrome", name: "Chrome (uses existing logins)", installed: false },
+        { id: "chromium", name: "Chromium (isolated)", installed: false },
+        { id: "msedge", name: "Microsoft Edge", installed: false },
+        { id: "firefox", name: "Firefox", installed: false },
+        { id: "webkit", name: "WebKit (Safari)", installed: false }
+      ];
+      
+      // Check which system browsers are installed
+      const checkBrowserInstalled = (browserId) => {
+        try {
+          if (process.platform === "darwin") {
+            // macOS paths
+            const macPaths = {
+              chrome: "/Applications/Google Chrome.app",
+              msedge: "/Applications/Microsoft Edge.app",
+              firefox: "/Applications/Firefox.app",
+              webkit: "/Applications/Safari.app"
+            };
+            if (macPaths[browserId]) {
+              require("fs").accessSync(macPaths[browserId]);
+              return true;
+            }
+          } else if (process.platform === "win32") {
+            // Windows - check common paths
+            const winPaths = {
+              chrome: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+              msedge: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+              firefox: "C:\\Program Files\\Mozilla Firefox\\firefox.exe"
+            };
+            if (winPaths[browserId]) {
+              require("fs").accessSync(winPaths[browserId]);
+              return true;
+            }
+          }
+          
+          // For chromium, check Playwright's cache
+          if (browserId === "chromium") {
+            const playwrightCache = path.join(os.homedir(), ".cache", "ms-playwright");
+            const files = require("fs").readdirSync(playwrightCache);
+            return files.some(f => f.toLowerCase().startsWith("chromium"));
+          }
+          
+          return false;
+        } catch {
+          return false;
+        }
+      };
+      
+      for (const browser of browsers) {
+        browser.installed = checkBrowserInstalled(browser.id);
+      }
+      
+      return { ok: true, browsers };
+    } catch (err) {
+      return { 
+        ok: true, 
+        browsers: [
+          { id: "chrome", name: "Chrome (uses existing logins)", installed: false },
+          { id: "chromium", name: "Chromium (isolated)", installed: false },
+          { id: "msedge", name: "Microsoft Edge", installed: false },
+          { id: "firefox", name: "Firefox", installed: false },
+          { id: "webkit", name: "WebKit (Safari)", installed: false }
+        ]
+      };
+    }
+  });
+
+  ipcMain.handle("integrations:setPlaywrightBrowser", async (_event, { browser }) => {
+    try {
+      const settingsPath = await getSettingsPath();
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch {}
+      
+      settings.playwrightBrowser = browser;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      
+      // If Playwright is running, restart it with the new browser
+      if (isPlaywrightMcpRunning()) {
+        await stopPlaywrightMcp();
+        await startPlaywrightMcp({ browser });
+      }
+      
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("integrations:testPlaywright", async () => {
+    try {
+      if (!isPlaywrightMcpRunning()) {
+        return { ok: false, error: "Playwright MCP is not running. Enable it first." };
+      }
+
+      // Test by navigating to a simple page
+      const result = await executePlaywrightTool("browser_navigate", {
+        url: "https://example.com"
+      });
+
+      if (result.error) {
+        return { ok: false, error: result.error };
+      }
+
+      // Get a snapshot to verify it worked
+      const snapshot = await executePlaywrightTool("browser_snapshot", {});
+      
+      if (snapshot.error) {
+        return { ok: false, error: snapshot.error };
+      }
+
+      return { 
+        ok: true, 
+        message: "Browser automation is working! Navigated to example.com successfully.",
+        toolCount: getPlaywrightTools().length,
+        tools: getPlaywrightTools().map(t => t.name)
+      };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
   // Google OAuth flow
   ipcMain.handle("integrations:startGoogleOAuth", async (_event, { clientId, clientSecret }) => {
     return new Promise((resolve) => {
@@ -2972,6 +3507,22 @@ Generate ONLY the welcome message, nothing else.`;
   ipcMain.handle("tasks:create", async (_event, taskData) => {
     try {
       const task = await createTask(taskData);
+      
+      // Send initial notification that task is starting
+      if (win && win.webContents) {
+        win.webContents.send("chat:newMessage", {
+          role: "assistant",
+          content: `🚀 **Task Started: ${task.title}**\n\nExecuting step 1: ${task.plan[0] || "Starting..."}`,
+          source: "task"
+        });
+      }
+      
+      // Auto-start the task immediately (same as when created from chat)
+      setTimeout(async () => {
+        console.log(`[Tasks] Auto-starting task from UI: ${task.id}`);
+        await executeTaskStep(task.id);
+      }, 100);
+      
       return { ok: true, task };
     } catch (err) {
       return { ok: false, error: err.message };
@@ -3891,11 +4442,11 @@ Generate ONLY the welcome message, nothing else.`;
     },
     {
       name: "get_slack_messages",
-      description: "Get recent messages from a Slack channel or DM.",
+      description: "Get recent messages from a Slack channel or DM. For DMs, you can pass a person's name and it will find their DM channel automatically.",
       input_schema: {
         type: "object",
         properties: {
-          channel: { type: "string", description: "Channel name (e.g., #general) or channel ID" },
+          channel: { type: "string", description: "Channel name (e.g., #general), channel ID, user ID (e.g., U12345), or person's name (e.g., 'Chris Gorog') to get their DMs" },
           limit: { type: "number", description: "Number of messages to fetch (default 20)" }
         },
         required: ["channel"]
@@ -3955,6 +4506,60 @@ Generate ONLY the welcome message, nothing else.`;
               return { error: `Channel ${channelId} not found` };
             }
             channelId = channel.id;
+          } 
+          // If it's a user ID (starts with U), open DM channel
+          else if (channelId.startsWith("U")) {
+            console.log(`[Slack] Opening DM channel with user ID: ${channelId}`);
+            const dmResponse = await fetch("https://slack.com/api/conversations.open", {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${accessToken}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({ users: channelId })
+            });
+            const dmData = await dmResponse.json();
+            if (dmData.ok && dmData.channel) {
+              channelId = dmData.channel.id;
+              console.log(`[Slack] DM channel ID: ${channelId}`);
+            } else {
+              return { error: `Failed to open DM with user: ${dmData.error}` };
+            }
+          }
+          // If it doesn't look like a channel/DM ID (C/D/G prefix), treat as user name search
+          else if (!channelId.match(/^[CDG][A-Z0-9]+$/)) {
+            console.log(`[Slack] Searching for user: ${channelId}`);
+            const users = await fetchSlackUsers(accessToken);
+            const query = channelId.toLowerCase();
+            const matchedUser = users.find(u => 
+              !u.deleted && !u.is_bot && (
+                (u.real_name || "").toLowerCase().includes(query) ||
+                (u.name || "").toLowerCase().includes(query)
+              )
+            );
+            
+            if (!matchedUser) {
+              return { error: `User "${channelId}" not found in Slack workspace` };
+            }
+            
+            console.log(`[Slack] Found user: ${matchedUser.real_name || matchedUser.name} (${matchedUser.id})`);
+            
+            // Open DM channel with the user
+            const dmResponse = await fetch("https://slack.com/api/conversations.open", {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${accessToken}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({ users: matchedUser.id })
+            });
+            const dmData = await dmResponse.json();
+            if (dmData.ok && dmData.channel) {
+              channelId = dmData.channel.id;
+              console.log(`[Slack] DM channel ID: ${channelId}`);
+            } else {
+              return { error: `Failed to open DM with ${matchedUser.real_name || matchedUser.name}: ${dmData.error}` };
+            }
           }
 
           const messages = await fetchSlackMessages(accessToken, channelId, limit);
@@ -4078,6 +4683,15 @@ Generate ONLY the welcome message, nothing else.`;
       switch (toolName) {
         case "create_task": {
           const task = await createTask(toolInput);
+          
+          // Send initial notification that task is starting
+          if (win && win.webContents) {
+            win.webContents.send("chat:newMessage", {
+              role: "assistant",
+              content: `🚀 **Task Started: ${task.title}**\n\nExecuting step 1: ${task.plan[0] || "Starting..."}`,
+              source: "task"
+            });
+          }
           
           // Auto-start the task immediately (don't await - let it run in background)
           setTimeout(async () => {
@@ -4876,11 +5490,17 @@ ${task.executionLog.slice(-3).map(e => `- ${e.message}`).join("\n") || "Task jus
 INSTRUCTIONS:
 1. Execute the CURRENT STEP using the available tools
 2. After completing the step's action, ALWAYS call update_task_state to:
-   - Log what you did
+   - Log what you did in logMessage - BE DETAILED AND USER-FRIENDLY. The user sees this in chat!
    - Set nextStatus: "waiting" if waiting for a response, "active" to continue immediately, "completed" if all done
    - Set nextStep to current step + 1 if advancing
    - Set pollIntervalMs if waiting (e.g., 60000 = 1 minute - lightweight checks are free)
    - Save any important info in contextUpdates
+
+CRITICAL - User Notifications:
+- The logMessage you provide in update_task_state is shown directly to the user in the chat
+- ALWAYS write logMessage as if speaking to the user: "I sent an email to X asking about Y" or "I found the calendar link in Chris's message: [link]"
+- Include relevant details, quotes from messages, or findings that the user would want to know
+- If you have a question for the user or need their input, include it in the logMessage
 
 3. CRITICAL - When SENDING a message and waiting for a reply:
    - Set contextUpdates.waiting_via = the messaging channel you used:
@@ -4902,15 +5522,56 @@ INSTRUCTIONS:
 5. CRITICAL - REPLY DETECTED: If the SAVED CONTEXT shows "new_reply_detected: true":
    *** A REPLY HAS BEEN RECEIVED - YOU MUST PROCESS IT NOW ***
    - First, use list_emails or get_recent_messages to READ the new message content
-   - Process the reply content to determine next actions
+   - Process the reply content to determine if it SATISFIES THE CURRENT STEP'S REQUIREMENTS
    - Clear the reply flag: contextUpdates.new_reply_detected = false
-   - ADVANCE TO THE NEXT STEP: set nextStatus: "active" and nextStep = current step + 1
-   - Do NOT stay on the same step - the reply means this step is complete
+   - DECISION POINT:
+     a) If the reply SATISFIES the step's requirement (e.g., definitive answer received):
+        → Advance: nextStatus: "active", nextStep = current step + 1
+     b) If the reply DOES NOT satisfy the requirement (e.g., unclear answer, needs follow-up):
+        → STAY on current step: nextStep = current step (same number)
+        → Take the appropriate action (send follow-up, ask for clarification)
+        → Set nextStatus: "waiting" to wait for the next reply
 
-6. AUTO-PROGRESSION: After completing each step that doesn't require waiting:
-   - ALWAYS set nextStatus: "active" and nextStep to the next step number
+6. CONDITIONAL STEP HANDLING:
+   - Many steps have CONDITIONS that must be met before advancing (e.g., "wait for definitive answer", "until confirmed")
+   - DO NOT advance just because you received a reply - evaluate if the CONDITION is satisfied
+   - Example: Step "Follow up until definitive answer" → if answer is vague, send follow-up and STAY on this step
+   - Example: Step "Wait for confirmation" → if response is "maybe", don't advance, ask for clear yes/no
+   - Save evaluation reasoning in logMessage so user understands why you're staying or advancing
+
+7. AUTO-PROGRESSION: After completing each step that doesn't require waiting:
+   - ONLY advance to next step if the current step's requirement is FULLY SATISFIED
    - This ensures the task continues immediately without waiting for the scheduler
-   - Only use nextStatus: "waiting" when you've JUST sent a message and need to wait for a reply
+   - Only use nextStatus: "waiting" when you need to wait for an external response
+
+7. TASK TYPE HANDLING:
+   ${task.taskType === "continuous" || task.contextMemory?.task_type === "continuous" ? `
+   *** THIS IS A CONTINUOUS/MONITORING TASK ***
+   - Monitoring condition: ${task.contextMemory?.monitoring_condition || "Check context for details"}
+   - Trigger action: ${task.contextMemory?.trigger_action || "Alert user when condition is met"}
+   
+   CONTINUOUS TASK RULES:
+   - This task runs INDEFINITELY - it should NEVER be marked as "completed"
+   - After completing the final step, LOOP BACK to step 1 by setting nextStep: 1
+   - Use nextStatus: "waiting" with pollIntervalMs to wait before the next monitoring cycle
+   - Recommended poll intervals: weather (3600000 = 1 hour), emails (60000 = 1 minute), prices (300000 = 5 min)
+   - ONLY notify user when the monitoring condition is actually triggered (e.g., rain detected, email received)
+   - Keep logMessage brief for routine checks: "Checked weather - no rain expected"
+   ` : `
+   *** THIS IS A DISCRETE TASK ***
+   - Success criteria: ${task.contextMemory?.success_criteria || "Complete all steps in the plan"}
+   
+   DISCRETE TASK RULES:
+   - This task has a clear end goal
+   - EACH STEP may have its own success condition - evaluate before advancing
+   - Common step conditions to watch for:
+     * "until definitive answer" → stay on step until clear answer received
+     * "follow up if not responded" → stay on step if no clear response
+     * "confirm" → stay until explicit confirmation received
+     * "if X then Y" → only advance after condition X is satisfied
+   - Mark as "completed" ONLY when all steps are done AND success criteria is met
+   - The final step should verify the success criteria before marking complete
+   `}
 
 IMPORTANT: You MUST call update_task_state before finishing. Always advance to the next step after completing the current one.`;
 
@@ -4927,14 +5588,20 @@ Your current step is ${task.currentStep.step}: "${task.plan[task.currentStep.ste
 
 ACTION REQUIRED:
 1. First, READ the reply using ${waitingVia === "email" ? "list_emails with from:" + waitingFor : waitingVia === "slack" ? "list_slack_messages" : "get_recent_messages"}
-2. Process what they said
+2. EVALUATE: Does this reply SATISFY the current step's requirements?
+   - If step asks for "definitive answer" - is the answer clear and specific?
+   - If step asks for "confirmation" - did they clearly confirm?
+   - If step asks to "follow up until X" - has X been achieved?
 3. Call update_task_state with:
-   - logMessage describing what they replied
-   - nextStatus: "active" 
-   - nextStep: ${task.currentStep.step + 1}
+   - logMessage describing what they replied AND your evaluation
+   - IF reply SATISFIES step requirement:
+     → nextStatus: "active", nextStep: ${task.currentStep.step + 1}
+   - IF reply DOES NOT satisfy (vague, unclear, needs follow-up):
+     → Send follow-up message
+     → nextStatus: "waiting", nextStep: ${task.currentStep.step} (STAY on same step)
    - contextUpdates.new_reply_detected = false
 
-DO NOT stay on this step. ADVANCE to the next step.`;
+IMPORTANT: Only advance if the step's condition is truly met. A reply alone doesn't mean success.`;
     } else {
       userPrompt = `Execute step ${task.currentStep.step}: "${task.plan[task.currentStep.step - 1]}"\n\nDo the action required for this step, then call update_task_state with the results.`;
     }
@@ -5025,6 +5692,8 @@ DO NOT stay on this step. ADVANCE to the next step.`;
             await updateTask(taskId, updates);
 
             // PROACTIVE NOTIFICATIONS - Always notify user of important task events
+            console.log(`[Tasks] Notification check: win=${!!win}, status=${input.nextStatus}, nextStep=${input.nextStep}, currentStep=${task.currentStep.step}`);
+            
             if (win) {
               let notificationMessage = null;
               let notificationEmoji = "📋";
@@ -5045,15 +5714,28 @@ DO NOT stay on this step. ADVANCE to the next step.`;
                 const nextStepDesc = task.plan[input.nextStep - 1] || "";
                 notificationMessage = `Step ${task.currentStep.step} complete: ${input.logMessage}\n\nMoving to step ${input.nextStep}: ${nextStepDesc}`;
               }
-              // Waiting for reply - brief update
-              else if (input.nextStatus === "waiting" && task.contextMemory?.waiting_for_contact) {
+              // Waiting for reply - brief update  
+              else if (input.nextStatus === "waiting") {
                 notificationEmoji = "⏳";
-                notificationMessage = `${input.logMessage}\n\nWaiting for reply from ${task.contextMemory.waiting_for_contact || input.contextUpdates?.waiting_for_contact}...`;
+                const waitingFor = input.contextUpdates?.waiting_for_contact || task.contextMemory?.waiting_for_contact;
+                notificationMessage = `${input.logMessage}${waitingFor ? `\n\nWaiting for reply from ${waitingFor}...` : ""}`;
+              }
+              // Any other status change with a log message - always notify
+              else if (input.logMessage && input.nextStatus === "active") {
+                notificationEmoji = "🔄";
+                notificationMessage = input.logMessage;
               }
               // Custom notification from executor
               else if (input.notifyUser) {
                 notificationMessage = input.notifyUser;
               }
+              // FALLBACK: Always notify if there's a logMessage, even if no other condition matched
+              else if (input.logMessage) {
+                notificationEmoji = "📋";
+                notificationMessage = input.logMessage;
+              }
+              
+              console.log(`[Tasks] Notification message: ${notificationMessage ? notificationMessage.slice(0, 50) + "..." : "NONE"}`);
               
               // Send notification to chat if we have one
               if (notificationMessage) {
@@ -5063,7 +5745,10 @@ DO NOT stay on this step. ADVANCE to the next step.`;
                   content: `${notificationEmoji} **Task: ${task.title}**\n\n${notificationMessage}`,
                   source: "task"
                 });
+                console.log(`[Tasks] Notification SENT to chat`);
               }
+            } else {
+              console.log(`[Tasks] Notification SKIPPED - no window`);
             }
 
             console.log(`[Tasks] Task ${taskId} state updated: status=${input.nextStatus}, step=${input.nextStep || task.currentStep.step}`);
@@ -5114,6 +5799,548 @@ DO NOT stay on this step. ADVANCE to the next step.`;
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // Query Decomposition System - For Complex Multi-Step Queries
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Fast models for classification (cheaper/faster)
+  const CLASSIFIER_MODELS = {
+    anthropic: "claude-3-5-haiku-20241022",
+    openai: "gpt-4o-mini",
+    google: "gemini-1.5-flash"
+  };
+
+  /**
+   * Classifies query complexity using a fast LLM call
+   * @param {string} query - The user's query
+   * @param {Object} apiKeys - Available API keys
+   * @param {string} activeProvider - The active LLM provider
+   * @returns {Object} Classification result with complexity, requires_waiting, estimated_steps
+   */
+  async function classifyQueryComplexity(query, apiKeys, activeProvider) {
+    const classificationPrompt = `Classify this user query for complexity:
+"${query}"
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{
+  "complexity": "simple" or "multi_step" or "complex_async",
+  "reason": "brief 5-10 word explanation",
+  "requires_waiting": true/false,
+  "estimated_steps": number
+}
+
+Classification rules:
+- "simple": Single action, question, or 1-2 tool calls. Examples: "what's the weather?", "send an email to Bob", "what's on my calendar?"
+- "multi_step": Multiple sequential actions that can run immediately, 3-6 tool calls. Examples: "find Chris's message in Slack and reply to it", "check my calendar and email the team about the meeting"
+- "complex_async": Requires waiting for external events, human responses, or very long operations (7+ steps). Examples: "email John to schedule a meeting and wait for his reply", "monitor Slack for messages"
+
+Set requires_waiting=true ONLY if the task needs to wait for: email replies, message responses, external API callbacks, or human input.`;
+
+    try {
+      // Use Anthropic if available (preferred)
+      if (apiKeys.anthropic) {
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKeys.anthropic,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.anthropic,
+            max_tokens: 256,
+            messages: [{ role: "user", content: classificationPrompt }]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.content?.[0]?.text || "{}";
+          // Extract JSON from response (handle potential markdown wrapping)
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[QueryDecomposition] Classified as: ${result.complexity} (${result.estimated_steps} steps, waiting: ${result.requires_waiting})`);
+            return result;
+          }
+        }
+      }
+      
+      // Fallback to OpenAI if available
+      if (apiKeys.openai) {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKeys.openai}`
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.openai,
+            max_tokens: 256,
+            messages: [
+              { role: "system", content: "You are a query classifier. Respond with only JSON." },
+              { role: "user", content: classificationPrompt }
+            ]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.choices?.[0]?.message?.content || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[QueryDecomposition] Classified as: ${result.complexity} (${result.estimated_steps} steps, waiting: ${result.requires_waiting})`);
+            return result;
+          }
+        }
+      }
+
+      // Default to simple if classification fails
+      console.log("[QueryDecomposition] Classification failed, defaulting to simple");
+      return { complexity: "simple", reason: "classification failed", requires_waiting: false, estimated_steps: 1 };
+
+    } catch (err) {
+      console.error("[QueryDecomposition] Classification error:", err.message);
+      return { complexity: "simple", reason: "error occurred", requires_waiting: false, estimated_steps: 1 };
+    }
+  }
+
+  /**
+   * Decomposes a complex query into structured steps
+   * @param {string} query - The user's query
+   * @param {Array} availableTools - List of available tool definitions
+   * @param {Object} apiKeys - Available API keys
+   * @param {string} activeProvider - The active LLM provider
+   * @returns {Object} Decomposition with title, steps array, and requires_task flag
+   */
+  async function decomposeQuery(query, availableTools, apiKeys, activeProvider) {
+    const toolNames = availableTools.map(t => `${t.name}: ${t.description}`).join("\n");
+    
+    const decompositionPrompt = `Break down this complex query into clear, sequential steps:
+
+Query: "${query}"
+
+Available tools:
+${toolNames}
+
+FIRST, determine if this is a DISCRETE or CONTINUOUS task:
+- DISCRETE: Has a clear end goal that can be completed (e.g., "find out X", "schedule a meeting", "send an email")
+- CONTINUOUS: Ongoing monitoring/watching with no end (e.g., "monitor weather and alert when it rains", "watch for emails from X")
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{
+  "title": "Brief 3-5 word task title",
+  "task_type": "discrete" or "continuous",
+  "success_criteria": "What defines successful completion (for discrete tasks)",
+  "monitoring_condition": "What to watch for (for continuous tasks only)",
+  "trigger_action": "What to do when condition is met (for continuous tasks only)",
+  "steps": [
+    {
+      "step": 1,
+      "action": "Clear description of what to do in this step",
+      "tools_needed": ["tool_name1"],
+      "depends_on_previous": false,
+      "may_require_waiting": false,
+      "is_recurring": false,
+      "expected_output": "What this step should produce"
+    }
+  ],
+  "requires_task": false,
+  "reason_for_task": null
+}
+
+CRITICAL Rules:
+1. Each step should be atomic - one clear action
+2. Steps should be in logical execution order
+3. Set depends_on_previous=true if step needs data from previous step
+4. Set may_require_waiting=true ONLY for steps waiting for external responses (email replies, etc.)
+5. Set requires_task=true if ANY step has may_require_waiting=true OR if there are 7+ steps OR if task_type is "continuous"
+6. Be specific about which tool to use in each step
+
+FOR DISCRETE TASKS (task_type: "discrete"):
+7. Set success_criteria to describe what defines completion
+8. The LAST step MUST be a confirmation/completion step that verifies success criteria is met. Examples:
+   - "follow up until he gives you an answer" → final step: "Confirm we have received a definitive answer and notify user of the result"
+   - "schedule a meeting" → final step: "Confirm meeting is scheduled and send confirmation to user"
+   - "find out X" → final step: "Confirm we have obtained X and summarize the finding to the user"
+
+FOR CONTINUOUS TASKS (task_type: "continuous"):
+9. Set success_criteria to null (no final success - task runs indefinitely)
+10. Set monitoring_condition to describe what triggers action (e.g., "rain detected in weather", "new email from X")
+11. Set trigger_action to describe what happens when condition is met (e.g., "send alert to user")
+12. Mark steps that repeat with is_recurring=true
+13. The plan should describe ONE monitoring cycle. Examples:
+    - "monitor weather and alert when it rains" → steps: 1) Check weather forecast, 2) If rain detected, alert user, 3) Wait and repeat
+    - "watch inbox for emails from X" → steps: 1) Check recent emails from X, 2) If new email found, notify user, 3) Wait and repeat`;
+
+    try {
+      // Use Anthropic if available (preferred)
+      if (apiKeys.anthropic) {
+        const model = activeProvider === "anthropic" ? (CLASSIFIER_MODELS.anthropic) : CLASSIFIER_MODELS.anthropic;
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKeys.anthropic,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: model,
+            max_tokens: 2048,
+            messages: [{ role: "user", content: decompositionPrompt }]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.content?.[0]?.text || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[QueryDecomposition] Decomposed into ${result.steps?.length || 0} steps: "${result.title}"`);
+            return result;
+          }
+        }
+      }
+      
+      // Fallback to OpenAI
+      if (apiKeys.openai) {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKeys.openai}`
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.openai,
+            max_tokens: 2048,
+            messages: [
+              { role: "system", content: "You are a query decomposition assistant. Respond with only JSON." },
+              { role: "user", content: decompositionPrompt }
+            ]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.choices?.[0]?.message?.content || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[QueryDecomposition] Decomposed into ${result.steps?.length || 0} steps: "${result.title}"`);
+            return result;
+          }
+        }
+      }
+
+      // Default empty decomposition if failed
+      console.log("[QueryDecomposition] Decomposition failed");
+      return { title: "Unknown", steps: [], requires_task: false, reason_for_task: null };
+
+    } catch (err) {
+      console.error("[QueryDecomposition] Decomposition error:", err.message);
+      return { title: "Unknown", steps: [], requires_task: false, reason_for_task: null };
+    }
+  }
+
+  /**
+   * Formats decomposed steps for display to user
+   * @param {Array} steps - Array of step objects
+   * @returns {string} Formatted markdown string
+   */
+  function formatDecomposedSteps(steps) {
+    if (!steps || steps.length === 0) return "No steps identified.";
+    return steps.map((s, i) => {
+      const waitIndicator = s.may_require_waiting ? " ⏳" : "";
+      const tools = s.tools_needed?.length > 0 ? ` [${s.tools_needed.join(", ")}]` : "";
+      return `${i + 1}. ${s.action}${tools}${waitIndicator}`;
+    }).join("\n");
+  }
+
+  /**
+   * Executes decomposed steps inline with context passing
+   * @param {Object} decomposition - The decomposition result
+   * @param {Array} messages - Chat message history
+   * @param {Object} toolExecutor - Object with executeTool function
+   * @param {Object} apiKeys - Available API keys
+   * @param {Object} models - Model configuration
+   * @param {string} activeProvider - The active LLM provider
+   * @param {string} systemPrompt - The system prompt to use
+   * @param {Function} sendProgress - Optional callback to send progress updates
+   * @returns {Object} Result with ok, response, and step results
+   */
+  async function executeDecomposedSteps(decomposition, messages, toolExecutor, apiKeys, models, activeProvider, systemPrompt, sendProgress) {
+    const { steps, title } = decomposition;
+    const stepResults = [];
+    let accumulatedContext = {};
+    
+    console.log(`[QueryDecomposition] ========== EXECUTE DECOMPOSED STEPS ==========`);
+    console.log(`[QueryDecomposition] Title: "${title}"`);
+    console.log(`[QueryDecomposition] Steps count: ${steps?.length || 0}`);
+    console.log(`[QueryDecomposition] Active provider: ${activeProvider}`);
+    console.log(`[QueryDecomposition] Has Anthropic key: ${!!apiKeys?.anthropic}`);
+    console.log(`[QueryDecomposition] Has OpenAI key: ${!!apiKeys?.openai}`);
+    console.log(`[QueryDecomposition] Tools count: ${toolExecutor?.tools?.length || 0}`);
+
+    // Enhanced system prompt for step execution
+    const stepSystemPrompt = `${systemPrompt}
+
+## EXECUTION CONTEXT
+You are executing a multi-step plan. Current plan: "${title}"
+
+Steps:
+${formatDecomposedSteps(steps)}
+
+## INSTRUCTIONS
+- Execute ONLY the current step indicated
+- Use the tools specified for that step
+- Be concise in your responses
+- After completing a step, summarize what you found/did
+- Pass relevant information to the next step via your response`;
+
+    // Build conversation with accumulated context
+    let currentMessages = [...messages];
+    
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      const stepNum = i + 1;
+      
+      console.log(`[QueryDecomposition] Executing step ${stepNum}/${steps.length}: ${step.action}`);
+      
+      // Send progress update if callback provided
+      if (sendProgress) {
+        sendProgress({
+          type: "step_progress",
+          currentStep: stepNum,
+          totalSteps: steps.length,
+          stepAction: step.action,
+          status: "executing"
+        });
+      }
+
+      // Add step instruction to messages
+      const stepInstruction = stepNum === 1 
+        ? `Execute step ${stepNum}: ${step.action}`
+        : `Continue with step ${stepNum}: ${step.action}\n\nContext from previous steps:\n${JSON.stringify(accumulatedContext, null, 2)}`;
+
+      const stepMessages = [
+        ...currentMessages,
+        { role: "user", content: stepInstruction }
+      ];
+
+      // Execute this step using the main chat flow (with tool calling)
+      try {
+        let stepResponse = null;
+        
+        console.log(`[QueryDecomposition] Step ${stepNum}: Provider=${activeProvider}, HasKey=${!!apiKeys[activeProvider]}`);
+        
+        // Use Anthropic
+        if (activeProvider === "anthropic" && apiKeys.anthropic) {
+          const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
+          let iterationMessages = stepMessages.map(m => ({ role: m.role, content: m.content }));
+          
+          console.log(`[QueryDecomposition] Step ${stepNum}: Calling Anthropic API with model ${anthropicModel}...`);
+          
+          for (let iteration = 0; iteration < 5; iteration++) {
+            console.log(`[QueryDecomposition] Step ${stepNum}: API iteration ${iteration + 1}`);
+            const response = await fetch("https://api.anthropic.com/v1/messages", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-api-key": apiKeys.anthropic,
+                "anthropic-version": "2023-06-01"
+              },
+              body: JSON.stringify({
+                model: anthropicModel,
+                max_tokens: 4096,
+                system: stepSystemPrompt,
+                tools: toolExecutor.tools,
+                messages: iterationMessages
+              })
+            });
+
+            if (!response.ok) {
+              const error = await response.text();
+              console.error(`[QueryDecomposition] Step ${stepNum}: API error - ${error}`);
+              throw new Error(`API error: ${error}`);
+            }
+
+            const data = await response.json();
+            console.log(`[QueryDecomposition] Step ${stepNum}: API response stop_reason=${data.stop_reason}`);
+
+            if (data.stop_reason === "end_turn" || !data.content.some(b => b.type === "tool_use")) {
+              const textBlock = data.content.find(b => b.type === "text");
+              stepResponse = textBlock?.text || "";
+              console.log(`[QueryDecomposition] Step ${stepNum}: Got text response (${stepResponse?.length || 0} chars)`);
+              break;
+            }
+
+            // Handle tool calls
+            const toolUseBlocks = data.content.filter(b => b.type === "tool_use");
+            const toolResults = [];
+
+            for (const toolUse of toolUseBlocks) {
+              console.log(`[QueryDecomposition] Step ${stepNum} tool: ${toolUse.name}`);
+              const result = await toolExecutor.executeTool(toolUse.name, toolUse.input);
+              
+              // Store tool results in accumulated context
+              accumulatedContext[`step${stepNum}_${toolUse.name}`] = result;
+              
+              toolResults.push({
+                type: "tool_result",
+                tool_use_id: toolUse.id,
+                content: JSON.stringify(result)
+              });
+            }
+
+            iterationMessages.push({ role: "assistant", content: data.content });
+            iterationMessages.push({ role: "user", content: toolResults });
+          }
+        }
+        // Use OpenAI
+        else if (activeProvider === "openai" && apiKeys.openai) {
+          const openaiModel = models.openai || "gpt-4o";
+          const openaiTools = toolExecutor.tools.map(t => ({
+            type: "function",
+            function: { name: t.name, description: t.description, parameters: t.input_schema }
+          }));
+
+          let iterationMessages = [
+            { role: "system", content: stepSystemPrompt },
+            ...stepMessages.map(m => ({ role: m.role, content: m.content }))
+          ];
+
+          for (let iteration = 0; iteration < 5; iteration++) {
+            const response = await fetch("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${apiKeys.openai}`
+              },
+              body: JSON.stringify({
+                model: openaiModel,
+                messages: iterationMessages,
+                tools: openaiTools
+              })
+            });
+
+            if (!response.ok) {
+              const error = await response.text();
+              throw new Error(`API error: ${error}`);
+            }
+
+            const data = await response.json();
+            const choice = data.choices[0];
+
+            if (choice.finish_reason === "stop" || !choice.message.tool_calls) {
+              stepResponse = choice.message.content || "";
+              break;
+            }
+
+            iterationMessages.push(choice.message);
+
+            for (const toolCall of choice.message.tool_calls) {
+              const toolInput = JSON.parse(toolCall.function.arguments);
+              console.log(`[QueryDecomposition] Step ${stepNum} tool: ${toolCall.function.name}`);
+              const result = await toolExecutor.executeTool(toolCall.function.name, toolInput);
+              
+              accumulatedContext[`step${stepNum}_${toolCall.function.name}`] = result;
+
+              iterationMessages.push({
+                role: "tool",
+                tool_call_id: toolCall.id,
+                content: JSON.stringify(result)
+              });
+            }
+          }
+        }
+        // Fallback for Google (no tool support yet)
+        else if (apiKeys.google) {
+          console.log(`[QueryDecomposition] Step ${stepNum}: Using Google (no tool support)`);
+          stepResponse = "Google Gemini does not yet support tool calling for decomposed execution.";
+        }
+        // No provider available
+        else {
+          console.error(`[QueryDecomposition] Step ${stepNum}: NO PROVIDER AVAILABLE!`);
+          console.error(`[QueryDecomposition] Provider: ${activeProvider}, Keys: anthropic=${!!apiKeys.anthropic}, openai=${!!apiKeys.openai}, google=${!!apiKeys.google}`);
+          stepResponse = "Error: No LLM provider available for this step.";
+        }
+
+        console.log(`[QueryDecomposition] Step ${stepNum}: Final response = "${stepResponse?.substring(0, 100) || 'null'}..."`);
+        
+        stepResults.push({
+          step: stepNum,
+          action: step.action,
+          response: stepResponse,
+          success: true
+        });
+
+        // Add step result to accumulated context
+        accumulatedContext[`step${stepNum}_result`] = stepResponse;
+
+        // Update current messages for next step
+        currentMessages.push({ role: "user", content: stepInstruction });
+        currentMessages.push({ role: "assistant", content: stepResponse || "" });
+
+        // Send progress update
+        if (sendProgress) {
+          sendProgress({
+            type: "step_progress",
+            currentStep: stepNum,
+            totalSteps: steps.length,
+            stepAction: step.action,
+            status: "completed",
+            result: stepResponse
+          });
+        }
+
+      } catch (err) {
+        console.error(`[QueryDecomposition] Step ${stepNum} error:`, err.message);
+        stepResults.push({
+          step: stepNum,
+          action: step.action,
+          response: null,
+          error: err.message,
+          success: false
+        });
+
+        if (sendProgress) {
+          sendProgress({
+            type: "step_progress",
+            currentStep: stepNum,
+            totalSteps: steps.length,
+            stepAction: step.action,
+            status: "error",
+            error: err.message
+          });
+        }
+
+        // Continue to next step or fail? For now, continue
+      }
+    }
+
+    // Generate final summary
+    const successfulSteps = stepResults.filter(r => r.success).length;
+    const lastResult = stepResults[stepResults.length - 1];
+    
+    let finalResponse = `## Task Complete: ${title}\n\n`;
+    finalResponse += `Completed ${successfulSteps}/${steps.length} steps.\n\n`;
+    
+    if (lastResult?.response) {
+      finalResponse += `**Final Result:**\n${lastResult.response}`;
+    }
+
+    console.log(`[QueryDecomposition] Execution complete: ${successfulSteps}/${steps.length} steps successful`);
+
+    return {
+      ok: true,
+      response: finalResponse,
+      stepResults,
+      decomposition
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // Shared Tool Builder - Used by both Chat and Task Executor
   // ─────────────────────────────────────────────────────────────────────────────
   
@@ -5136,6 +6363,7 @@ DO NOT stay on this step. ADVANCE to the next step.`;
       slackAccessToken = null,
       weatherEnabled = true,
       iMessageEnabled = false,
+      playwrightEnabled = false,
       includeProfileTools = true,
       includeTaskTools = true,
       includeMemoryTools = true,
@@ -5152,6 +6380,16 @@ DO NOT stay on this step. ADVANCE to the next step.`;
     if (iMessageEnabled) tools.push(...iMessageTools);
     if (weatherEnabled) tools.push(...weatherTools);
     if (slackAccessToken) tools.push(...slackTools);
+    
+    // Add Playwright browser automation tools if enabled
+    if (playwrightEnabled) {
+      const pwTools = getPlaywrightTools();
+      if (pwTools.length > 0) {
+        tools.push(...pwTools);
+        console.log(`[Tools] Added ${pwTools.length} Playwright browser tools`);
+      }
+    }
+    
     if (additionalTools.length > 0) tools.push(...additionalTools);
 
     // Tool execution router
@@ -5184,6 +6422,10 @@ DO NOT stay on this step. ADVANCE to the next step.`;
       if (slackAccessToken && slackTools.find(t => t.name === toolName)) {
         return await executeSlackTool(toolName, toolInput, slackAccessToken);
       }
+      // Playwright browser tools
+      if (playwrightEnabled && getPlaywrightTools().find(t => t.name === toolName)) {
+        return await executePlaywrightTool(toolName, toolInput);
+      }
       
       return { error: `Tool ${toolName} not available` };
     };
@@ -5193,7 +6435,7 @@ DO NOT stay on this step. ADVANCE to the next step.`;
 
   /**
    * Loads integration settings and builds tools
-   * @returns {Object} { tools, executeTool, googleAccessToken, slackAccessToken, weatherEnabled, iMessageEnabled }
+   * @returns {Object} { tools, executeTool, googleAccessToken, slackAccessToken, weatherEnabled, iMessageEnabled, playwrightEnabled }
    */
   const loadIntegrationsAndBuildTools = async (options = {}) => {
     const settingsPath = await getSettingsPath();
@@ -5235,11 +6477,28 @@ DO NOT stay on this step. ADVANCE to the next step.`;
       // Default to platform check
     }
 
+    // Check Playwright browser automation enabled
+    let playwrightIsEnabled = false;
+    try {
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      if (settings.playwrightEnabled === true) {
+        // Start Playwright MCP if not already running
+        if (!isPlaywrightMcpRunning()) {
+          const options = settings.playwrightOptions || {};
+          await startPlaywrightMcp(options);
+        }
+        playwrightIsEnabled = isPlaywrightMcpRunning();
+      }
+    } catch {
+      // Default disabled
+    }
+
     const { tools, executeTool } = buildToolsAndExecutor({
       googleAccessToken,
       slackAccessToken,
       weatherEnabled,
       iMessageEnabled,
+      playwrightEnabled: playwrightIsEnabled,
       ...options
     });
 
@@ -5249,7 +6508,8 @@ DO NOT stay on this step. ADVANCE to the next step.`;
       googleAccessToken,
       slackAccessToken,
       weatherEnabled,
-      iMessageEnabled
+      iMessageEnabled,
+      playwrightEnabled: playwrightIsEnabled
     };
   };
 
@@ -5339,89 +6599,175 @@ DO NOT stay on this step. ADVANCE to the next step.`;
 
   console.log(`[Messaging] Registered ${Object.keys(messagingIntegrations).length} messaging integrations`);
 
-  // Chat handler with agentic workflow
-  ipcMain.handle("chat:send", async (_event, { messages }) => {
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Core Chat Processing Function (shared by IPC handler and inline execution)
+  // ─────────────────────────────────────────────────────────────────────────────
+  
+  /**
+   * Process a chat query through the full pipeline
+   * @param {Array} messages - Chat messages array
+   * @param {Object} options - Processing options
+   * @param {boolean} options.skipDecomposition - Skip query decomposition (for inline step execution)
+   * @param {string} options.stepContext - Additional context from previous steps (for inline execution)
+   * @returns {Object} Result with ok, response, and optional decomposition/classification
+   */
+  async function processChatQuery(messages, options = {}) {
+    const { skipDecomposition = false, stepContext = null } = options;
+    
+    const settingsPath = await getSettingsPath();
+    let apiKeys = {};
+    let models = {};
+    let activeProvider = "anthropic";
     try {
-      const settingsPath = await getSettingsPath();
-      let apiKeys = {};
-      let models = {};
-      let activeProvider = "anthropic";
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      apiKeys = settings.apiKeys || {};
+      models = settings.models || {};
+      activeProvider = settings.activeProvider || "anthropic";
+    } catch {
+      return { ok: false, error: "No API keys configured" };
+    }
+
+    if (!apiKeys.anthropic && !apiKeys.openai && !apiKeys.google) {
+      return { ok: false, error: "No API keys configured. Go to Settings to add your API key." };
+    }
+    
+    const userMessage = messages[messages.length - 1]?.content || "";
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Query Decomposition (skipped for inline step execution)
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    if (!skipDecomposition && userMessage.length > 30) {
       try {
-        const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-        apiKeys = settings.apiKeys || {};
-        models = settings.models || {};
-        activeProvider = settings.activeProvider || "anthropic";
-      } catch {
-        return { ok: false, error: "No API keys configured" };
-      }
-
-      if (!apiKeys.anthropic && !apiKeys.openai && !apiKeys.google) {
-        return { ok: false, error: "No API keys configured. Go to Settings to add your API key." };
-      }
-
-      // Get user profile for context
-      let profile = null;
-      try {
-        const profilePath = await getUserProfilePath();
-        const markdown = await fs.readFile(profilePath, "utf8");
-        profile = parseUserProfile(markdown);
-      } catch {
-        // No profile
-      }
-
-      // Check Google auth
-      const accessToken = await getGoogleAccessToken();
-      const hasGoogleTools = !!accessToken;
-      const hasIMessageTools = process.platform === "darwin";
-
-      // Load conversation context (historical memory)
-      let conversationContext = { todayMessages: "", yesterdayMessages: "", recentSummaries: "" };
-      try {
-        conversationContext = await loadConversationContext();
+        console.log("[QueryDecomposition] Classifying query complexity...");
+        const queryClassification = await classifyQueryComplexity(userMessage, apiKeys, activeProvider);
+        
+        // If classified as multi_step or complex_async, decompose the query
+        if (queryClassification.complexity !== "simple") {
+          console.log("[QueryDecomposition] Complex query detected, decomposing...");
+          
+          // Build tools list for decomposition
+          const accessToken = await getGoogleAccessToken();
+          const slackToken = await getSlackAccessToken().catch(() => null);
+          const hasPlaywright = await (async () => {
+            try {
+              const s = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+              return s.playwrightEnabled === true && isPlaywrightMcpRunning();
+            } catch { return false; }
+          })();
+          
+          const toolsForDecomposition = [
+            ...profileTools, ...taskTools, ...memoryTools,
+            ...(accessToken ? googleWorkspaceTools : []),
+            ...(process.platform === "darwin" ? iMessageTools : []),
+            ...weatherTools,
+            ...(slackToken ? slackTools : []),
+            ...(hasPlaywright ? getPlaywrightTools() : [])
+          ];
+          
+          const queryDecomposition = await decomposeQuery(userMessage, toolsForDecomposition, apiKeys, activeProvider);
+          
+          // Check if we should suggest creating a task or execute inline
+          if (queryDecomposition && queryDecomposition.steps && queryDecomposition.steps.length > 0) {
+            const hasWaitingSteps = queryDecomposition.steps.some(s => s.may_require_waiting);
+            const tooManySteps = queryDecomposition.steps.length > 6;
+            const shouldSuggestTask = queryDecomposition.requires_task || hasWaitingSteps || tooManySteps || queryClassification.requires_waiting;
+            
+            if (shouldSuggestTask) {
+              const stepsDisplay = formatDecomposedSteps(queryDecomposition.steps);
+              const taskReason = hasWaitingSteps 
+                ? "This task involves waiting for external responses (like replies), which requires a background task."
+                : tooManySteps 
+                  ? `This task has ${queryDecomposition.steps.length} steps, which is best handled as a background task.`
+                  : queryDecomposition.reason_for_task || "This complex task is best handled as a background task.";
+              
+              return {
+                ok: true,
+                response: `I've analyzed your request and broken it down into ${queryDecomposition.steps.length} steps:\n\n**${queryDecomposition.title}**\n\n${stepsDisplay}\n\n${taskReason}\n\nWould you like me to create a background task to handle this? It will run autonomously and notify you of progress.`,
+                decomposition: queryDecomposition,
+                classification: queryClassification,
+                suggestTask: true
+              };
+            }
+          }
+        }
       } catch (err) {
-        console.error("[Memory] Error loading conversation context:", err.message);
+        console.error("[QueryDecomposition] Error in decomposition flow:", err.message);
+        // Fall through to normal chat flow on error
       }
+    }
 
-      // Load skills and find best match for user's message
-      let matchedSkill = null;
-      try {
-        const userMessage = messages[messages.length - 1]?.content || "";
-        const skills = await loadAllSkills();
-        if (skills.length > 0 && userMessage) {
-          matchedSkill = await findBestSkill(userMessage, skills);
-        }
-      } catch (err) {
-        console.error("[Skills] Error matching skill:", err.message);
+    // ─────────────────────────────────────────────────────────────────────────
+    // Normal Chat Flow (full pipeline with profile, memory, skills, tools)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Get user profile for context
+    let profile = null;
+    try {
+      const profilePath = await getUserProfilePath();
+      const markdown = await fs.readFile(profilePath, "utf8");
+      profile = parseUserProfile(markdown);
+    } catch {
+      // No profile
+    }
+
+    // Check Google auth
+    const accessToken = await getGoogleAccessToken();
+    const hasGoogleTools = !!accessToken;
+    const hasIMessageTools = process.platform === "darwin";
+
+    // Load conversation context (historical memory)
+    let conversationContext = { todayMessages: "", yesterdayMessages: "", recentSummaries: "" };
+    try {
+      conversationContext = await loadConversationContext();
+    } catch (err) {
+      console.error("[Memory] Error loading conversation context:", err.message);
+    }
+
+    // Load skills and find best match for user's message
+    let matchedSkill = null;
+    try {
+      const skills = await loadAllSkills();
+      if (skills.length > 0 && userMessage) {
+        matchedSkill = await findBestSkill(userMessage, skills);
       }
+    } catch (err) {
+      console.error("[Skills] Error matching skill:", err.message);
+    }
 
-      // Build system prompt
-      let systemPrompt = `You are Wovly, a warm and helpful AI assistant. You have a friendly, supportive personality.`;
+    // Build system prompt
+    let systemPrompt = `You are Wovly, a warm and helpful AI assistant. You have a friendly, supportive personality.`;
 
-      if (profile) {
-        systemPrompt += `\n\nUser Profile:\n- Name: ${profile.firstName} ${profile.lastName}\n- Occupation: ${profile.occupation || "Not specified"}\n- City: ${profile.city || "Not specified"}\n- Home Life: ${profile.homeLife || "Not specified"}`;
+    if (profile) {
+      systemPrompt += `\n\nUser Profile:\n- Name: ${profile.firstName} ${profile.lastName}\n- Occupation: ${profile.occupation || "Not specified"}\n- City: ${profile.city || "Not specified"}\n- Home Life: ${profile.homeLife || "Not specified"}`;
+    }
+
+    // Add step context for inline execution
+    if (stepContext) {
+      systemPrompt += `\n\n## Current Step Context\nYou are executing a specific step as part of a larger plan. Use this context from previous steps:\n${stepContext}`;
+    }
+
+    // Add conversation history context
+    if (conversationContext.todayMessages || conversationContext.yesterdayMessages || conversationContext.recentSummaries) {
+      systemPrompt += `\n\n## Recent Conversation History\nUse this context to provide personalized responses and recall past conversations.`;
+      
+      if (conversationContext.todayMessages) {
+        systemPrompt += `\n\n### Earlier Today:\n${conversationContext.todayMessages}`;
       }
-
-      // Add conversation history context
-      if (conversationContext.todayMessages || conversationContext.yesterdayMessages || conversationContext.recentSummaries) {
-        systemPrompt += `\n\n## Recent Conversation History\nUse this context to provide personalized responses and recall past conversations.`;
-        
-        if (conversationContext.todayMessages) {
-          systemPrompt += `\n\n### Earlier Today:\n${conversationContext.todayMessages}`;
-        }
-        
-        if (conversationContext.yesterdayMessages) {
-          systemPrompt += `\n\n### Yesterday:\n${conversationContext.yesterdayMessages}`;
-        }
-        
-        if (conversationContext.recentSummaries) {
-          systemPrompt += `\n\n### Summary of Recent Days (past 2 weeks):\n${conversationContext.recentSummaries}`;
-        }
+      
+      if (conversationContext.yesterdayMessages) {
+        systemPrompt += `\n\n### Yesterday:\n${conversationContext.yesterdayMessages}`;
       }
+      
+      if (conversationContext.recentSummaries) {
+        systemPrompt += `\n\n### Summary of Recent Days (past 2 weeks):\n${conversationContext.recentSummaries}`;
+      }
+    }
 
-      // Add matched skill context (Advisory Mode)
-      if (matchedSkill && matchedSkill.confidence >= 0.3) {
-        const skill = matchedSkill.skill;
-        systemPrompt += `\n\n## Active Skill: ${skill.name}
+    // Add matched skill context (Advisory Mode)
+    if (matchedSkill && matchedSkill.confidence >= 0.3) {
+      const skill = matchedSkill.skill;
+      systemPrompt += `\n\n## Active Skill: ${skill.name}
 
 You have expertise in this area. Use this knowledge to guide the user:
 
@@ -5432,21 +6778,68 @@ ${skill.procedure.map((step, i) => `${i + 1}. ${step}`).join("\n")}
 ${skill.constraints.map(c => `- ${c}`).join("\n")}
 
 Use this as advisory guidance. When the user asks about this topic, explain the recommended process and offer to help them through each step. If they want you to execute the full process autonomously, suggest creating a task.`;
-      }
+    }
 
-      if (hasGoogleTools) {
-        systemPrompt += `\n\nYou have access to Google Workspace tools (calendar, email, drive). Use them when relevant.`;
-      }
+    if (hasGoogleTools) {
+      systemPrompt += `\n\nYou have access to Google Workspace tools (calendar, email, drive). Use them when relevant.`;
+    }
 
-      if (hasIMessageTools) {
-        systemPrompt += `\n\nYou have access to iMessage/SMS tools:
+    if (hasIMessageTools) {
+      systemPrompt += `\n\nYou have access to iMessage/SMS tools:
 - lookup_contact: Look up phone numbers from Apple Contacts by name. Use this to find someone's phone number.
 - send_imessage: Send a text message. You can use a contact name directly (e.g., "Adaira") and it will auto-lookup their phone number from Contacts.
 - get_recent_messages: Read recent text messages.
 - search_messages: Search through message history.
 
 When sending messages: You can pass a contact name directly to send_imessage - it will automatically look up their phone number. Always confirm with the user before sending.`;
+    }
+
+    // Continue with the rest of the chat flow (Slack, Weather, Playwright, Task tools, LLM calls)
+    // This is handled by the caller (IPC handler) since it contains provider-specific logic
+    return {
+      ok: true,
+      continueWithFullFlow: true,
+      apiKeys,
+      models,
+      activeProvider,
+      systemPrompt,
+      profile,
+      accessToken,
+      hasGoogleTools,
+      hasIMessageTools,
+      conversationContext,
+      matchedSkill
+    };
+  }
+
+  // Chat handler with agentic workflow
+  ipcMain.handle("chat:send", async (_event, { messages, skipDecomposition = false, stepContext = null }) => {
+    try {
+      // Use the shared processing function
+      const processResult = await processChatQuery(messages, { skipDecomposition, stepContext });
+      
+      // If decomposition returned a task suggestion, return it directly
+      if (processResult.suggestTask) {
+        return processResult;
       }
+      
+      // If there was an error, return it
+      if (!processResult.ok) {
+        return processResult;
+      }
+      
+      // If we need to continue with full flow, extract the prepared context
+      if (!processResult.continueWithFullFlow) {
+        return processResult;
+      }
+      
+      const { apiKeys, models, activeProvider, systemPrompt: baseSystemPrompt } = processResult;
+      const { accessToken } = processResult;
+      const { hasGoogleTools, hasIMessageTools } = processResult;
+      
+      // Build on the system prompt from processChatQuery
+      let systemPrompt = baseSystemPrompt;
+      const settingsPath = await getSettingsPath();
 
       // Weather system prompt (added before checking if enabled)
       systemPrompt += `\n\nYou have access to weather tools. You can look up weather forecasts, current conditions, and find location coordinates. Use these when the user asks about weather.`;
@@ -5475,6 +6868,35 @@ When sending messages: You can pass a contact name directly to send_imessage - i
       // Add Slack system prompt if connected
       if (hasSlackTools) {
         systemPrompt += `\n\nYou have access to Slack. You can list channels, read messages, send messages, and search for users. Always confirm before sending messages.`;
+      }
+
+      // Check if Playwright browser automation is enabled
+      let hasPlaywrightTools = false;
+      try {
+        const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+        if (settings.playwrightEnabled === true && isPlaywrightMcpRunning()) {
+          hasPlaywrightTools = true;
+        }
+      } catch {
+        // Default disabled
+      }
+
+      // Add Playwright system prompt if enabled
+      if (hasPlaywrightTools) {
+        systemPrompt += `\n\nYou have access to browser automation tools (Playwright). You can:
+- browser_navigate: Navigate to any URL
+- browser_snapshot: Get the structured content of a web page (accessibility tree)
+- browser_click: Click elements on the page
+- browser_type: Type text into input fields
+- browser_fill_form: Fill out form fields
+- browser_select_option: Select from dropdowns
+- browser_take_screenshot: Capture screenshots
+- browser_press_key: Press keyboard keys
+- browser_wait_for: Wait for text or elements to appear
+- browser_tabs: Manage browser tabs
+- browser_close: Close the browser
+
+Use browser_snapshot to understand page content before clicking elements. The snapshot returns an accessibility tree with element references you can use with browser_click.`;
       }
 
       // Add task system prompt
@@ -5531,6 +6953,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
       if (hasIMessageTools) allTools.push(...iMessageTools);
       if (weatherEnabled) allTools.push(...weatherTools);
       if (hasSlackTools) allTools.push(...slackTools);
+      if (hasPlaywrightTools) allTools.push(...getPlaywrightTools());
 
       // Determine which provider to use
       const useProvider = apiKeys[activeProvider] ? activeProvider : 
@@ -5585,7 +7008,8 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             googleAccessToken: accessToken,
             slackAccessToken,
             weatherEnabled,
-            iMessageEnabled: hasIMessageTools
+            iMessageEnabled: hasIMessageTools,
+            playwrightEnabled: hasPlaywrightTools
           });
 
           for (const toolUse of toolUseBlocks) {
@@ -5652,7 +7076,8 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             googleAccessToken: accessToken,
             slackAccessToken,
             weatherEnabled,
-            iMessageEnabled: hasIMessageTools
+            iMessageEnabled: hasIMessageTools,
+            playwrightEnabled: hasPlaywrightTools
           });
 
           for (const toolCall of choice.message.tool_calls) {
@@ -5705,6 +7130,396 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
       return { ok: false, error: "No API key available for selected provider" };
     } catch (err) {
       console.error("Chat error:", err);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Execute decomposed steps inline (when user dismisses task suggestion)
+  ipcMain.handle("chat:executeInline", async (_event, { decomposition, originalMessage }) => {
+    try {
+      console.log(`[Chat] ========== INLINE EXECUTION STARTED ==========`);
+      console.log(`[Chat] Title: ${decomposition.title}`);
+      console.log(`[Chat] Steps: ${decomposition.steps?.length || 0}`);
+      console.log(`[Chat] Original message: ${originalMessage?.substring(0, 100)}...`);
+      
+      const { steps, title } = decomposition;
+      const stepResults = [];
+      let accumulatedContext = {};
+      
+      // Send initial progress message
+      if (win && win.webContents) {
+        win.webContents.send("chat:newMessage", {
+          role: "assistant",
+          content: `🚀 **Starting: ${title}**\n\nI'll work through each step using the full system...`,
+          source: "decomposed"
+        });
+      }
+      
+      // Execute each step through the FULL chat processing pipeline
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        const stepNum = i + 1;
+        
+        console.log(`[Chat] Executing step ${stepNum}/${steps.length}: ${step.action}`);
+        
+        // Send "executing" progress message
+        if (win && win.webContents) {
+          win.webContents.send("chat:newMessage", {
+            role: "assistant",
+            content: `⏳ **Step ${stepNum}/${steps.length}**: ${step.action}`,
+            source: "decomposed"
+          });
+        }
+        
+        // Build the step message with context from previous steps
+        // Format context in a more readable way
+        let contextSummary = "";
+        if (Object.keys(accumulatedContext).length > 0) {
+          const contextEntries = Object.entries(accumulatedContext);
+          contextSummary = "\n\n## DATA FROM PREVIOUS STEPS (USE THIS!):\n";
+          for (const [key, value] of contextEntries) {
+            const valueStr = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+            // Truncate very long values but keep URLs intact
+            const displayValue = valueStr.length > 2000 ? valueStr.substring(0, 2000) + "..." : valueStr;
+            contextSummary += `\n### ${key}:\n${displayValue}\n`;
+          }
+          
+          // Also extract and highlight any URLs
+          const allText = JSON.stringify(accumulatedContext);
+          const urls = allText.match(/https?:\/\/[^\s"',\]\\]+/g) || [];
+          if (urls.length > 0) {
+            contextSummary += `\n### IMPORTANT URLS FOUND:\n${[...new Set(urls)].map(u => `- ${u}`).join('\n')}\n`;
+          }
+        }
+        
+        // Create messages array for this step - using a single user message for clarity
+        const stepMessages = [
+          { role: "user", content: `Original request: "${originalMessage}"
+
+I'm currently on step ${stepNum} of ${steps.length}: "${step.action}"
+${contextSummary}
+INSTRUCTION: Execute this step using the tools available. If this step requires opening a URL or link from a previous step, use the browser_navigate tool to open it, then browser_snapshot to read the page content.
+
+Please execute this step now.` }
+        ];
+        
+        try {
+          // Use processChatQuery to get the full context (profile, memory, skills, system prompt)
+          const contextResult = await processChatQuery(stepMessages, {
+            skipDecomposition: true, // Don't re-decompose individual steps
+            stepContext: Object.keys(accumulatedContext).length > 0 
+              ? JSON.stringify(accumulatedContext, null, 2) 
+              : null
+          });
+          
+          // If there was an error getting context, handle it
+          if (!contextResult.ok && !contextResult.continueWithFullFlow) {
+            throw new Error(contextResult.error || "Failed to get context");
+          }
+          
+          // Now execute the step using the enriched system prompt
+          const { apiKeys, models, activeProvider, systemPrompt } = contextResult;
+          const { accessToken } = contextResult;
+          
+          // Get Slack token
+          const slackAccessToken = await getSlackAccessToken().catch(() => null);
+          
+          // Get settings for weather and playwright
+          const settingsPath = await getSettingsPath();
+          let weatherEnabled = true;
+          let hasPlaywrightTools = false;
+          try {
+            const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+            weatherEnabled = settings.weatherEnabled !== false;
+            
+            // Start Playwright MCP if enabled but not running (same as chat:send)
+            if (settings.playwrightEnabled === true) {
+              if (!isPlaywrightMcpRunning()) {
+                console.log(`[Chat] Step ${stepNum}: Starting Playwright MCP...`);
+                const options = settings.playwrightOptions || {};
+                await startPlaywrightMcp(options);
+              }
+              hasPlaywrightTools = isPlaywrightMcpRunning();
+              console.log(`[Chat] Step ${stepNum}: Playwright enabled=${hasPlaywrightTools}`);
+            }
+          } catch (err) {
+            console.error(`[Chat] Step ${stepNum}: Error loading settings:`, err.message);
+          }
+          
+          // Build tool executor with all tools
+          const { executeTool, tools: allTools } = buildToolsAndExecutor({
+            googleAccessToken: accessToken,
+            slackAccessToken,
+            weatherEnabled,
+            iMessageEnabled: process.platform === "darwin",
+            playwrightEnabled: hasPlaywrightTools
+          });
+          
+          console.log(`[Chat] Step ${stepNum} tools available: ${allTools.length}`, allTools.map(t => t.name));
+          
+          // Build complete system prompt with ALL tool instructions (matching chat:send)
+          let fullSystemPrompt = systemPrompt;
+          
+          // Add Slack system prompt if connected
+          if (slackAccessToken) {
+            fullSystemPrompt += `\n\nYou have access to Slack tools:
+- get_slack_messages: Get recent messages from a Slack channel or DM. For DMs, you can pass a person's name and it will find their DM channel automatically.
+- send_slack_message: Send a message to a Slack channel or DM
+- list_slack_channels: List available Slack channels
+- search_slack_users: Search for Slack users by name
+
+When getting DMs from a specific person, use get_slack_messages with their name (e.g., "Chris Gorog").`;
+          }
+          
+          // Add Weather system prompt
+          if (weatherEnabled) {
+            fullSystemPrompt += `\n\nYou have access to weather tools. You can look up weather forecasts, current conditions, and find location coordinates.`;
+          }
+          
+          // Add Playwright system prompt
+          if (hasPlaywrightTools) {
+            fullSystemPrompt += `\n\nYou have access to browser automation tools (Playwright). You can:
+- browser_navigate: Navigate to a URL
+- browser_click: Click an element on the page
+- browser_type: Type text into an input
+- browser_fill: Clear and fill an input field
+- browser_snapshot: Get structured page content
+- browser_take_screenshot: Capture a screenshot
+- browser_wait: Wait for specified time
+- browser_tabs: Manage browser tabs
+
+Use these tools to interact with web pages, fill forms, and extract information.`;
+          }
+          
+          // Add Google tools system prompt
+          if (accessToken) {
+            fullSystemPrompt += `\n\nYou have access to Google Workspace tools (calendar, email, drive). Use them when relevant.`;
+          }
+          
+          // Add iMessage system prompt
+          if (process.platform === "darwin") {
+            fullSystemPrompt += `\n\nYou have access to iMessage/SMS tools for sending and reading text messages.`;
+          }
+          
+          // Enhanced system prompt for this specific step
+          // Extract any URLs from the accumulated context to highlight them
+          const contextStr = JSON.stringify(accumulatedContext);
+          const urlMatches = contextStr.match(/https?:\/\/[^\s"',\]]+/g) || [];
+          const uniqueUrls = [...new Set(urlMatches)];
+          
+          const stepSystemPrompt = `${fullSystemPrompt}
+
+## Current Task: ${title}
+You are executing step ${stepNum} of ${steps.length}: "${step.action}"
+
+## CRITICAL INSTRUCTIONS FOR MULTI-STEP EXECUTION:
+
+1. **USE DATA FROM PREVIOUS STEPS**: The context below contains results from prior steps. You MUST use this data - especially any URLs, links, names, IDs, or values that were retrieved. DO NOT make up or guess values that were already found.
+
+2. **OPENING URLS/LINKS**: When a step requires opening, visiting, or navigating to a URL:
+   - Use the Playwright browser tools (browser_navigate, browser_snapshot, browser_click, etc.)
+   - First call browser_navigate with the URL
+   - Then call browser_snapshot to see the page content
+   - Extract the relevant information from the snapshot
+
+3. **DO NOT SKIP TOOL CALLS**: Actually execute the tools. Don't just describe what you would do - use the tools and report the actual results.
+
+${uniqueUrls.length > 0 ? `## URLs FOUND IN PREVIOUS STEPS (use these!):
+${uniqueUrls.map(url => `- ${url}`).join('\n')}
+` : ''}
+## Tools Available:
+You have access to Slack, Google Calendar, Email, Browser automation (Playwright), Weather, and other tools. Use them!
+
+Execute this step and report what you found or did. Be concise but thorough.`;
+
+          // Execute LLM call for this step
+          let stepResponse = null;
+          
+          if (activeProvider === "anthropic" && apiKeys.anthropic) {
+            const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
+            let iterationMessages = stepMessages.map(m => ({ role: m.role, content: m.content }));
+            
+            for (let iteration = 0; iteration < 5; iteration++) {
+              const response = await fetch("https://api.anthropic.com/v1/messages", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "x-api-key": apiKeys.anthropic,
+                  "anthropic-version": "2023-06-01"
+                },
+                body: JSON.stringify({
+                  model: anthropicModel,
+                  max_tokens: 4096,
+                  system: stepSystemPrompt,
+                  tools: allTools,
+                  messages: iterationMessages
+                })
+              });
+
+              if (!response.ok) {
+                const error = await response.text();
+                throw new Error(`API error: ${error}`);
+              }
+
+              const data = await response.json();
+              
+              console.log(`[Chat] Step ${stepNum} iteration ${iteration}: stop_reason=${data.stop_reason}, content types=${data.content?.map(b => b.type).join(',')}`);
+
+              if (data.stop_reason === "end_turn" || !data.content.some(b => b.type === "tool_use")) {
+                const textBlock = data.content.find(b => b.type === "text");
+                stepResponse = textBlock?.text || "";
+                console.log(`[Chat] Step ${stepNum} completed without tool use, response length: ${stepResponse.length}`);
+                break;
+              }
+
+              // Handle tool calls
+              const toolUseBlocks = data.content.filter(b => b.type === "tool_use");
+              const toolResults = [];
+              
+              console.log(`[Chat] Step ${stepNum} has ${toolUseBlocks.length} tool calls`);
+
+              for (const toolUse of toolUseBlocks) {
+                console.log(`[Chat] Step ${stepNum} executing tool: ${toolUse.name} with input:`, JSON.stringify(toolUse.input).substring(0, 200));
+                const result = await executeTool(toolUse.name, toolUse.input);
+                console.log(`[Chat] Step ${stepNum} tool ${toolUse.name} result:`, JSON.stringify(result).substring(0, 300));
+                accumulatedContext[`step${stepNum}_${toolUse.name}`] = result;
+                
+                toolResults.push({
+                  type: "tool_result",
+                  tool_use_id: toolUse.id,
+                  content: JSON.stringify(result)
+                });
+              }
+
+              iterationMessages.push({ role: "assistant", content: data.content });
+              iterationMessages.push({ role: "user", content: toolResults });
+            }
+          } else if (activeProvider === "openai" && apiKeys.openai) {
+            // OpenAI flow (similar to Anthropic)
+            const openaiModel = models.openai || "gpt-4o";
+            const openaiTools = allTools.map(t => ({
+              type: "function",
+              function: { name: t.name, description: t.description, parameters: t.input_schema }
+            }));
+
+            let iterationMessages = [
+              { role: "system", content: stepSystemPrompt },
+              ...stepMessages.map(m => ({ role: m.role, content: m.content }))
+            ];
+
+            for (let iteration = 0; iteration < 5; iteration++) {
+              const response = await fetch("https://api.openai.com/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${apiKeys.openai}`
+                },
+                body: JSON.stringify({
+                  model: openaiModel,
+                  messages: iterationMessages,
+                  tools: openaiTools
+                })
+              });
+
+              if (!response.ok) {
+                const error = await response.text();
+                throw new Error(`API error: ${error}`);
+              }
+
+              const data = await response.json();
+              const choice = data.choices[0];
+
+              if (choice.finish_reason === "stop" || !choice.message.tool_calls) {
+                stepResponse = choice.message.content || "";
+                break;
+              }
+
+              iterationMessages.push(choice.message);
+
+              for (const toolCall of choice.message.tool_calls) {
+                const toolInput = JSON.parse(toolCall.function.arguments);
+                console.log(`[Chat] Step ${stepNum} tool: ${toolCall.function.name}`);
+                const result = await executeTool(toolCall.function.name, toolInput);
+                accumulatedContext[`step${stepNum}_${toolCall.function.name}`] = result;
+
+                iterationMessages.push({
+                  role: "tool",
+                  tool_call_id: toolCall.id,
+                  content: JSON.stringify(result)
+                });
+              }
+            }
+          } else {
+            throw new Error(`No LLM provider available (active: ${activeProvider})`);
+          }
+          
+          // Store result
+          if (stepResponse) {
+            accumulatedContext[`step${stepNum}_result`] = stepResponse;
+            
+            stepResults.push({
+              step: stepNum,
+              action: step.action,
+              response: stepResponse,
+              success: true
+            });
+            
+            // Send "completed" progress message with full response (no truncation)
+            if (win && win.webContents) {
+              win.webContents.send("chat:newMessage", {
+                role: "assistant",
+                content: `✅ **Step ${stepNum} complete**: ${step.action}\n\n${stepResponse}`,
+                source: "decomposed"
+              });
+            }
+          } else {
+            throw new Error("No response from LLM");
+          }
+          
+        } catch (err) {
+          console.error(`[Chat] Step ${stepNum} error:`, err);
+          stepResults.push({
+            step: stepNum,
+            action: step.action,
+            error: err.message,
+            success: false
+          });
+          
+          if (win && win.webContents) {
+            win.webContents.send("chat:newMessage", {
+              role: "assistant",
+              content: `❌ **Step ${stepNum} failed**: ${err.message}`,
+              source: "decomposed"
+            });
+          }
+        }
+      }
+      
+      // Generate final summary
+      const successfulSteps = stepResults.filter(r => r.success).length;
+      const lastResult = stepResults[stepResults.length - 1];
+      
+      let finalResponse = `## Task Complete: ${title}\n\n`;
+      finalResponse += `Completed ${successfulSteps}/${steps.length} steps.\n\n`;
+      
+      if (lastResult?.response) {
+        finalResponse += `**Final Result:**\n${lastResult.response}`;
+      }
+      
+      const inlineResult = {
+        ok: true,
+        response: finalResponse,
+        stepResults
+      };
+
+      return {
+        ok: inlineResult.ok,
+        response: inlineResult.response,
+        executedInline: true,
+        stepResults: inlineResult.stepResults
+      };
+    } catch (err) {
+      console.error("[Chat] Inline execution error:", err);
       return { ok: false, error: err.message };
     }
   });

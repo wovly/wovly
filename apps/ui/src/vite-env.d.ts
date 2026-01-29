@@ -113,6 +113,63 @@ type WovlyIpcApi = {
       ok: boolean;
       response?: string;
       error?: string;
+      // Query decomposition fields
+      suggestTask?: boolean;
+      executedInline?: boolean;
+      decomposition?: {
+        title: string;
+        task_type: "discrete" | "continuous";
+        // For discrete tasks
+        success_criteria?: string | null;
+        // For continuous tasks
+        monitoring_condition?: string | null;
+        trigger_action?: string | null;
+        steps: Array<{
+          step: number;
+          action: string;
+          tools_needed?: string[];
+          depends_on_previous?: boolean;
+          may_require_waiting?: boolean;
+          is_recurring?: boolean;
+          expected_output?: string;
+        }>;
+        requires_task: boolean;
+        reason_for_task?: string | null;
+      };
+      classification?: {
+        complexity: "simple" | "multi_step" | "complex_async";
+        reason: string;
+        requires_waiting: boolean;
+        estimated_steps: number;
+      };
+      stepResults?: Array<{
+        step: number;
+        action: string;
+        response: string | null;
+        error?: string;
+        success: boolean;
+      }>;
+    }>;
+    executeInline: (decomposition: {
+      title: string;
+      task_type?: "discrete" | "continuous";
+      steps: Array<{
+        step: number;
+        action: string;
+        tools_needed?: string[];
+      }>;
+    }, originalMessage: string) => Promise<{
+      ok: boolean;
+      response?: string;
+      error?: string;
+      executedInline?: boolean;
+      stepResults?: Array<{
+        step: number;
+        action: string;
+        response: string | null;
+        error?: string;
+        success: boolean;
+      }>;
     }>;
     onNewMessage: (callback: (message: ChatMessage) => void) => () => void;
   };
@@ -150,6 +207,12 @@ type WovlyIpcApi = {
     disconnectSlack: () => Promise<{ ok: boolean; error?: string }>;
     setWeatherEnabled: (enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
     getWeatherEnabled: () => Promise<{ ok: boolean; enabled: boolean }>;
+    // Playwright Browser Automation
+    setPlaywrightEnabled: (enabled: boolean) => Promise<{ ok: boolean; running?: boolean; error?: string }>;
+    getPlaywrightEnabled: () => Promise<{ ok: boolean; enabled: boolean; running: boolean; toolCount: number; browser?: string }>;
+    testPlaywright: () => Promise<{ ok: boolean; message?: string; toolCount?: number; tools?: string[]; error?: string }>;
+    getAvailableBrowsers: () => Promise<{ ok: boolean; browsers: Array<{ id: string; name: string; installed: boolean }> }>;
+    setPlaywrightBrowser: (browser: string) => Promise<{ ok: boolean; error?: string }>;
   };
   profile: {
     get: () => Promise<{

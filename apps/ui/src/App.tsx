@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef, Fragment } from "react";
-import { WovlyIcon, GoogleIcon, IMessageIcon, WeatherIcon, SlackIcon, WhatsAppIcon, TelegramIcon, DiscordIcon, ClaudeIcon, OpenAIIcon, GeminiIcon, ChatIcon, TasksIcon, SkillsIcon, InterfacesIcon, IntegrationsIcon, SettingsIcon } from "./icons";
+import { WovlyIcon, GoogleIcon, IMessageIcon, WeatherIcon, SlackIcon, WhatsAppIcon, TelegramIcon, DiscordIcon, ClaudeIcon, OpenAIIcon, GeminiIcon, PlaywrightIcon, ChatIcon, TasksIcon, SkillsIcon, InterfacesIcon, IntegrationsIcon, SettingsIcon } from "./icons";
 
 type NavItem = "chat" | "tasks" | "skills" | "interfaces" | "integrations" | "settings";
 
@@ -255,6 +255,24 @@ function AgendaPanel() {
     return date.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
   };
 
+  // Format full date with ordinal suffix (e.g., "Wednesday, Jan 28th, 2026")
+  const formatFullDate = (date: Date) => {
+    const day = date.getDate();
+    const ordinalSuffix = (d: number) => {
+      if (d > 3 && d < 21) return "th";
+      switch (d % 10) {
+        case 1: return "st";
+        case 2: return "nd";
+        case 3: return "rd";
+        default: return "th";
+      }
+    };
+    const weekday = date.toLocaleDateString("en-US", { weekday: "long" });
+    const month = date.toLocaleDateString("en-US", { month: "short" });
+    const year = date.getFullYear();
+    return `${weekday}, ${month} ${day}${ordinalSuffix(day)}, ${year}`;
+  };
+
   const timedEvents = events.filter(e => e.start.includes("T"));
   const eventColumns = calculateEventColumns(timedEvents);
 
@@ -262,7 +280,10 @@ function AgendaPanel() {
     <div className="panel agenda-panel">
       <div className="panel-header">
         <button className="icon-btn" onClick={goToPreviousDay}>←</button>
-        <h2>{formatDate(currentDate)}</h2>
+        <div className="agenda-header-text">
+          <h2>{formatDate(currentDate)}</h2>
+          <span className="agenda-date-subtitle">{formatFullDate(currentDate)}</span>
+        </div>
         <button className="icon-btn" onClick={goToNextDay}>→</button>
       </div>
       <div className="panel-body">
@@ -334,6 +355,30 @@ function AgendaPanel() {
 // Chat Panel
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Type for decomposition result
+type DecompositionStep = {
+  step: number;
+  action: string;
+  tools_needed?: string[];
+  depends_on_previous?: boolean;
+  may_require_waiting?: boolean;
+  is_recurring?: boolean;
+  expected_output?: string;
+};
+
+type DecompositionResult = {
+  title: string;
+  task_type: "discrete" | "continuous";
+  // For discrete tasks
+  success_criteria?: string | null;
+  // For continuous tasks
+  monitoring_condition?: string | null;
+  trigger_action?: string | null;
+  steps: DecompositionStep[];
+  requires_task: boolean;
+  reason_for_task?: string | null;
+};
+
 function ChatPanel({
   messages,
   setMessages,
@@ -350,6 +395,10 @@ function ChatPanel({
   const [error, setError] = useState<string | null>(null);
   const [whatsappSyncReady, setWhatsappSyncReady] = useState(false);
   const chatBodyRef = useRef<HTMLDivElement>(null);
+  
+  // Query decomposition state
+  const [pendingDecomposition, setPendingDecomposition] = useState<DecompositionResult | null>(null);
+  const [isCreatingTask, setIsCreatingTask] = useState(false);
 
   // Auto-scroll
   useEffect(() => {
@@ -363,8 +412,8 @@ function ChatPanel({
     if (!window.wovly) return;
 
     const unsubscribe = window.wovly.chat.onNewMessage((msg) => {
-      // Handle incoming messages from various sources
-      if (msg.source === "whatsapp" || msg.source === "task") {
+      // Handle incoming messages from various sources (WhatsApp, tasks, decomposed inline execution)
+      if (msg.source === "whatsapp" || msg.source === "task" || msg.source === "decomposed") {
         setMessages(prev => [...prev, {
           id: crypto.randomUUID(),
           role: msg.role,
@@ -461,11 +510,17 @@ function ChatPanel({
 
       if (result.ok && result.response) {
         const responseText = result.response;
+        
+        // Check if this is a task suggestion from query decomposition
+        if (result.suggestTask && result.decomposition) {
+          setPendingDecomposition(result.decomposition as DecompositionResult);
+        }
+        
         setMessages(prev => [...prev, {
           id: crypto.randomUUID(),
           role: "assistant" as const,
           content: responseText,
-          source: "app"
+          source: result.executedInline ? "decomposed" : "app"
         }]);
 
         // Sync AI response to WhatsApp if connected
@@ -488,6 +543,96 @@ function ChatPanel({
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
+    }
+  };
+
+  // Handle creating a task from pending decomposition
+  const handleCreateTaskFromDecomposition = async () => {
+    if (!pendingDecomposition || !window.wovly) return;
+    
+    setIsCreatingTask(true);
+    try {
+      // Determine task type from decomposition
+      const taskType = pendingDecomposition.task_type || "discrete";
+      const isContinuous = taskType === "continuous";
+      
+      // Create task with the decomposition plan
+      const taskResult = await window.wovly.tasks.create({
+        title: pendingDecomposition.title,
+        originalRequest: messages[messages.length - 2]?.content || pendingDecomposition.title, // Get the user's original message
+        plan: pendingDecomposition.steps.map(s => s.action),
+        taskType: taskType,
+        // For continuous tasks, pass monitoring info
+        ...(isContinuous ? {
+          monitoringCondition: pendingDecomposition.monitoring_condition,
+          triggerAction: pendingDecomposition.trigger_action
+        } : {
+          successCriteria: pendingDecomposition.success_criteria
+        }),
+        context: {}
+      });
+      
+      if (taskResult.ok) {
+        const taskDescription = isContinuous 
+          ? `I've created a **continuous monitoring task**: **${pendingDecomposition.title}**\n\nThis task will run indefinitely, checking periodically and alerting you when the condition is met.`
+          : `I've created a background task: **${pendingDecomposition.title}**\n\nThe task will run autonomously and I'll notify you of progress. You can view it in the Tasks page.`;
+        
+        setMessages(prev => [...prev, {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: taskDescription,
+          source: "task"
+        }]);
+        setPendingDecomposition(null);
+      } else {
+        setError(taskResult.error || "Failed to create task");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to create task");
+    } finally {
+      setIsCreatingTask(false);
+    }
+  };
+
+  // Cancel the task suggestion entirely (close button)
+  const handleCancelTaskSuggestion = () => {
+    setPendingDecomposition(null);
+    // Just return to normal chat mode - no action needed
+  };
+
+  // Dismiss the task suggestion and execute steps inline
+  const handleDismissTaskSuggestion = async () => {
+    if (!pendingDecomposition || !window.wovly) {
+      setPendingDecomposition(null);
+      return;
+    }
+    
+    // Get the original user message (the one before the decomposition response)
+    const originalMessage = messages[messages.length - 2]?.content || "";
+    const decomposition = pendingDecomposition;
+    
+    setPendingDecomposition(null);
+    setIsLoading(true);
+    
+    try {
+      // Execute the decomposed steps inline
+      // Progress updates will come through the onNewMessage listener
+      const result = await window.wovly.chat.executeInline(decomposition, originalMessage);
+      
+      if (result.ok && result.response) {
+        setMessages(prev => [...prev, {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: result.response,
+          source: "decomposed"
+        }]);
+      } else if (result.error) {
+        setError(result.error);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to execute steps");
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -519,6 +664,34 @@ function ChatPanel({
           </div>
         )}
         {error && <div className="chat-error">{error}</div>}
+        
+        {/* Task Suggestion from Query Decomposition */}
+        {pendingDecomposition && (
+          <div className="task-suggestion-actions">
+            <button 
+              className="task-suggestion-close"
+              onClick={handleCancelTaskSuggestion}
+              disabled={isCreatingTask}
+              title="Cancel request"
+            >
+              ×
+            </button>
+            <button 
+              className="primary" 
+              onClick={handleCreateTaskFromDecomposition}
+              disabled={isCreatingTask}
+            >
+              {isCreatingTask ? "Creating Task..." : "Yes, Create Task"}
+            </button>
+            <button 
+              className="secondary" 
+              onClick={handleDismissTaskSuggestion}
+              disabled={isCreatingTask}
+            >
+              No, Help Me Directly
+            </button>
+          </div>
+        )}
       </div>
       <div className="chat-input-area">
         <textarea
@@ -1703,6 +1876,79 @@ function SkillsPage() {
     setNewSkillId("");
   };
 
+  const [showToolsRef, setShowToolsRef] = useState(false);
+
+  // Available tools reference data
+  const availableTools = [
+    {
+      category: "Google Calendar",
+      tools: [
+        { name: "get_calendar_events", desc: "Get events from calendar (specify days)" },
+        { name: "create_calendar_event", desc: "Create event with title, time, attendees" },
+        { name: "delete_calendar_event", desc: "Delete an event by ID" },
+      ]
+    },
+    {
+      category: "Gmail",
+      tools: [
+        { name: "send_email", desc: "Send or reply to an email" },
+        { name: "list_emails", desc: "List recent emails (optionally filter by from/to)" },
+        { name: "search_emails", desc: "Search emails by query" },
+        { name: "get_email_content", desc: "Get full content of a specific email" },
+        { name: "create_draft", desc: "Create an email draft" },
+      ]
+    },
+    {
+      category: "iMessage (macOS)",
+      tools: [
+        { name: "send_imessage", desc: "Send a text message to a contact" },
+        { name: "lookup_contact", desc: "Find contact by name, returns phone number" },
+        { name: "get_recent_messages", desc: "Get recent messages with a contact" },
+      ]
+    },
+    {
+      category: "Slack",
+      tools: [
+        { name: "send_slack_message", desc: "Send message to channel or user" },
+        { name: "list_slack_channels", desc: "List available channels" },
+        { name: "list_slack_messages", desc: "Get messages from a channel" },
+        { name: "search_slack_users", desc: "Find Slack users by name" },
+      ]
+    },
+    {
+      category: "Weather",
+      tools: [
+        { name: "get_current_weather", desc: "Current conditions for a location" },
+        { name: "get_weather_forecast", desc: "Multi-day forecast" },
+        { name: "search_location", desc: "Find location coordinates" },
+      ]
+    },
+    {
+      category: "Tasks",
+      tools: [
+        { name: "create_task", desc: "Create an autonomous background task" },
+        { name: "list_tasks", desc: "List all active tasks" },
+        { name: "cancel_task", desc: "Cancel a running task" },
+      ]
+    },
+    {
+      category: "Browser (Playwright)",
+      tools: [
+        { name: "browser_navigate", desc: "Navigate to a URL" },
+        { name: "browser_click", desc: "Click an element on the page" },
+        { name: "browser_type", desc: "Type text into an input field" },
+        { name: "browser_fill", desc: "Clear and fill an input field" },
+        { name: "browser_snapshot", desc: "Get structured page content (accessibility tree)" },
+        { name: "browser_take_screenshot", desc: "Capture a screenshot of the page" },
+        { name: "browser_select_option", desc: "Select an option from a dropdown" },
+        { name: "browser_press_key", desc: "Press a keyboard key" },
+        { name: "browser_wait", desc: "Wait for specified time" },
+        { name: "browser_tabs", desc: "List, create, close, or select browser tabs" },
+        { name: "browser_close", desc: "Close the browser" },
+      ]
+    },
+  ];
+
   // Editing/Creating modal
   if (editingSkill || isCreating) {
     return (
@@ -1728,34 +1974,71 @@ function SkillsPage() {
             </div>
           )}
           
-          <textarea
-            className="skill-editor-textarea"
-            value={editContent}
-            onChange={(e) => setEditContent(e.target.value)}
-            placeholder="Enter skill markdown..."
-          />
-          
-          <div className="editor-help">
-            <h4>Skill Format:</h4>
-            <pre>{`# Skill Name
+          <div className="editor-main">
+            <textarea
+              className="skill-editor-textarea"
+              value={editContent}
+              onChange={(e) => setEditContent(e.target.value)}
+              placeholder="Enter skill markdown..."
+            />
+            
+            <div className="editor-sidebar">
+              <div className="editor-help">
+                <h4>Skill Format:</h4>
+                <pre>{`# Skill Name
 
 ## Description
-What this skill does and when to use it.
+What this skill does.
 
 ## Keywords
-keyword1, keyword2, keyword3
+keyword1, keyword2
 
 ## Procedure
 1. First step
 2. Second step
-3. Third step
 
 ## Constraints
-- Important rule or constraint
-- Another constraint
+- Important rule
 
 ## Tools
 tool1, tool2`}</pre>
+              </div>
+              
+              <div className="tools-reference">
+                <button 
+                  className="tools-reference-toggle"
+                  onClick={() => setShowToolsRef(!showToolsRef)}
+                >
+                  {showToolsRef ? "▼" : "▶"} Available Tools Reference
+                </button>
+                
+                {showToolsRef && (
+                  <div className="tools-reference-content">
+                    {availableTools.map(category => (
+                      <div key={category.category} className="tool-category">
+                        <h5>{category.category}</h5>
+                        <ul>
+                          {category.tools.map(tool => (
+                            <li key={tool.name}>
+                              <code 
+                                className="tool-name" 
+                                onClick={() => {
+                                  navigator.clipboard.writeText(tool.name);
+                                }}
+                                title="Click to copy"
+                              >
+                                {tool.name}
+                              </code>
+                              <span className="tool-desc">{tool.desc}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -2015,6 +2298,13 @@ function IntegrationsPage() {
   const [testingWeather, setTestingWeather] = useState(false);
   const [weatherTestResult, setWeatherTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
 
+  // Playwright (Browser Automation) state
+  const [playwrightEnabled, setPlaywrightEnabled] = useState(false);
+  const [testingPlaywright, setTestingPlaywright] = useState(false);
+  const [playwrightTestResult, setPlaywrightTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
+  const [playwrightBrowser, setPlaywrightBrowser] = useState<string>("chrome");
+  const [availableBrowsers, setAvailableBrowsers] = useState<Array<{ id: string; name: string; installed: boolean }>>([]);
+
   useEffect(() => {
     const checkConnections = async () => {
       if (!window.wovly) return;
@@ -2032,6 +2322,21 @@ function IntegrationsPage() {
       const weatherResult = await window.wovly.integrations.getWeatherEnabled();
       if (weatherResult.ok) {
         setWeatherEnabled(weatherResult.enabled);
+      }
+
+      // Check Playwright enabled and browser settings
+      const playwrightResult = await window.wovly.integrations.getPlaywrightEnabled();
+      if (playwrightResult.ok) {
+        setPlaywrightEnabled(playwrightResult.enabled);
+        if (playwrightResult.browser) {
+          setPlaywrightBrowser(playwrightResult.browser);
+        }
+      }
+      
+      // Get available browsers
+      const browsersResult = await window.wovly.integrations.getAvailableBrowsers?.();
+      if (browsersResult?.ok && browsersResult.browsers) {
+        setAvailableBrowsers(browsersResult.browsers);
       }
     };
     checkConnections();
@@ -2085,6 +2390,33 @@ function IntegrationsPage() {
     setSlackConnected(false);
     setSlackTeam("");
     setSlackTestResult(null);
+  };
+
+  const handleTestPlaywright = async () => {
+    setTestingPlaywright(true);
+    setPlaywrightTestResult(null);
+    const result = await window.wovly.integrations.testPlaywright();
+    setPlaywrightTestResult(result);
+    setTestingPlaywright(false);
+  };
+
+  const handleTogglePlaywright = async () => {
+    const newValue = !playwrightEnabled;
+    setPlaywrightTestResult(null);
+    const result = await window.wovly.integrations.setPlaywrightEnabled(newValue);
+    if (result.ok) {
+      setPlaywrightEnabled(newValue);
+    } else {
+      setPlaywrightTestResult({ ok: false, message: result.error || "Failed to toggle" });
+    }
+  };
+
+  const handleBrowserChange = async (browser: string) => {
+    setPlaywrightBrowser(browser);
+    const result = await window.wovly.integrations.setPlaywrightBrowser?.(browser);
+    if (!result?.ok) {
+      setPlaywrightTestResult({ ok: false, message: result?.error || "Failed to change browser" });
+    }
   };
 
   return (
@@ -2198,6 +2530,55 @@ function IntegrationsPage() {
         {slackTestResult && (
           <div className={`test-result ${slackTestResult.ok ? "success" : "error"}`}>
             {slackTestResult.ok ? `✓ ${slackTestResult.message}` : `✗ ${slackTestResult.message}`}
+          </div>
+        )}
+      </div>
+
+      {/* Playwright - Browser Automation */}
+      <div className="integration-row">
+        <div className="integration-icon">
+          <PlaywrightIcon size={32} />
+        </div>
+        <div className="integration-info">
+          <h3>Playwright - Browser Automation</h3>
+          <p>Web navigation, clicking, typing, screenshots</p>
+          <span className="integration-detail no-key">No API key required</span>
+          {playwrightEnabled && availableBrowsers.length > 0 && (
+            <div className="browser-select-row">
+              <label>Browser:</label>
+              <select 
+                value={playwrightBrowser} 
+                onChange={(e) => handleBrowserChange(e.target.value)}
+                className="browser-select"
+              >
+                {availableBrowsers.map(browser => (
+                  <option key={browser.id} value={browser.id}>
+                    {browser.name} {browser.installed ? "" : "(will download)"}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+        <div className="integration-status">
+          {playwrightEnabled ? (
+            <>
+              <span className="status connected">Enabled</span>
+              <button className="secondary small" onClick={handleTestPlaywright} disabled={testingPlaywright}>
+                {testingPlaywright ? "Testing..." : "Test"}
+              </button>
+              <button className="secondary small" onClick={handleTogglePlaywright}>Disable</button>
+            </>
+          ) : (
+            <>
+              <span className="status disconnected">Disabled</span>
+              <button className="primary small" onClick={handleTogglePlaywright}>Enable</button>
+            </>
+          )}
+        </div>
+        {playwrightTestResult && (
+          <div className={`test-result ${playwrightTestResult.ok ? "success" : "error"}`}>
+            {playwrightTestResult.ok ? `✓ ${playwrightTestResult.message}` : `✗ ${playwrightTestResult.message}`}
           </div>
         )}
       </div>
