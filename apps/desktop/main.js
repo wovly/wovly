@@ -1991,7 +1991,8 @@ const parseTaskMarkdown = (markdown, taskId) => {
           recipient: "",
           subject: "",
           message: "",
-          created: ""
+          created: "",
+          toolInput: "{}"
         };
       } else if (currentPendingMessage) {
         // Parse message fields
@@ -2006,6 +2007,7 @@ const parseTaskMarkdown = (markdown, taskId) => {
             case "recipient": currentPendingMessage.recipient = value; break;
             case "subject": currentPendingMessage.subject = value; break;
             case "created": currentPendingMessage.created = value; break;
+            case "toolinput": currentPendingMessage.toolInput = value; break;
           }
         } else if (line.startsWith("```")) {
           // Skip code fence markers
@@ -2092,6 +2094,7 @@ Poll Interval: ${task.currentStep?.pollInterval || ""}
 - **Platform**: ${msg.platform}
 - **Recipient**: ${msg.recipient}
 ${msg.subject ? `- **Subject**: ${msg.subject}\n` : ''}- **Created**: ${msg.created}
+- **ToolInput**: ${msg.toolInput || '{}'}
 
 \`\`\`
 ${msg.message}
@@ -4748,9 +4751,39 @@ Generate ONLY the welcome message, nothing else.`;
       let toolInput;
       
       try {
-        toolInput = JSON.parse(pendingMsg.toolInput);
+        toolInput = JSON.parse(pendingMsg.toolInput || '{}');
       } catch {
-        return { ok: false, error: "Invalid message data" };
+        // If toolInput is missing or invalid, try to reconstruct from message content
+        console.log(`[Tasks] toolInput parse failed, reconstructing from message content`);
+        toolInput = {};
+      }
+      
+      // If toolInput is empty, reconstruct from pending message fields
+      if (!toolInput || Object.keys(toolInput).length === 0) {
+        console.log(`[Tasks] Reconstructing toolInput for ${pendingMsg.toolName}`);
+        switch (pendingMsg.toolName) {
+          case 'send_email':
+            toolInput = {
+              to: pendingMsg.recipient,
+              subject: pendingMsg.subject || '',
+              body: pendingMsg.message
+            };
+            break;
+          case 'send_imessage':
+            toolInput = {
+              recipient: pendingMsg.recipient,
+              message: pendingMsg.message
+            };
+            break;
+          case 'send_slack_message':
+            toolInput = {
+              channel: pendingMsg.recipient,
+              message: pendingMsg.message
+            };
+            break;
+          default:
+            return { ok: false, error: `Unknown tool type: ${pendingMsg.toolName}` };
+        }
       }
 
       // If message was edited, update the content
