@@ -1,18 +1,87 @@
-# Wovly AI Assistant
+# Wovly: Your Autonomous Communication Agent
 
-A powerful, privacy-focused personal AI assistant that runs locally on your desktop. Wovly combines multiple LLM providers with deep integrations into your daily tools, enabling autonomous task execution, context-rich advice, and intelligent scheduling.
+**The privacy-focused AI assistant that manages your inbox, replies, and follow-ups across Email, Slack, and iMessage.**
+
+Wovly is a local desktop application designed to solve communication fatigue. It doesn't just draft text; it understands your relationships, remembers context, and autonomously executes the tedious work of scheduling, negotiating, and chasing down replies so you can focus on deep work.
+
+---
 
 ## Why Wovly?
 
-- **100% UI-Driven** - No coding, no configuration files, no terminal commands. Everything is managed through a clean, intuitive interface. Connect integrations with a few clicks, manage tasks visually, and chat naturally.
-- **Privacy-First** - All data stays on your machine. No cloud sync, no telemetry.
-- **Truly Autonomous** - Tasks run in the background, monitor for events, and complete multi-step workflows without constant oversight.
-- **Works With Your Tools** - Deep integrations with Google Workspace, Slack, iMessage, web browsers, and more.
-- **Learns About You** - Automatically detects when you share personal information and offers to save it to your profile for more personalized assistance.
+Communication is more than just typing; it's remembering who people are, finding time on calendars, and persisting until you get an answer. Wovly automates the entire loop.
 
-## Features
+- **Unified Communication Logic** – Wovly sits across your Gmail, Slack, and iMessage. It doesn't matter where the message comes from; Wovly can read, understand, and reply using the correct channel.
 
-### Example Use Cases
+- **Context-Aware Drafting** – Because Wovly has Long-Term Memory and Personal Profile awareness, you don't need to write long prompts. You can simply say "Reply to him effectively"—Wovly knows who "he" is, what you last spoke about, and your relationship dynamics (e.g., "Connie is my mother").
+
+- **Autonomous Follow-Ups** – Stop keeping mental tabs on pending replies. Wovly can send an email and monitor for a response in the background. If they don't reply, Wovly can nudge them automatically or notify you to intervene.
+
+- **Zero-Friction Context Gathering** – Need to look up a flight price or a LinkedIn profile before replying? Wovly's Browser Automation handles the research and weaves the data directly into your draft.
+
+- **100% Privacy-First** – Your emails, DMs, and texts are the most sensitive data you own. Wovly runs locally on your machine. No cloud sync, no telemetry. Your communication history never leaves your control.
+
+---
+
+## Communication Superpowers
+
+### 1. The "Fire and Forget" Workflow
+
+Wovly changes how you delegate communication. Instead of micromanaging the draft, you delegate the outcome.
+
+| Workflow | How It Works |
+|----------|--------------|
+| **Smart Scheduling:** "Schedule a meeting with John next week." | Wovly emails John, negotiates times based on your real calendar availability, and sends the invite only when a time is confirmed. |
+| **Cross-Platform Coordination:** "Text my wife to coordinate pickup, then Slack my boss I'll be leaving early." | Wovly creates a multi-step workflow, executing actions across iMessage and Slack simultaneously. |
+| **Persistent Outreach:** "Email the candidates and follow up until you get availability." | Wovly maintains a background process that tracks the thread state and continues the workflow over days if necessary. |
+
+### 2. Deep Context Engine
+
+Most AI assistants have amnesia. Wovly remembers, making your communication faster and more natural.
+
+- **Relationship Awareness** – Wovly detects and saves facts like "Igor is my contractor" or "My wife's birthday is March 15th." When you ask to "Email Igor," it knows exactly which address to use and the context of your renovations.
+
+- **Pronoun Resolution** – Wovly tracks the conversation thread. If you are looking at an email and say "Send a reply to him," Wovly resolves "him" to the sender of the email.
+
+- **Intelligent Summarization** – Wovly reads your daily logs and condenses them, so it can recall details from a Slack conversation three weeks ago to inform an email draft today.
+
+---
+
+## Core Capabilities
+
+Wovly enables this communication automation through a suite of deep integrations and tools:
+
+### Integrations
+
+| Integration | Description |
+|-------------|-------------|
+| **Google Workspace** | Full read/write access to Gmail and Calendar |
+| **Slack** | Send messages as yourself (User OAuth), read channels, search DMs |
+| **iMessage** | Native macOS integration to send texts and read threads |
+| **WhatsApp** | Control Wovly remotely from your phone |
+| **Web Automation (Playwright)** | Navigates websites to fill contact forms, scrape data for emails, or take screenshots |
+
+### Multi-LLM Support
+
+Choose the best brain for your emails:
+- **Anthropic Claude** (Sonnet 4, Haiku, Opus)
+- **OpenAI GPT** (GPT-4o, GPT-4 Turbo)
+- **Google Gemini** (1.5 Pro, 1.5 Flash)
+
+### Customizable Skills
+
+Your communication style is unique. Wovly lets you create **custom skills**—opinionated workflows and communication patterns tailored to how *you* work. Define templates for follow-up sequences, set rules for how certain contacts should be handled, or create step-by-step playbooks for recurring scenarios like vendor negotiations or candidate outreach.
+
+### External Control via WhatsApp
+
+Your communication doesn't stop when you leave your desk. With WhatsApp integration, you can message Wovly from your phone and trigger the same powerful automations—check your calendar, send a Slack message, or kick off a follow-up sequence—all without opening your laptop.
+
+### 100% UI-Driven
+
+No terminal commands or config files. Connect your accounts and manage your communication workflows through a clean, visual interface.
+
+---
+
+## Example Use Cases
 
 **Scheduling & Coordination**
 - "Schedule a meeting with John next week" → Wovly emails John, negotiates times, checks your calendar, and creates the event automatically
@@ -28,80 +97,16 @@ A powerful, privacy-focused personal AI assistant that runs locally on your desk
 - "Go to LinkedIn and get me the profile summary of [person]" → Wovly navigates to the page and extracts the relevant information
 - "Check the flight prices from Boston to Miami for next month on Google Flights" → Wovly browses the site and reports back with options
 - "Fill out the contact form on [website] with my information" → Wovly navigates, fills fields, and submits
-- "Take a screenshot of the homepage of [competitor's website]" → Wovly captures visual snapshots for reference
 
 **Monitoring & Alerts**
 - "Monitor the weather and alert me if it's going to rain today" → Wovly checks periodically and notifies you before rain
 - "Watch my inbox for emails from [important client] and summarize them immediately" → Wovly monitors and alerts in real-time
-- "Check [website] every hour and tell me if the price drops below $500" → Wovly monitors and alerts on price changes
-
-**Multi-Step Workflows**
-- "Research [topic], compile findings into a summary, and email it to my team" → Wovly searches, synthesizes, and delivers
-- "Get the agenda from tomorrow's meeting invite, prepare talking points, and Slack them to me before 9am" → Wovly pulls calendar context, drafts points, and schedules delivery
-
-**Personal Information & Context**
-- "Igor is my contractor working on the house renovation" → Wovly detects this as personal info and offers to save it
-- "My wife's birthday is March 15th" → Saved to profile for future reference (like reminders)
-- "Connie is my mother, Daddee is my father" → Wovly remembers your relationships
-- "Send an email to him about next week" → Wovly knows who "him" is from your previous conversation
-
-**Real Estate & Property**
-- "Search for homes under $800k in Palo Alto with 3+ bedrooms" → Wovly browses Redfin/Zillow and reports options
-- "Find rental properties in Austin near downtown" → Wovly searches multiple listing sites
-- "What's the Zestimate for [address]?" → Wovly looks up property valuations
 
 **Local Services & Outreach**
 - "I need a contractor to fix my sink - find the top 10 nearby plumbers and email them asking for a quote" → Wovly searches for local plumbers, gathers contact info, and sends personalized quote requests
 - "Find 5 highly-rated electricians in my area and ask about availability next week" → Wovly researches, compiles options, and handles outreach
-- "Research local caterers for a 50-person event and get pricing" → Wovly finds vendors and initiates contact
 
-### Multi-LLM Support
-- **Anthropic Claude** (Sonnet 4, Haiku, Opus)
-- **OpenAI GPT** (GPT-4o, GPT-4 Turbo)
-- **Google Gemini** (1.5 Pro, 1.5 Flash)
-
-### Integrations
-- **Google Workspace** - Gmail, Calendar, Drive (read, write, send emails, create events with attendees)
-- **Slack** - Send messages as yourself (user OAuth), read channels, search DMs
-- **iMessage** - Send texts, read conversations (macOS only)
-- **Playwright Browser Automation** - Full browser control: navigate websites, click, type, fill forms, take screenshots, extract data
-- **Weather** - Current conditions and forecasts via Open-Meteo
-- **WhatsApp** - Chat with Wovly from anywhere via WhatsApp
-
-### Intelligent Query Decomposition
-- Complex requests are automatically broken down into executable steps
-- Choose to run as a background task or execute inline immediately
-- Each step is validated before progressing to ensure conditions are met
-- Context from previous steps flows automatically to subsequent actions
-
-### Autonomous Task System
-- Create background tasks that execute multi-step workflows independently
-- Tasks monitor for replies and external events with lightweight polling
-- Conditional step logic: tasks stay on steps until success criteria are met
-- Supports both discrete tasks (clear end goal) and continuous monitoring tasks
-- Real-time notifications in chat as tasks progress
-
-### Customizable Skills
-- Skills are markdown files that define reusable procedures
-- Built-in skills for scheduling, email drafting, research, and more
-- Create custom skills for your specific workflows
-- Skills provide constraints and best practices for the AI to follow
-
-### Memory System
-- Daily conversation logs stored as markdown
-- Automatic summarization of older conversations
-- Long-term memory for context retention across sessions
-
-### Personal Profile ("About Me")
-- **Smart Fact Detection** - Wovly automatically detects when you share personal information ("Igor is my contractor", "My wife's birthday is March 15th") and offers to save it to your profile
-- **Conflict Resolution** - If new information conflicts with existing facts, Wovly asks which version to keep
-- **Profile Editor** - View and edit your profile directly in the "About Me" page
-- **Better Context** - Your profile helps Wovly understand your relationships, preferences, and context for more personalized responses
-
-### Intelligent Conversation Context
-- **Pronoun Resolution** - When you say "send an email to him", Wovly understands who "him" refers to from the conversation
-- **Follow-up Questions** - Ask "what were the dates of those messages?" and Wovly knows which messages you mean
-- **Contextual Understanding** - References like "that", "those", "them" are automatically resolved from recent conversation
+---
 
 ## Getting Started
 

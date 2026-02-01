@@ -25,8 +25,11 @@ const TOOLS_REQUIRING_CONFIRMATION = [
 
 /**
  * Build a human-readable preview for a message tool
+ * @param {string} toolName - The tool being called
+ * @param {Object} toolInput - The tool input parameters
+ * @param {Object} taskContext - Optional task context with contextMemory for name lookups
  */
-function buildMessagePreview(toolName, toolInput) {
+function buildMessagePreview(toolName, toolInput, taskContext = null) {
   const preview = {
     type: toolName.replace('send_', '').replace('_', ' '),
     recipient: '',
@@ -50,7 +53,35 @@ function buildMessagePreview(toolName, toolInput) {
       break;
     case 'send_slack_message':
       preview.platform = 'Slack';
-      preview.recipient = toolInput.channel;
+      // Try to find a friendly name for the recipient
+      let slackRecipient = toolInput.channel;
+      
+      // If channel looks like a Slack user ID (starts with U), try to find username in context
+      if (slackRecipient && slackRecipient.startsWith('U') && taskContext?.contextMemory) {
+        // Look for any key that ends with _username or _name and has a matching _slack_id
+        for (const [key, value] of Object.entries(taskContext.contextMemory)) {
+          if (key.endsWith('_slack_id') && value === slackRecipient) {
+            // Found the matching ID, look for the username
+            const prefix = key.replace('_slack_id', '');
+            const usernameKey = `${prefix}_username`;
+            const nameKey = `${prefix}_name`;
+            if (taskContext.contextMemory[usernameKey]) {
+              slackRecipient = `@${taskContext.contextMemory[usernameKey]}`;
+              break;
+            } else if (taskContext.contextMemory[nameKey]) {
+              slackRecipient = taskContext.contextMemory[nameKey];
+              break;
+            }
+          }
+        }
+      }
+      
+      // Also check if there's a recipientName provided directly
+      if (toolInput.recipientName) {
+        slackRecipient = toolInput.recipientName;
+      }
+      
+      preview.recipient = slackRecipient;
       preview.message = toolInput.message || toolInput.text;
       break;
   }
@@ -67,7 +98,7 @@ function buildMessagePreview(toolName, toolInput) {
  */
 async function requestMessageConfirmation(toolName, toolInput, taskContext = null) {
   const confirmationId = `confirm_${++confirmationIdCounter}_${Date.now()}`;
-  const preview = buildMessagePreview(toolName, toolInput);
+  const preview = buildMessagePreview(toolName, toolInput, taskContext);
   
   console.log(`[Confirmation] Requesting approval for ${toolName} to ${preview.recipient}`);
   
@@ -4825,9 +4856,24 @@ Generate ONLY the welcome message, nothing else.`;
       // Remove the pending message from task
       task.pendingMessages.splice(messageIndex, 1);
       
-      // Update task status - if no more pending messages, resume task
+      // Update task status - if no more pending messages, advance to next step and resume
       if (task.pendingMessages.length === 0) {
         task.status = "active"; // Resume task execution
+        
+        // Advance to the next step since the current step's message was sent
+        const currentStep = task.currentStep.step;
+        const nextStep = currentStep + 1;
+        
+        if (nextStep <= task.plan.length) {
+          task.currentStep.step = nextStep;
+          task.currentStep.state = "executing";
+          console.log(`[Tasks] Message sent, advancing from step ${currentStep} to step ${nextStep}`);
+        } else {
+          // This was the last step - mark task as completed
+          task.status = "completed";
+          task.currentStep.state = "completed";
+          console.log(`[Tasks] Message sent on final step, marking task as completed`);
+        }
       }
       task.lastUpdated = new Date().toISOString();
       task.executionLog.push({
@@ -4843,7 +4889,7 @@ Generate ONLY the welcome message, nothing else.`;
       // Notify UI
       addTaskUpdate(taskId, `Message sent to ${pendingMsg.recipient}`);
       
-      // If task is active, continue execution
+      // If task is active, continue execution on the NEXT step
       if (task.status === "active") {
         setTimeout(() => executeTaskStep(taskId), 100);
       }
@@ -4872,9 +4918,24 @@ Generate ONLY the welcome message, nothing else.`;
       const pendingMsg = task.pendingMessages[messageIndex];
       task.pendingMessages.splice(messageIndex, 1);
       
-      // Update task status
+      // Update task status - advance to next step even when discarded (otherwise it will retry the same message)
       if (task.pendingMessages.length === 0) {
         task.status = "active"; // Resume but message was skipped
+        
+        // Advance to the next step since the user chose to skip this message
+        const currentStep = task.currentStep.step;
+        const nextStep = currentStep + 1;
+        
+        if (nextStep <= task.plan.length) {
+          task.currentStep.step = nextStep;
+          task.currentStep.state = "executing";
+          console.log(`[Tasks] Message discarded, advancing from step ${currentStep} to step ${nextStep}`);
+        } else {
+          // This was the last step - mark task as completed (with skipped message)
+          task.status = "completed";
+          task.currentStep.state = "completed";
+          console.log(`[Tasks] Message discarded on final step, marking task as completed`);
+        }
       }
       task.lastUpdated = new Date().toISOString();
       task.executionLog.push({
@@ -4890,7 +4951,7 @@ Generate ONLY the welcome message, nothing else.`;
       // Notify UI
       addTaskUpdate(taskId, `Message discarded (user rejected)`);
       
-      // Continue task execution
+      // Continue task execution on the next step
       if (task.status === "active") {
         setTimeout(() => executeTaskStep(taskId), 100);
       }
@@ -7145,7 +7206,11 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
           } else {
             // Use shared tool executor for all other tools
             // Pass task context so message confirmations can be stored in the task
-            const taskContext = { taskId, autoSend: task.autoSend || false };
+            const taskContext = { 
+              taskId, 
+              autoSend: task.autoSend || false,
+              contextMemory: task.contextMemory || {}  // Include for name lookups in message previews
+            };
             toolResult = await executeTool(toolUse.name, toolUse.input, taskContext);
             
             // If a message is pending approval, update task status and return
