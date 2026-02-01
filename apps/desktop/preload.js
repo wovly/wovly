@@ -57,7 +57,11 @@ contextBridge.exposeInMainWorld("wovly", {
     testPlaywright: () => ipcRenderer.invoke("integrations:testPlaywright"),
     getAvailableBrowsers: () => ipcRenderer.invoke("integrations:getAvailableBrowsers"),
     setPlaywrightBrowser: (browser) => ipcRenderer.invoke("integrations:setPlaywrightBrowser", { browser }),
-    getPlaywrightCliReference: () => ipcRenderer.invoke("integrations:getPlaywrightCliReference")
+    getPlaywrightCliReference: () => ipcRenderer.invoke("integrations:getPlaywrightCliReference"),
+    // CDP Browser Engine (new architecture)
+    getBrowserEngine: () => ipcRenderer.invoke("integrations:getBrowserEngine"),
+    setBrowserEngine: (engine) => ipcRenderer.invoke("integrations:setBrowserEngine", { engine }),
+    testCdpBrowser: () => ipcRenderer.invoke("integrations:testCdpBrowser")
   },
   profile: {
     get: () => ipcRenderer.invoke("profile:get"),

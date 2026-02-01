@@ -8,6 +8,572 @@ const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLat
 const QRCode = require("qrcode");
 const { spawn, exec, execSync } = require("child_process");
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CDP Browser Controller - Direct Chrome DevTools Protocol control
+// ─────────────────────────────────────────────────────────────────────────────
+
+let puppeteer = null; // Lazy-loaded puppeteer-core
+
+/**
+ * BrowserController manages a persistent Chromium instance via CDP
+ * Provides low-latency browser automation with visual snapshots
+ */
+class BrowserController {
+  constructor() {
+    this.browser = null;
+    this.contexts = new Map(); // sessionId -> { context, page }
+    this.chromiumPath = null;
+    this.initialized = false;
+    this.initializing = null; // Promise for initialization in progress
+    this.elementRefs = new Map(); // sessionId -> Map(ref -> backendNodeId)
+  }
+
+  /**
+   * Get the Chromium executable path
+   * Downloads Chromium if not present
+   */
+  async getChromiumPath() {
+    if (this.chromiumPath) return this.chromiumPath;
+    
+    // Check for existing Chromium in our managed directory
+    const wovlyDir = path.join(os.homedir(), ".wovly");
+    const chromiumDir = path.join(wovlyDir, "chromium");
+    
+    try {
+      await fs.mkdir(chromiumDir, { recursive: true });
+    } catch { /* ignore */ }
+    
+    // Try to find existing Chromium installation
+    const possiblePaths = [
+      // Puppeteer cache locations
+      path.join(os.homedir(), ".cache", "puppeteer", "chrome"),
+      path.join(os.homedir(), "Library", "Caches", "puppeteer", "chrome"),
+      // Playwright cache (reuse if available)
+      path.join(os.homedir(), ".cache", "ms-playwright", "chromium-1148"),
+      path.join(os.homedir(), "Library", "Caches", "ms-playwright", "chromium-1148"),
+    ];
+    
+    // Check macOS app paths
+    if (process.platform === "darwin") {
+      possiblePaths.push("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+      possiblePaths.push("/Applications/Chromium.app/Contents/MacOS/Chromium");
+    }
+    
+    for (const basePath of possiblePaths) {
+      try {
+        const stat = await fs.stat(basePath);
+        if (stat.isFile()) {
+          this.chromiumPath = basePath;
+          console.log(`[BrowserController] Using Chromium at: ${basePath}`);
+          return basePath;
+        }
+        if (stat.isDirectory()) {
+          // Look for chrome executable in directory
+          const chromePaths = [
+            path.join(basePath, "chrome"),
+            path.join(basePath, "chrome.exe"),
+            path.join(basePath, "Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing"),
+          ];
+          for (const chromePath of chromePaths) {
+            try {
+              await fs.access(chromePath);
+              this.chromiumPath = chromePath;
+              console.log(`[BrowserController] Using Chromium at: ${chromePath}`);
+              return chromePath;
+            } catch { /* continue */ }
+          }
+        }
+      } catch { /* continue */ }
+    }
+    
+    // Download Chromium using puppeteer
+    console.log("[BrowserController] Downloading Chromium...");
+    try {
+      if (!puppeteer) {
+        puppeteer = require("puppeteer-core");
+      }
+      
+      // Use Puppeteer's browser fetcher
+      const { Browser } = require("puppeteer-core");
+      const browserFetcher = puppeteer.createBrowserFetcher({
+        path: chromiumDir,
+        product: "chrome"
+      });
+      
+      const revisionInfo = await browserFetcher.download("stable");
+      this.chromiumPath = revisionInfo.executablePath;
+      console.log(`[BrowserController] Downloaded Chromium to: ${this.chromiumPath}`);
+      return this.chromiumPath;
+    } catch (err) {
+      console.error("[BrowserController] Failed to download Chromium:", err.message);
+      // Fall back to system Chrome
+      if (process.platform === "darwin") {
+        const systemChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+        try {
+          await fs.access(systemChrome);
+          this.chromiumPath = systemChrome;
+          console.log("[BrowserController] Falling back to system Chrome");
+          return systemChrome;
+        } catch { /* continue */ }
+      }
+      throw new Error("No Chromium/Chrome installation found. Please install Chrome or Chromium.");
+    }
+  }
+
+  /**
+   * Initialize the browser instance
+   */
+  async initialize() {
+    if (this.initialized) return;
+    if (this.initializing) return this.initializing;
+    
+    this.initializing = this._doInitialize();
+    try {
+      await this.initializing;
+      this.initialized = true;
+    } finally {
+      this.initializing = null;
+    }
+  }
+
+  async _doInitialize() {
+    console.log("[BrowserController] Initializing...");
+    
+    if (!puppeteer) {
+      puppeteer = require("puppeteer-core");
+    }
+    
+    const chromiumPath = await this.getChromiumPath();
+    
+    // User data directory for persistence
+    const userDataDir = path.join(os.homedir(), ".wovly", "browser-data");
+    try {
+      await fs.mkdir(userDataDir, { recursive: true });
+    } catch { /* ignore */ }
+    
+    // Anti-detection arguments (same as Playwright CLI)
+    const args = [
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-site-isolation-trials',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--window-size=1920,1080',
+      '--start-maximized',
+      '--disable-infobars',
+      '--disable-extensions',
+      '--disable-gpu',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--no-first-run',
+      '--no-default-browser-check',
+    ];
+    
+    this.browser = await puppeteer.launch({
+      executablePath: chromiumPath,
+      headless: false, // Visible browser for debugging
+      defaultViewport: { width: 1920, height: 1080 },
+      args,
+      userDataDir,
+      ignoreDefaultArgs: ['--enable-automation'],
+    });
+    
+    // Handle browser disconnection
+    this.browser.on('disconnected', () => {
+      console.log("[BrowserController] Browser disconnected");
+      this.initialized = false;
+      this.browser = null;
+      this.contexts.clear();
+    });
+    
+    console.log("[BrowserController] Browser launched successfully");
+  }
+
+  /**
+   * Get or create a page for a session
+   * @param {string} sessionId - Session identifier (default: "default")
+   */
+  async getPage(sessionId = "default") {
+    await this.initialize();
+    
+    // Check if we already have a context for this session
+    if (this.contexts.has(sessionId)) {
+      const { page } = this.contexts.get(sessionId);
+      try {
+        // Verify page is still valid
+        await page.evaluate(() => true);
+        return page;
+      } catch {
+        // Page was closed, remove from cache
+        this.contexts.delete(sessionId);
+      }
+    }
+    
+    // Create new browser context for isolation
+    const context = await this.browser.createBrowserContext();
+    const page = await context.newPage();
+    
+    // Set realistic user agent
+    await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    
+    // Hide webdriver property
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+    
+    this.contexts.set(sessionId, { context, page });
+    this.elementRefs.set(sessionId, new Map());
+    
+    console.log(`[BrowserController] Created new page for session: ${sessionId}`);
+    return page;
+  }
+
+  /**
+   * Navigate to a URL
+   * @returns {Object} Snapshot with screenshot and elements
+   */
+  async navigate(sessionId, url) {
+    console.log(`[BrowserController] Navigating to: ${url}`);
+    const page = await this.getPage(sessionId);
+    
+    try {
+      await page.goto(url, { 
+        waitUntil: 'networkidle0',
+        timeout: 30000 
+      });
+    } catch (err) {
+      // Try with less strict wait condition
+      if (err.message.includes('timeout')) {
+        console.log("[BrowserController] Navigation timeout, continuing anyway");
+      } else {
+        throw err;
+      }
+    }
+    
+    // Return snapshot after navigation
+    return this.snapshot(sessionId);
+  }
+
+  /**
+   * Take a screenshot
+   * @returns {string} Base64-encoded screenshot
+   */
+  async screenshot(sessionId = "default") {
+    const page = await this.getPage(sessionId);
+    const screenshot = await page.screenshot({ 
+      encoding: 'base64', 
+      type: 'jpeg', 
+      quality: 80,
+      fullPage: false 
+    });
+    return `data:image/jpeg;base64,${screenshot}`;
+  }
+
+  /**
+   * Get page snapshot with screenshot and accessibility tree
+   * @returns {Object} { screenshot, elements, url, title }
+   */
+  async snapshot(sessionId = "default") {
+    const page = await this.getPage(sessionId);
+    
+    // Get screenshot
+    const screenshot = await page.screenshot({ 
+      encoding: 'base64', 
+      type: 'jpeg', 
+      quality: 80 
+    });
+    
+    // Get accessibility tree
+    let elements = [];
+    try {
+      const accessibilityTree = await page.accessibility.snapshot({ 
+        interestingOnly: true 
+      });
+      elements = this.parseAccessibilityTree(accessibilityTree, sessionId);
+    } catch (err) {
+      console.error("[BrowserController] Failed to get accessibility tree:", err.message);
+    }
+    
+    // Get page info
+    const url = page.url();
+    const title = await page.title();
+    
+    return {
+      screenshot: `data:image/jpeg;base64,${screenshot}`,
+      elements,
+      url,
+      title,
+      elementCount: elements.length
+    };
+  }
+
+  /**
+   * Parse accessibility tree into element refs
+   */
+  parseAccessibilityTree(node, sessionId, refs = [], counter = { value: 0 }) {
+    if (!node) return refs;
+    
+    const refMap = this.elementRefs.get(sessionId) || new Map();
+    
+    // Only include interactive elements
+    const interactiveRoles = [
+      'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox',
+      'menuitem', 'tab', 'searchbox', 'slider', 'spinbutton', 'switch'
+    ];
+    
+    if (node.role && (interactiveRoles.includes(node.role) || node.focused)) {
+      const ref = `e${counter.value++}`;
+      const element = {
+        ref,
+        role: node.role,
+        name: node.name || '',
+        value: node.value || undefined,
+        focused: node.focused || false,
+        disabled: node.disabled || false,
+      };
+      refs.push(element);
+      
+      // Store for later click/type operations
+      refMap.set(ref, { 
+        name: node.name, 
+        role: node.role,
+        selector: this.buildSelector(node)
+      });
+    }
+    
+    // Recurse into children
+    if (node.children) {
+      for (const child of node.children) {
+        this.parseAccessibilityTree(child, sessionId, refs, counter);
+      }
+    }
+    
+    this.elementRefs.set(sessionId, refMap);
+    return refs;
+  }
+
+  /**
+   * Build a selector for an element based on its accessibility info
+   */
+  buildSelector(node) {
+    if (!node) return null;
+    
+    // Build selector based on role and name
+    const roleMap = {
+      'button': 'button',
+      'link': 'a',
+      'textbox': 'input, textarea',
+      'checkbox': 'input[type="checkbox"]',
+      'radio': 'input[type="radio"]',
+      'combobox': 'select',
+      'searchbox': 'input[type="search"]',
+    };
+    
+    const baseSelector = roleMap[node.role] || '*';
+    
+    if (node.name) {
+      // Try to match by text content or aria-label
+      return `${baseSelector}:has-text("${node.name.replace(/"/g, '\\"').substring(0, 50)}")`;
+    }
+    
+    return baseSelector;
+  }
+
+  /**
+   * Click an element by ref
+   */
+  async click(sessionId, ref) {
+    console.log(`[BrowserController] Clicking: ${ref}`);
+    const page = await this.getPage(sessionId);
+    
+    const refMap = this.elementRefs.get(sessionId);
+    if (!refMap || !refMap.has(ref)) {
+      throw new Error(`Element ref "${ref}" not found. Take a new snapshot first.`);
+    }
+    
+    const element = refMap.get(ref);
+    
+    // Try different click strategies
+    try {
+      // Strategy 1: Use accessibility name
+      if (element.name) {
+        const selector = this.buildClickSelector(element);
+        await page.click(selector, { timeout: 5000 });
+        return { success: true, clicked: ref };
+      }
+    } catch (err) {
+      console.log(`[BrowserController] Click strategy 1 failed: ${err.message}`);
+    }
+    
+    try {
+      // Strategy 2: Use page.evaluate to find and click
+      const clicked = await page.evaluate((name, role) => {
+        const elements = document.querySelectorAll('button, a, input, [role="button"], [role="link"]');
+        for (const el of elements) {
+          const text = el.textContent || el.value || el.getAttribute('aria-label') || '';
+          if (text.toLowerCase().includes(name.toLowerCase())) {
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      }, element.name, element.role);
+      
+      if (clicked) {
+        return { success: true, clicked: ref };
+      }
+    } catch (err) {
+      console.log(`[BrowserController] Click strategy 2 failed: ${err.message}`);
+    }
+    
+    throw new Error(`Failed to click element "${ref}" (${element.name})`);
+  }
+
+  /**
+   * Build a selector for clicking
+   */
+  buildClickSelector(element) {
+    const { name, role } = element;
+    
+    // Role-specific selectors
+    const roleSelectors = {
+      'button': `button:has-text("${name}"), [role="button"]:has-text("${name}")`,
+      'link': `a:has-text("${name}"), [role="link"]:has-text("${name}")`,
+      'textbox': `input[placeholder*="${name}" i], input[aria-label*="${name}" i]`,
+      'checkbox': `input[type="checkbox"][aria-label*="${name}" i]`,
+    };
+    
+    return roleSelectors[role] || `*:has-text("${name}")`;
+  }
+
+  /**
+   * Type text into an element
+   */
+  async type(sessionId, text, ref = null) {
+    console.log(`[BrowserController] Typing: "${text.substring(0, 20)}..." into ${ref || 'focused element'}`);
+    const page = await this.getPage(sessionId);
+    
+    // If ref provided, click it first to focus
+    if (ref) {
+      const refMap = this.elementRefs.get(sessionId);
+      if (refMap && refMap.has(ref)) {
+        const element = refMap.get(ref);
+        try {
+          await this.click(sessionId, ref);
+          await page.waitForTimeout(100);
+        } catch (err) {
+          console.log(`[BrowserController] Failed to focus element, trying direct type`);
+        }
+      }
+    }
+    
+    // Clear existing content and type new text
+    await page.keyboard.down('Control');
+    await page.keyboard.press('KeyA');
+    await page.keyboard.up('Control');
+    await page.keyboard.type(text, { delay: 50 });
+    
+    return { success: true, typed: text.substring(0, 50) };
+  }
+
+  /**
+   * Press a key
+   */
+  async press(sessionId, key) {
+    console.log(`[BrowserController] Pressing key: ${key}`);
+    const page = await this.getPage(sessionId);
+    await page.keyboard.press(key);
+    return { success: true, pressed: key };
+  }
+
+  /**
+   * Scroll the page
+   */
+  async scroll(sessionId, direction = 'down', amount = 500) {
+    const page = await this.getPage(sessionId);
+    const delta = direction === 'up' ? -amount : amount;
+    await page.mouse.wheel({ deltaY: delta });
+    return { success: true, scrolled: direction };
+  }
+
+  /**
+   * Go back
+   */
+  async goBack(sessionId) {
+    const page = await this.getPage(sessionId);
+    await page.goBack();
+    return this.snapshot(sessionId);
+  }
+
+  /**
+   * Go forward
+   */
+  async goForward(sessionId) {
+    const page = await this.getPage(sessionId);
+    await page.goForward();
+    return this.snapshot(sessionId);
+  }
+
+  /**
+   * Reload page
+   */
+  async reload(sessionId) {
+    const page = await this.getPage(sessionId);
+    await page.reload();
+    return this.snapshot(sessionId);
+  }
+
+  /**
+   * Get page URL
+   */
+  async getUrl(sessionId = "default") {
+    const page = await this.getPage(sessionId);
+    return page.url();
+  }
+
+  /**
+   * Clean up resources
+   */
+  async cleanup() {
+    console.log("[BrowserController] Cleaning up...");
+    
+    // Close all contexts
+    for (const [sessionId, { context }] of this.contexts) {
+      try {
+        await context.close();
+      } catch { /* ignore */ }
+    }
+    this.contexts.clear();
+    this.elementRefs.clear();
+    
+    // Close browser
+    if (this.browser) {
+      try {
+        await this.browser.close();
+      } catch { /* ignore */ }
+      this.browser = null;
+    }
+    
+    this.initialized = false;
+    console.log("[BrowserController] Cleanup complete");
+  }
+}
+
+// Global browser controller instance
+let browserController = null;
+
+/**
+ * Get or create the browser controller
+ */
+async function getBrowserController() {
+  if (!browserController) {
+    browserController = new BrowserController();
+  }
+  return browserController;
+}
+
 let win;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2937,6 +3503,338 @@ const checkForNewSlackMessages = async (channelOrUser, afterTimestamp, accessTok
   }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Conversation Style Context - Retrieve user's sent messages to mimic their voice
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Get the user's previously sent messages to a specific recipient
+ * Used to analyze communication style and mimic the user's voice when drafting
+ * @param {string} recipient - Email address, phone number, or Slack user/channel
+ * @param {string} platform - 'email', 'slack', or 'imessage'
+ * @param {object} options - { limit: number, accessToken: string, slackUserId: string }
+ * @returns {{ messages: string[], hasHistory: boolean, recipient: string }}
+ */
+const getConversationStyleContext = async (recipient, platform, options = {}) => {
+  const { limit = 10, accessToken, slackUserId } = options;
+  const messages = [];
+  
+  console.log(`[StyleContext] Retrieving sent messages to ${recipient} via ${platform}`);
+  
+  try {
+    switch (platform) {
+      case 'email': {
+        if (!accessToken) {
+          console.log('[StyleContext] No Google access token, skipping email history');
+          return { messages: [], hasHistory: false, recipient };
+        }
+        
+        // Search for emails sent TO this recipient
+        const query = `to:${recipient} in:sent`;
+        const url = new URL("https://www.googleapis.com/gmail/v1/users/me/messages");
+        url.searchParams.set("q", query);
+        url.searchParams.set("maxResults", String(limit));
+        
+        const response = await fetch(url.toString(), {
+          headers: { "Authorization": `Bearer ${accessToken}` }
+        });
+        
+        if (!response.ok) {
+          console.error(`[StyleContext] Gmail API error: ${response.status}`);
+          return { messages: [], hasHistory: false, recipient };
+        }
+        
+        const data = await response.json();
+        const messageIds = data.messages || [];
+        
+        // Fetch message bodies
+        for (const msg of messageIds.slice(0, limit)) {
+          try {
+            const msgUrl = `https://www.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`;
+            const msgResponse = await fetch(msgUrl, {
+              headers: { "Authorization": `Bearer ${accessToken}` }
+            });
+            
+            if (msgResponse.ok) {
+              const msgData = await msgResponse.json();
+              // Extract body from payload
+              let body = '';
+              const payload = msgData.payload;
+              
+              if (payload.body?.data) {
+                body = Buffer.from(payload.body.data, 'base64').toString('utf8');
+              } else if (payload.parts) {
+                // Look for text/plain part
+                const textPart = payload.parts.find(p => p.mimeType === 'text/plain');
+                if (textPart?.body?.data) {
+                  body = Buffer.from(textPart.body.data, 'base64').toString('utf8');
+                }
+              }
+              
+              if (body && body.trim()) {
+                // Clean up the body - remove quoted replies, signatures
+                const cleanBody = body.split(/\n>|\nOn .* wrote:|\n--\s*\n/)[0].trim();
+                if (cleanBody.length > 20) { // Only include substantial messages
+                  messages.push(cleanBody.substring(0, 1000)); // Limit length
+                }
+              }
+            }
+          } catch (msgErr) {
+            console.error(`[StyleContext] Error fetching email ${msg.id}:`, msgErr.message);
+          }
+        }
+        break;
+      }
+      
+      case 'slack': {
+        if (!accessToken) {
+          console.log('[StyleContext] No Slack access token, skipping Slack history');
+          return { messages: [], hasHistory: false, recipient };
+        }
+        
+        // First, resolve the recipient to a channel ID
+        let channelId = recipient;
+        let targetUserId = null;
+        
+        // If it's a user ID (starts with U), open DM channel
+        if (/^U[A-Z0-9]+$/i.test(recipient)) {
+          targetUserId = recipient;
+          const dmResponse = await fetch("https://slack.com/api/conversations.open", {
+            method: "POST",
+            headers: { 
+              "Authorization": `Bearer ${accessToken}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ users: recipient })
+          });
+          const dmData = await dmResponse.json();
+          if (dmData.ok && dmData.channel) {
+            channelId = dmData.channel.id;
+          }
+        }
+        // If it doesn't look like a channel ID, search for user by name
+        else if (!/^[CDG][A-Z0-9]+$/i.test(recipient)) {
+          const usersResponse = await fetch(`https://slack.com/api/users.list?limit=200`, {
+            headers: { "Authorization": `Bearer ${accessToken}` }
+          });
+          const usersData = await usersResponse.json();
+          
+          if (usersData.ok && usersData.members) {
+            const user = usersData.members.find(m => 
+              m.name?.toLowerCase().includes(recipient.toLowerCase()) ||
+              m.real_name?.toLowerCase().includes(recipient.toLowerCase())
+            );
+            
+            if (user) {
+              targetUserId = user.id;
+              const dmResponse = await fetch("https://slack.com/api/conversations.open", {
+                method: "POST",
+                headers: { 
+                  "Authorization": `Bearer ${accessToken}`,
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ users: user.id })
+              });
+              const dmData = await dmResponse.json();
+              if (dmData.ok && dmData.channel) {
+                channelId = dmData.channel.id;
+              }
+            }
+          }
+        }
+        
+        // Fetch conversation history
+        const historyResponse = await fetch(
+          `https://slack.com/api/conversations.history?channel=${channelId}&limit=${limit * 3}`,
+          { headers: { "Authorization": `Bearer ${accessToken}` } }
+        );
+        const historyData = await historyResponse.json();
+        
+        if (historyData.ok && historyData.messages) {
+          // Filter for messages FROM the current user (sent by user)
+          const currentUserId = slackUserId;
+          
+          for (const msg of historyData.messages) {
+            // Only include messages from the current user (sent messages)
+            if (msg.user === currentUserId && msg.text && !msg.subtype) {
+              const cleanText = msg.text.replace(/<@[A-Z0-9]+>/g, '').trim(); // Remove mentions
+              if (cleanText.length > 10) {
+                messages.push(cleanText.substring(0, 500));
+                if (messages.length >= limit) break;
+              }
+            }
+          }
+        }
+        break;
+      }
+      
+      case 'imessage': {
+        const dbPath = path.join(os.homedir(), "Library", "Messages", "chat.db");
+        
+        try {
+          await fs.access(dbPath);
+        } catch {
+          console.log('[StyleContext] Cannot access Messages database');
+          return { messages: [], hasHistory: false, recipient };
+        }
+        
+        // Resolve contact name to phone if it contains letters
+        let phoneFilter = recipient;
+        if (/[a-zA-Z]/.test(recipient) && !/@/.test(recipient)) {
+          // This is a name - we'll match against handle.id loosely
+          phoneFilter = recipient.replace(/'/g, "''");
+        }
+        
+        const digits = phoneFilter.replace(/\D/g, "");
+        const lastDigits = digits.slice(-10);
+        
+        // Query for messages FROM ME to this contact (is_from_me = 1)
+        const query = lastDigits 
+          ? `SELECT m.text, datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date FROM message m JOIN handle h ON m.handle_id = h.ROWID WHERE h.id LIKE '%${lastDigits}%' AND m.is_from_me = 1 AND m.text IS NOT NULL AND m.text != '' ORDER BY m.date DESC LIMIT ${limit}`
+          : `SELECT m.text, datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date FROM message m JOIN handle h ON m.handle_id = h.ROWID WHERE (h.id LIKE '%${phoneFilter}%') AND m.is_from_me = 1 AND m.text IS NOT NULL AND m.text != '' ORDER BY m.date DESC LIMIT ${limit}`;
+        
+        const { exec } = require("child_process");
+        const result = await new Promise((resolve) => {
+          exec(`sqlite3 -json "${dbPath}" "${query.replace(/"/g, '\\"')}"`, { maxBuffer: 5 * 1024 * 1024 }, (error, stdout) => {
+            if (error) {
+              console.error(`[StyleContext] iMessage query error: ${error.message}`);
+              resolve([]);
+              return;
+            }
+            try {
+              const rows = stdout.trim() ? JSON.parse(stdout) : [];
+              resolve(rows.map(r => r.text).filter(t => t && t.length > 10));
+            } catch {
+              resolve([]);
+            }
+          });
+        });
+        
+        messages.push(...result.slice(0, limit));
+        break;
+      }
+    }
+    
+    console.log(`[StyleContext] Found ${messages.length} sent messages to ${recipient} via ${platform}`);
+    return { 
+      messages, 
+      hasHistory: messages.length > 0, 
+      recipient,
+      platform 
+    };
+    
+  } catch (err) {
+    console.error(`[StyleContext] Error retrieving messages: ${err.message}`);
+    return { messages: [], hasHistory: false, recipient };
+  }
+};
+
+/**
+ * Generate a style guide by analyzing the user's previous messages
+ * Uses a fast LLM call to summarize communication patterns
+ * @param {string[]} messages - Array of user's sent messages
+ * @param {string} recipient - Who the messages were sent to
+ * @param {object} apiKeys - API keys for LLM providers
+ * @param {string} activeProvider - Which LLM provider to use
+ * @returns {{ styleGuide: string, formality: string }}
+ */
+const generateStyleGuide = async (messages, recipient, apiKeys, activeProvider) => {
+  if (!messages || messages.length === 0) {
+    return { styleGuide: null, formality: 'professional' };
+  }
+  
+  console.log(`[StyleGuide] Analyzing ${messages.length} messages to generate style guide`);
+  
+  // Prepare sample messages for analysis (limit to avoid token overflow)
+  const sampleMessages = messages.slice(0, 7).map((m, i) => `Message ${i + 1}: "${m.substring(0, 300)}${m.length > 300 ? '...' : ''}"`).join('\n\n');
+  
+  const analysisPrompt = `Analyze these messages I've sent to "${recipient}" and describe my communication style in 2-3 concise sentences. Focus on:
+- Tone (casual, formal, friendly, direct, professional)
+- Greeting and sign-off patterns (if any)
+- Writing style (short/long sentences, emojis, exclamation points, bullet points)
+- Any notable patterns or phrases I use
+
+Messages:
+${sampleMessages}
+
+Respond with ONLY a brief style description (2-3 sentences max) that I can use as a guide for writing similar messages. Also indicate the formality level at the end as one word: casual, professional, or mixed.
+
+Example format:
+"Uses friendly, casual tone with short sentences. Often starts with 'Hey' and uses emojis. Tends to be direct and action-oriented. Formality: casual"`;
+
+  try {
+    let styleGuide = '';
+    let formality = 'professional';
+    
+    // Use a fast model for style analysis
+    if (apiKeys.anthropic) {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKeys.anthropic,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model: "claude-3-haiku-20240307", // Fast model for analysis
+          max_tokens: 200,
+          messages: [{ role: "user", content: analysisPrompt }]
+        })
+      });
+      
+      if (response.ok) {
+        const result = await response.json();
+        styleGuide = result.content?.[0]?.text || '';
+      }
+    } else if (apiKeys.openai) {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKeys.openai}`
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini", // Fast model for analysis
+          max_tokens: 200,
+          messages: [{ role: "user", content: analysisPrompt }]
+        })
+      });
+      
+      if (response.ok) {
+        const result = await response.json();
+        styleGuide = result.choices?.[0]?.message?.content || '';
+      }
+    } else if (apiKeys.google) {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKeys.google}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: analysisPrompt }] }],
+          generationConfig: { maxOutputTokens: 200 }
+        })
+      });
+      
+      if (response.ok) {
+        const result = await response.json();
+        styleGuide = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      }
+    }
+    
+    // Extract formality from the response
+    const formalityMatch = styleGuide.toLowerCase().match(/formality:\s*(casual|professional|mixed)/);
+    if (formalityMatch) {
+      formality = formalityMatch[1];
+    }
+    
+    console.log(`[StyleGuide] Generated style guide (formality: ${formality})`);
+    return { styleGuide: styleGuide.trim(), formality };
+    
+  } catch (err) {
+    console.error(`[StyleGuide] Error generating style guide: ${err.message}`);
+    return { styleGuide: null, formality: 'professional' };
+  }
+};
+
 // Fetch calendar events for a date range
 const fetchCalendarEvents = async (accessToken, startDate, endDate) => {
   const calendarUrl = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
@@ -4026,6 +4924,60 @@ Generate ONLY the welcome message, nothing else.`;
       setPlaywrightBrowser(browser);
       
       return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Browser Engine setting (cdp vs playwright-cli)
+  ipcMain.handle("integrations:getBrowserEngine", async () => {
+    try {
+      const settingsPath = await getSettingsPath();
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      // Default to CDP if playwright is enabled but no engine specified
+      const engine = settings.browserEngine || (settings.playwrightEnabled ? "cdp" : null);
+      return { ok: true, engine };
+    } catch {
+      return { ok: true, engine: null };
+    }
+  });
+
+  ipcMain.handle("integrations:setBrowserEngine", async (_event, { engine }) => {
+    try {
+      const settingsPath = await getSettingsPath();
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch {}
+      
+      settings.browserEngine = engine; // "cdp" or "playwright-cli"
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      
+      console.log(`[Settings] Browser engine set to: ${engine}`);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Test CDP browser
+  ipcMain.handle("integrations:testCdpBrowser", async () => {
+    try {
+      const controller = await getBrowserController();
+      const snapshot = await controller.navigate("test", "https://example.com");
+      
+      // Clean up test session
+      const { context } = controller.contexts.get("test") || {};
+      if (context) {
+        await context.close();
+        controller.contexts.delete("test");
+      }
+      
+      return { 
+        ok: true, 
+        message: `CDP Browser working! Navigated to ${snapshot.title}. Found ${snapshot.elementCount} interactive elements.`,
+        screenshot: snapshot.screenshot
+      };
     } catch (err) {
       return { ok: false, error: err.message };
     }
@@ -8458,6 +9410,251 @@ ${formatDecomposedSteps(steps)}
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // CDP Browser Tools - Direct Chrome DevTools Protocol control
+  // ─────────────────────────────────────────────────────────────────────────────
+  
+  const cdpBrowserTools = [
+    {
+      name: "browser_navigate",
+      description: "Navigate to a URL in the browser. Returns a visual snapshot with clickable element refs. Use this to open websites, search pages, etc.",
+      input_schema: {
+        type: "object",
+        properties: {
+          url: { 
+            type: "string", 
+            description: "The URL to navigate to (e.g., 'https://google.com' or 'https://zillow.com/homes/palo-alto')" 
+          }
+        },
+        required: ["url"]
+      }
+    },
+    {
+      name: "browser_click",
+      description: "Click an element on the page by its ref (e.g., 'e23'). Get refs from browser_snapshot. After clicking, a new snapshot is returned.",
+      input_schema: {
+        type: "object",
+        properties: {
+          ref: { 
+            type: "string", 
+            description: "Element ref from the snapshot (e.g., 'e5', 'e23')" 
+          }
+        },
+        required: ["ref"]
+      }
+    },
+    {
+      name: "browser_type",
+      description: "Type text into an input field. Optionally specify a ref to focus that element first. If no ref, types into the currently focused element.",
+      input_schema: {
+        type: "object",
+        properties: {
+          text: { 
+            type: "string", 
+            description: "The text to type" 
+          },
+          ref: { 
+            type: "string", 
+            description: "Optional: Element ref to focus first before typing" 
+          }
+        },
+        required: ["text"]
+      }
+    },
+    {
+      name: "browser_press",
+      description: "Press a keyboard key (e.g., 'Enter', 'Tab', 'Escape', 'ArrowDown'). Use after typing to submit forms.",
+      input_schema: {
+        type: "object",
+        properties: {
+          key: { 
+            type: "string", 
+            description: "Key to press (e.g., 'Enter', 'Tab', 'Escape', 'ArrowDown', 'ArrowUp')" 
+          }
+        },
+        required: ["key"]
+      }
+    },
+    {
+      name: "browser_snapshot",
+      description: "Get a visual snapshot of the current page. Returns a screenshot and list of clickable elements with refs. Use this to see what's on the page and get element refs for clicking/typing.",
+      input_schema: {
+        type: "object",
+        properties: {},
+        required: []
+      }
+    },
+    {
+      name: "browser_scroll",
+      description: "Scroll the page up or down to see more content.",
+      input_schema: {
+        type: "object",
+        properties: {
+          direction: { 
+            type: "string", 
+            enum: ["up", "down"],
+            description: "Direction to scroll" 
+          },
+          amount: { 
+            type: "number", 
+            description: "Pixels to scroll (default: 500)" 
+          }
+        },
+        required: ["direction"]
+      }
+    },
+    {
+      name: "browser_back",
+      description: "Go back to the previous page in browser history.",
+      input_schema: {
+        type: "object",
+        properties: {},
+        required: []
+      }
+    }
+  ];
+
+  /**
+   * Execute CDP browser tool
+   */
+  const executeCdpBrowserTool = async (toolName, toolInput) => {
+    try {
+      const controller = await getBrowserController();
+      const sessionId = toolInput.sessionId || "default";
+      
+      switch (toolName) {
+        case "browser_navigate": {
+          if (!toolInput.url) {
+            return { error: "URL is required" };
+          }
+          const snapshot = await controller.navigate(sessionId, toolInput.url);
+          return {
+            success: true,
+            url: snapshot.url,
+            title: snapshot.title,
+            elementCount: snapshot.elementCount,
+            elements: snapshot.elements.slice(0, 30), // Limit elements to save tokens
+            screenshotDataUrl: snapshot.screenshot,
+            message: `Navigated to ${snapshot.url}. Found ${snapshot.elementCount} interactive elements. A screenshot is attached.`
+          };
+        }
+        
+        case "browser_click": {
+          if (!toolInput.ref) {
+            return { error: "Element ref is required (e.g., 'e5')" };
+          }
+          await controller.click(sessionId, toolInput.ref);
+          // Wait for any navigation/updates
+          await new Promise(resolve => setTimeout(resolve, 500));
+          // Return new snapshot
+          const snapshot = await controller.snapshot(sessionId);
+          return {
+            success: true,
+            clicked: toolInput.ref,
+            url: snapshot.url,
+            title: snapshot.title,
+            elementCount: snapshot.elementCount,
+            elements: snapshot.elements.slice(0, 30),
+            screenshotDataUrl: snapshot.screenshot,
+            message: `Clicked ${toolInput.ref}. Page updated. Screenshot attached.`
+          };
+        }
+        
+        case "browser_type": {
+          if (!toolInput.text) {
+            return { error: "Text is required" };
+          }
+          await controller.type(sessionId, toolInput.text, toolInput.ref);
+          return {
+            success: true,
+            typed: toolInput.text.substring(0, 50) + (toolInput.text.length > 50 ? '...' : ''),
+            message: `Typed "${toolInput.text.substring(0, 30)}...". Use browser_press with 'Enter' to submit.`
+          };
+        }
+        
+        case "browser_press": {
+          if (!toolInput.key) {
+            return { error: "Key is required (e.g., 'Enter')" };
+          }
+          await controller.press(sessionId, toolInput.key);
+          // Wait for any updates after key press
+          await new Promise(resolve => setTimeout(resolve, 500));
+          // Return snapshot if Enter was pressed (likely form submission)
+          if (toolInput.key === 'Enter') {
+            const snapshot = await controller.snapshot(sessionId);
+            return {
+              success: true,
+              pressed: toolInput.key,
+              url: snapshot.url,
+              title: snapshot.title,
+              elementCount: snapshot.elementCount,
+              elements: snapshot.elements.slice(0, 30),
+              screenshotDataUrl: snapshot.screenshot,
+              message: `Pressed ${toolInput.key}. Page may have updated. Screenshot attached.`
+            };
+          }
+          return {
+            success: true,
+            pressed: toolInput.key,
+            message: `Pressed ${toolInput.key}`
+          };
+        }
+        
+        case "browser_snapshot": {
+          const snapshot = await controller.snapshot(sessionId);
+          return {
+            success: true,
+            url: snapshot.url,
+            title: snapshot.title,
+            elementCount: snapshot.elementCount,
+            elements: snapshot.elements.slice(0, 30),
+            screenshotDataUrl: snapshot.screenshot,
+            message: `Current page: ${snapshot.title}. Found ${snapshot.elementCount} interactive elements. Screenshot attached.`
+          };
+        }
+        
+        case "browser_scroll": {
+          const direction = toolInput.direction || 'down';
+          const amount = toolInput.amount || 500;
+          await controller.scroll(sessionId, direction, amount);
+          // Return snapshot after scroll
+          const snapshot = await controller.snapshot(sessionId);
+          return {
+            success: true,
+            scrolled: direction,
+            url: snapshot.url,
+            elementCount: snapshot.elementCount,
+            elements: snapshot.elements.slice(0, 30),
+            screenshotDataUrl: snapshot.screenshot,
+            message: `Scrolled ${direction}. Screenshot attached.`
+          };
+        }
+        
+        case "browser_back": {
+          const snapshot = await controller.goBack(sessionId);
+          return {
+            success: true,
+            url: snapshot.url,
+            title: snapshot.title,
+            elementCount: snapshot.elementCount,
+            elements: snapshot.elements.slice(0, 30),
+            screenshotDataUrl: snapshot.screenshot,
+            message: `Went back to ${snapshot.url}. Screenshot attached.`
+          };
+        }
+        
+        default:
+          return { error: `Unknown browser tool: ${toolName}` };
+      }
+    } catch (err) {
+      console.error(`[BrowserController] Error executing ${toolName}:`, err.message);
+      return { 
+        error: err.message,
+        suggestion: "Try browser_snapshot to see the current page state, or browser_navigate to a new URL."
+      };
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // Shared Tool Builder - Used by both Chat and Task Executor
   // ─────────────────────────────────────────────────────────────────────────────
   
@@ -8481,6 +9678,7 @@ ${formatDecomposedSteps(steps)}
       weatherEnabled = true,
       iMessageEnabled = false,
       playwrightEnabled = false,
+      cdpBrowserEnabled = false, // New CDP browser engine
       includeProfileTools = true,
       includeTaskTools = true,
       includeMemoryTools = true,
@@ -8498,9 +9696,14 @@ ${formatDecomposedSteps(steps)}
     if (weatherEnabled) tools.push(...weatherTools);
     if (slackAccessToken) tools.push(...slackTools);
     
-    // Note: Playwright CLI commands are NOT added as tools
-    // Instead, the LLM generates CLI commands inline which are detected and executed
-    // This is more token-efficient than loading tool schemas
+    // CDP Browser tools (new direct CDP control - faster and more reliable)
+    if (cdpBrowserEnabled) {
+      tools.push(...cdpBrowserTools);
+      console.log("[Tools] CDP browser tools enabled");
+    }
+    
+    // Note: Playwright CLI commands are NOT added as tools when CDP is enabled
+    // Instead, use the browser_* tools above for better performance
     
     if (additionalTools.length > 0) tools.push(...additionalTools);
 
@@ -8571,7 +9774,12 @@ ${formatDecomposedSteps(steps)}
         return await executeSlackTool(toolName, toolInput, slackAccessToken);
       }
       
-      // Note: Playwright commands are NOT handled as tools
+      // CDP Browser tools (new direct control)
+      if (cdpBrowserEnabled && cdpBrowserTools.find(t => t.name === toolName)) {
+        return await executeCdpBrowserTool(toolName, toolInput);
+      }
+      
+      // Note: Playwright CLI commands are NOT handled as tools when CDP is disabled
       // They are detected and executed inline from LLM response text
       
       return { error: `Tool ${toolName} not available` };
@@ -8639,12 +9847,29 @@ ${formatDecomposedSteps(steps)}
       // Default disabled
     }
 
+    // Check CDP browser engine setting (new architecture - preferred over Playwright CLI)
+    let cdpBrowserIsEnabled = false;
+    try {
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      // CDP is enabled if browserEngine is "cdp" OR if playwrightEnabled is true and no browserEngine specified
+      // This allows gradual migration
+      if (settings.browserEngine === "cdp") {
+        cdpBrowserIsEnabled = true;
+      } else if (settings.playwrightEnabled === true && !settings.browserEngine) {
+        // Default to CDP when playwright is enabled but no engine specified (new default)
+        cdpBrowserIsEnabled = true;
+      }
+    } catch {
+      // Default disabled
+    }
+
     const { tools, executeTool } = buildToolsAndExecutor({
       googleAccessToken,
       slackAccessToken,
       weatherEnabled,
       iMessageEnabled,
       playwrightEnabled: playwrightIsEnabled,
+      cdpBrowserEnabled: cdpBrowserIsEnabled,
       ...options
     });
 
@@ -8655,7 +9880,8 @@ ${formatDecomposedSteps(steps)}
       slackAccessToken,
       weatherEnabled,
       iMessageEnabled,
-      playwrightEnabled: playwrightIsEnabled
+      playwrightEnabled: playwrightIsEnabled,
+      cdpBrowserEnabled: cdpBrowserIsEnabled
     };
   };
 
@@ -8954,6 +10180,126 @@ ${formatDecomposedSteps(steps)}
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Conversation Style Context - Mimic user's voice when drafting messages
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    let conversationStyleContext = null;
+    
+    // Detect if this is a messaging request and extract recipient/platform
+    const messagingPatterns = [
+      { pattern: /(?:send|write|compose|draft|reply|email|message|text|slack|dm)\b.*(?:to|@)\s*([^\s,]+(?:\s+[^\s,]+)?)/i, platform: null },
+      { pattern: /email\s+([^\s,]+@[^\s,]+)/i, platform: 'email' },
+      { pattern: /(?:send|write)\s+(?:an?\s+)?email\s+(?:to\s+)?([^\s,]+)/i, platform: 'email' },
+      { pattern: /(?:text|imessage|sms)\s+([^\s,]+(?:\s+[^\s,]+)?)/i, platform: 'imessage' },
+      { pattern: /(?:slack|dm)\s+([^\s,]+(?:\s+[^\s,]+)?)/i, platform: 'slack' },
+      { pattern: /(?:message|send\s+to)\s+([^\s,]+(?:\s+[^\s,]+)?)\s+(?:on|via|in)\s+(slack|email|text|imessage)/i, platform: null },
+    ];
+    
+    let detectedRecipient = null;
+    let detectedPlatform = null;
+    
+    for (const { pattern, platform } of messagingPatterns) {
+      const match = userMessage.match(pattern);
+      if (match) {
+        detectedRecipient = match[1]?.trim();
+        // Check for platform mention in the message
+        if (!platform) {
+          if (/email/i.test(userMessage)) detectedPlatform = 'email';
+          else if (/slack|dm/i.test(userMessage)) detectedPlatform = 'slack';
+          else if (/text|imessage|sms/i.test(userMessage)) detectedPlatform = 'imessage';
+        } else {
+          detectedPlatform = platform;
+        }
+        break;
+      }
+    }
+    
+    // Also check queryUnderstanding for extracted entities
+    if (!detectedRecipient && queryUnderstanding?.entities) {
+      const recipientEntity = queryUnderstanding.entities.find(e => 
+        e.type === 'person' || e.type === 'contact' || e.type === 'email'
+      );
+      if (recipientEntity) {
+        detectedRecipient = recipientEntity.resolved_value || recipientEntity.value;
+      }
+      
+      // Check for messaging intent
+      const actionEntity = queryUnderstanding.entities.find(e => e.type === 'action');
+      if (actionEntity?.value && /send|email|message|text|slack|reply/i.test(actionEntity.value)) {
+        if (!detectedPlatform) {
+          if (/email/i.test(userMessage)) detectedPlatform = 'email';
+          else if (/slack/i.test(userMessage)) detectedPlatform = 'slack';
+          else if (/text|imessage/i.test(userMessage)) detectedPlatform = 'imessage';
+        }
+      }
+    }
+    
+    // If we detected a messaging intent with a recipient, get their conversation style
+    if (detectedRecipient && detectedPlatform) {
+      console.log(`[StyleContext] Detected messaging to "${detectedRecipient}" via ${detectedPlatform}`);
+      
+      try {
+        const googleAccessToken = await getGoogleAccessToken();
+        const slackAccessToken = await getSlackAccessToken().catch(() => null);
+        
+        // Get current Slack user ID if needed
+        let slackUserId = null;
+        if (detectedPlatform === 'slack' && slackAccessToken) {
+          try {
+            const authResponse = await fetch("https://slack.com/api/auth.test", {
+              headers: { "Authorization": `Bearer ${slackAccessToken}` }
+            });
+            const authData = await authResponse.json();
+            if (authData.ok) {
+              slackUserId = authData.user_id;
+            }
+          } catch { /* Ignore auth errors */ }
+        }
+        
+        // Retrieve user's sent messages to this recipient
+        const styleContextResult = await getConversationStyleContext(
+          detectedRecipient, 
+          detectedPlatform, 
+          { 
+            limit: 10, 
+            accessToken: googleAccessToken,
+            slackUserId 
+          }
+        );
+        
+        if (styleContextResult.hasHistory && styleContextResult.messages.length > 0) {
+          // Generate style guide from the messages
+          const styleGuide = await generateStyleGuide(
+            styleContextResult.messages,
+            detectedRecipient,
+            apiKeys,
+            activeProvider
+          );
+          
+          conversationStyleContext = {
+            recipient: detectedRecipient,
+            platform: detectedPlatform,
+            messages: styleContextResult.messages.slice(0, 5), // Limit examples
+            styleGuide: styleGuide.styleGuide,
+            formality: styleGuide.formality,
+            hasHistory: true
+          };
+          
+          console.log(`[StyleContext] Generated style guide for ${detectedRecipient} (formality: ${styleGuide.formality})`);
+        } else {
+          conversationStyleContext = {
+            recipient: detectedRecipient,
+            platform: detectedPlatform,
+            hasHistory: false
+          };
+          console.log(`[StyleContext] No message history with ${detectedRecipient}, using default style`);
+        }
+      } catch (err) {
+        console.error(`[StyleContext] Error retrieving style context: ${err.message}`);
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Query Decomposition (skipped for inline step execution)
     // ─────────────────────────────────────────────────────────────────────────
     
@@ -9136,6 +10482,27 @@ Use this as advisory guidance. When the user asks about this topic, explain the 
 When sending messages: You can pass a contact name directly to send_imessage - it will automatically look up their phone number. Always confirm with the user before sending.`;
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Conversation Style Context - Inject user's voice/style into prompt
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    if (conversationStyleContext && conversationStyleContext.hasHistory) {
+      systemPrompt += `\n\n## YOUR VOICE FOR THIS RECIPIENT
+
+Based on your prior messages to "${conversationStyleContext.recipient}", here is your established communication style:
+
+**Style Guide:** ${conversationStyleContext.styleGuide}
+
+**Example Messages You've Sent:**
+${conversationStyleContext.messages.slice(0, 5).map((m, i) => `${i + 1}. "${m.substring(0, 200)}${m.length > 200 ? '...' : ''}"`).join('\n')}
+
+**IMPORTANT:** Match this style closely when drafting the message. Use similar tone, greeting patterns, language conventions, and level of formality (${conversationStyleContext.formality}). The message should sound like it came from the user, not a generic AI.`;
+    } else if (conversationStyleContext && !conversationStyleContext.hasHistory) {
+      systemPrompt += `\n\n## MESSAGE STYLE NOTE
+
+No prior message history found with "${conversationStyleContext.recipient}". Using standard professional tone. Adjust based on the context of the request.`;
+    }
+
     // Continue with the rest of the chat flow (Slack, Weather, Playwright, Task tools, LLM calls)
     // This is handled by the caller (IPC handler) since it contains provider-specific logic
     return {
@@ -9150,6 +10517,7 @@ When sending messages: You can pass a contact name directly to send_imessage - i
       hasGoogleTools,
       hasIMessageTools,
       conversationContext,
+      conversationStyleContext,
       matchedSkill
     };
   }
@@ -9451,8 +10819,9 @@ You have FULL access to the user's tools including calendar, email, contacts, et
         systemPrompt += `\n\nYou have access to Slack. You can list channels, read messages, send messages, and search for users. Always confirm before sending messages.`;
       }
 
-      // Check if Playwright browser automation is enabled
+      // Check if browser automation is enabled (CDP or Playwright)
       let hasPlaywrightTools = false;
+      let hasCdpBrowser = false;
       try {
         const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
         if (settings.playwrightEnabled === true) {
@@ -9462,12 +10831,46 @@ You have FULL access to the user's tools including calendar, email, contacts, et
             setPlaywrightBrowser(settings.playwrightBrowser);
           }
         }
+        // Check for CDP browser engine (new architecture)
+        if (settings.browserEngine === "cdp" || (settings.playwrightEnabled && !settings.browserEngine)) {
+          hasCdpBrowser = true;
+        }
       } catch {
         // Default disabled
       }
 
-      // Add Playwright CLI system prompt if enabled (with available credentials)
-      if (hasPlaywrightTools) {
+      // Add browser automation system prompt
+      if (hasCdpBrowser) {
+        // CDP Browser tools (new architecture - uses tool calls)
+        systemPrompt += `\n\n## WEB RESEARCH CAPABILITY - BROWSER AUTOMATION
+
+You have FULL browser automation capability via the browser_* tools. Use these to research online:
+
+**AVAILABLE BROWSER TOOLS:**
+- \`browser_navigate\`: Go to any URL. Returns a visual snapshot with clickable element refs.
+- \`browser_click\`: Click an element using its ref (e.g., "e5"). Each snapshot shows available refs.
+- \`browser_type\`: Type text into an input field. Specify ref to focus it first.
+- \`browser_press\`: Press keys like "Enter" to submit forms.
+- \`browser_snapshot\`: Get current page screenshot and element list.
+- \`browser_scroll\`: Scroll up/down to see more content.
+- \`browser_back\`: Go back to previous page.
+
+**HOW TO USE:**
+1. Use \`browser_navigate\` to go to a website
+2. Review the returned snapshot to see what's on the page
+3. Use refs (like "e5", "e12") to click buttons/links or type into fields
+4. After typing, use \`browser_press\` with "Enter" to submit
+
+**DO NOT SAY "I cannot access" websites. JUST USE THE BROWSER TOOLS.**
+
+**CAPTCHA/BOT DETECTION:**
+If blocked, try alternative sites:
+- Real estate: Zillow → Redfin → Realtor.com
+- Flights: Google Flights → Kayak → Skyscanner
+- Hotels: Google Hotels → Booking.com → Expedia
+- Products: Amazon → Walmart → Target`;
+      } else if (hasPlaywrightTools) {
+        // Legacy Playwright CLI system prompt
         const availableCredentials = await getAvailableCredentialDomains();
         systemPrompt += `\n\n## WEB RESEARCH CAPABILITY - YOU CAN BROWSE THE INTERNET
 You have FULL browser automation capability. This means:
@@ -9984,10 +11387,11 @@ Be concise. Execute the step and provide the answer.` }
           // Get Slack token
           const slackAccessToken = await getSlackAccessToken().catch(() => null);
           
-          // Get settings for weather and playwright
+          // Get settings for weather, playwright, and CDP browser
           const settingsPath = await getSettingsPath();
           let weatherEnabled = true;
           let hasPlaywrightTools = false;
+          let hasCdpBrowser = false;
           try {
             const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
             weatherEnabled = settings.weatherEnabled !== false;
@@ -10001,17 +11405,25 @@ Be concise. Execute the step and provide the answer.` }
               }
               console.log(`[Chat] Step ${stepNum}: Playwright CLI enabled`);
             }
+            
+            // Check for CDP browser engine (new architecture)
+            if (settings.browserEngine === "cdp" || (settings.playwrightEnabled && !settings.browserEngine)) {
+              hasCdpBrowser = true;
+              console.log(`[Chat] Step ${stepNum}: CDP browser enabled`);
+            }
           } catch (err) {
             console.error(`[Chat] Step ${stepNum}: Error loading settings:`, err.message);
           }
           
-          // Build tool executor with all tools (Playwright CLI not included - handled separately)
+          // Build tool executor with all tools
+          // Include CDP browser tools if enabled (they handle browser via tool calls)
           const { executeTool, tools: allTools } = buildToolsAndExecutor({
             googleAccessToken: accessToken,
             slackAccessToken,
             weatherEnabled,
             iMessageEnabled: process.platform === "darwin",
-            playwrightEnabled: false // CLI commands handled separately
+            playwrightEnabled: false, // CLI commands handled separately
+            cdpBrowserEnabled: hasCdpBrowser
           });
           
           console.log(`[Chat] Step ${stepNum} tools available: ${allTools.length}`, allTools.map(t => t.name));
@@ -10035,8 +11447,23 @@ When getting DMs from a specific person, use get_slack_messages with their name 
             fullSystemPrompt += `\n\nYou have access to weather tools. You can look up weather forecasts, current conditions, and find location coordinates.`;
           }
           
-          // Add Playwright CLI system prompt (with available credentials)
-          if (hasPlaywrightTools) {
+          // Add browser automation system prompt
+          if (hasCdpBrowser) {
+            // CDP Browser tools (new architecture)
+            fullSystemPrompt += `\n\n## WEB RESEARCH CAPABILITY - BROWSER TOOLS
+
+You have browser automation via browser_* tools:
+- \`browser_navigate\`: Go to URL, returns snapshot with element refs
+- \`browser_click\`: Click element by ref (e.g., "e5")
+- \`browser_type\`: Type text, optionally specify ref to focus
+- \`browser_press\`: Press keys like "Enter"
+- \`browser_snapshot\`: Get current page screenshot + elements
+- \`browser_scroll\`: Scroll page up/down
+
+**DO NOT SAY you cannot access websites. USE THE BROWSER TOOLS.**`;
+            console.log(`[Chat] Step ${stepNum}: Added CDP browser tools to prompt`);
+          } else if (hasPlaywrightTools) {
+            // Legacy Playwright CLI system prompt
             const availableCredentials = await getAvailableCredentialDomains();
             const cliRef = getPlaywrightCliReference(availableCredentials);
             fullSystemPrompt += `\n\n## WEB RESEARCH CAPABILITY - YOU CAN BROWSE THE INTERNET
@@ -10060,7 +11487,7 @@ If you encounter captcha, bot detection, or access denied:
 ${cliRef}`;
             console.log(`[Chat] Step ${stepNum}: Added Playwright CLI reference to prompt (${cliRef.length} chars), available creds: ${availableCredentials.join(', ') || 'none'}`);
           } else {
-            console.log(`[Chat] Step ${stepNum}: Playwright NOT enabled (hasPlaywrightTools=${hasPlaywrightTools})`);
+            console.log(`[Chat] Step ${stepNum}: Browser automation NOT enabled`);
           }
           
           // Add Google tools system prompt
@@ -10089,9 +11516,11 @@ ${cliRef}`;
 4. **Use data from previous steps** - Don't re-fetch what's already available in context.
 
 ## BROWSER AUTOMATION REMINDER:
-- If you open a website and need to SEE what's on the page (read text, view calendars, see images), **USE \`playwright-cli screenshot\`**
+${hasCdpBrowser ? `- Use browser_navigate to go to websites - it automatically returns a screenshot
+- Use browser_snapshot to see the current page state
+- All browser tools return visual snapshots - you can SEE what's on the page` : `- If you open a website and need to SEE what's on the page, **USE \`playwright-cli screenshot\`**
 - The \`snapshot\` command only gives element refs for clicking - it does NOT let you see the page
-- ALWAYS take a screenshot after opening a page if you need to analyze its visual content
+- ALWAYS take a screenshot after opening a page if you need to analyze its visual content`}
 
 ${uniqueUrls.length > 0 ? `## URLs available:
 ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
@@ -10418,7 +11847,15 @@ ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
   });
 });
 
-app.on("window-all-closed", () => {
+app.on("window-all-closed", async () => {
+  // Clean up browser controller before quitting
+  if (browserController) {
+    try {
+      await browserController.cleanup();
+    } catch (err) {
+      console.error("[App] Error cleaning up browser:", err.message);
+    }
+  }
   if (process.platform !== "darwin") app.quit();
 });
 
