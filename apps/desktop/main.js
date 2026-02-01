@@ -15,6 +15,61 @@ const { spawn, exec, execSync } = require("child_process");
 let puppeteer = null; // Lazy-loaded puppeteer-core
 
 /**
+ * Check if puppeteer-core is installed
+ */
+function checkPuppeteerCoreInstalled() {
+  try {
+    require.resolve("puppeteer-core");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Auto-install puppeteer-core if not present
+ */
+async function ensurePuppeteerCoreInstalled() {
+  if (checkPuppeteerCoreInstalled()) {
+    return true;
+  }
+  
+  console.log("[BrowserController] puppeteer-core not found, installing...");
+  
+  return new Promise((resolve) => {
+    const desktopDir = path.join(__dirname);
+    exec('npm install puppeteer-core@^22.0.0', { cwd: desktopDir, timeout: 120000 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error("[BrowserController] Failed to install puppeteer-core:", err.message);
+        resolve(false);
+      } else {
+        console.log("[BrowserController] puppeteer-core installed successfully");
+        // Clear require cache and try to load again
+        try {
+          delete require.cache[require.resolve("puppeteer-core")];
+        } catch { /* ignore */ }
+        resolve(true);
+      }
+    });
+  });
+}
+
+/**
+ * Load puppeteer-core, installing if necessary
+ */
+async function loadPuppeteer() {
+  if (puppeteer) return puppeteer;
+  
+  const installed = await ensurePuppeteerCoreInstalled();
+  if (!installed) {
+    throw new Error("puppeteer-core is not installed and auto-install failed. Please run: npm install puppeteer-core");
+  }
+  
+  puppeteer = require("puppeteer-core");
+  return puppeteer;
+}
+
+/**
  * BrowserController manages a persistent Chromium instance via CDP
  * Provides low-latency browser automation with visual snapshots
  */
@@ -90,11 +145,11 @@ class BrowserController {
     console.log("[BrowserController] Downloading Chromium...");
     try {
       if (!puppeteer) {
-        puppeteer = require("puppeteer-core");
+        puppeteer = await loadPuppeteer();
       }
       
       // Use Puppeteer's browser fetcher
-      const { Browser } = require("puppeteer-core");
+      const { Browser } = puppeteer;
       const browserFetcher = puppeteer.createBrowserFetcher({
         path: chromiumDir,
         product: "chrome"
@@ -140,7 +195,7 @@ class BrowserController {
     console.log("[BrowserController] Initializing...");
     
     if (!puppeteer) {
-      puppeteer = require("puppeteer-core");
+      puppeteer = await loadPuppeteer();
     }
     
     const chromiumPath = await this.getChromiumPath();
@@ -151,7 +206,7 @@ class BrowserController {
       await fs.mkdir(userDataDir, { recursive: true });
     } catch { /* ignore */ }
     
-    // Anti-detection arguments (same as Playwright CLI)
+    // Anti-detection arguments for browser automation
     const args = [
       '--disable-blink-features=AutomationControlled',
       '--disable-features=IsolateOrigins,site-per-process',
@@ -395,26 +450,61 @@ class BrowserController {
     
     const element = refMap.get(ref);
     
-    // Try different click strategies
+    // Strategy 1: Use page.evaluate with flexible text matching (most reliable)
     try {
-      // Strategy 1: Use accessibility name
-      if (element.name) {
-        const selector = this.buildClickSelector(element);
-        await page.click(selector, { timeout: 5000 });
-        return { success: true, clicked: ref };
-      }
-    } catch (err) {
-      console.log(`[BrowserController] Click strategy 1 failed: ${err.message}`);
-    }
-    
-    try {
-      // Strategy 2: Use page.evaluate to find and click
       const clicked = await page.evaluate((name, role) => {
-        const elements = document.querySelectorAll('button, a, input, [role="button"], [role="link"]');
+        // Clean up the search name - remove trailing asterisks, trim whitespace
+        // Accessibility tree often appends * for required fields
+        let searchName = name.toLowerCase().replace(/\*+$/, '').trim();
+        
+        // Also create a simplified version for fuzzy matching (just alphanumeric)
+        const simplifiedSearch = searchName.replace(/[^a-z0-9]/g, '');
+        
+        // Determine which elements to search based on role
+        let selector = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"]';
+        if (role === 'textbox') {
+          selector = 'input, textarea, [contenteditable="true"]';
+        } else if (role === 'button') {
+          selector = 'button, [role="button"], input[type="submit"], input[type="button"]';
+        } else if (role === 'link') {
+          selector = 'a, [role="link"]';
+        }
+        
+        const elements = document.querySelectorAll(selector);
         for (const el of elements) {
-          const text = el.textContent || el.value || el.getAttribute('aria-label') || '';
-          if (text.toLowerCase().includes(name.toLowerCase())) {
-            el.click();
+          const text = (el.textContent || '').trim().toLowerCase();
+          const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+          const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+          const value = (el.value || '').toLowerCase();
+          const title = (el.getAttribute('title') || '').toLowerCase();
+          const name = (el.getAttribute('name') || '').toLowerCase();
+          const id = (el.id || '').toLowerCase();
+          
+          // Check various text sources for a match
+          const allText = [text, ariaLabel, placeholder, value, title, name, id];
+          
+          // Try exact-ish match first (contains the search name)
+          const exactMatch = allText.some(t => t.includes(searchName));
+          
+          // Try simplified fuzzy match (alphanumeric only)
+          const fuzzyMatch = allText.some(t => {
+            const simplifiedT = t.replace(/[^a-z0-9]/g, '');
+            return simplifiedT.includes(simplifiedSearch) || simplifiedSearch.includes(simplifiedT);
+          });
+          
+          // Also check for key words in the search name
+          const keywords = searchName.split(/\s+/).filter(w => w.length > 3);
+          const keywordMatch = keywords.length > 0 && keywords.every(kw => 
+            allText.some(t => t.includes(kw))
+          );
+          
+          if (exactMatch || fuzzyMatch || keywordMatch) {
+            // For input fields, just focus; for others, click
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+              el.focus();
+            } else {
+              el.click();
+            }
             return true;
           }
         }
@@ -425,57 +515,231 @@ class BrowserController {
         return { success: true, clicked: ref };
       }
     } catch (err) {
-      console.log(`[BrowserController] Click strategy 2 failed: ${err.message}`);
+      console.log(`[BrowserController] Click strategy 1 (text match) failed: ${err.message}`);
     }
     
-    throw new Error(`Failed to click element "${ref}" (${element.name})`);
+    // Strategy 2: Try by index - get all matching elements and click the nth one
+    try {
+      // Extract the element index from the ref (e.g., "e5" -> 5)
+      const refIndex = parseInt(ref.replace('e', ''), 10);
+      
+      const clicked = await page.evaluate((role, targetIndex) => {
+        let selector = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"]';
+        if (role === 'textbox') {
+          selector = 'input:not([type="hidden"]), textarea, [contenteditable="true"]';
+        }
+        
+        const elements = Array.from(document.querySelectorAll(selector));
+        // Filter to visible elements
+        const visible = elements.filter(el => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+        
+        if (targetIndex < visible.length) {
+          const el = visible[targetIndex];
+          if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+            el.focus();
+          } else {
+            el.click();
+          }
+          return true;
+        }
+        return false;
+      }, element.role, refIndex);
+      
+      if (clicked) {
+        console.log(`[BrowserController] Click strategy 2 (index) succeeded`);
+        return { success: true, clicked: ref };
+      }
+    } catch (err) {
+      console.log(`[BrowserController] Click strategy 2 (index) failed: ${err.message}`);
+    }
+    
+    // Strategy 3: Try CSS selector (last resort)
+    try {
+      if (element.name) {
+        const selector = this.buildClickSelector(element);
+        await page.click(selector, { timeout: 3000 });
+        return { success: true, clicked: ref };
+      }
+    } catch (err) {
+      console.log(`[BrowserController] Click strategy 3 (selector) failed: ${err.message}`);
+    }
+    
+    throw new Error(`Failed to click element "${ref}" (${element.name}). Try a different element or take a new snapshot.`);
   }
 
   /**
-   * Build a selector for clicking
+   * Build a selector for clicking - uses standard CSS (not Playwright's :has-text)
+   * Note: This is a fallback selector. The primary click method uses page.evaluate for text matching.
    */
   buildClickSelector(element) {
     const { name, role } = element;
+    // Clean up name: remove trailing asterisks (required field indicators), escape quotes
+    const cleanName = name.replace(/\*+$/, '').trim();
+    // Take first meaningful word(s) for selector to avoid special character issues
+    const simpleName = cleanName.split(/[^a-zA-Z0-9\s]/).filter(s => s.trim())[0] || cleanName;
+    const escapedName = simpleName.replace(/"/g, '\\"').substring(0, 30);
     
-    // Role-specific selectors
+    // Role-specific selectors using standard CSS
     const roleSelectors = {
-      'button': `button:has-text("${name}"), [role="button"]:has-text("${name}")`,
-      'link': `a:has-text("${name}"), [role="link"]:has-text("${name}")`,
-      'textbox': `input[placeholder*="${name}" i], input[aria-label*="${name}" i]`,
-      'checkbox': `input[type="checkbox"][aria-label*="${name}" i]`,
+      'button': `button[aria-label*="${escapedName}" i], [role="button"][aria-label*="${escapedName}" i]`,
+      'link': `a[aria-label*="${escapedName}" i], [role="link"][aria-label*="${escapedName}" i]`,
+      'textbox': `input[placeholder*="${escapedName}" i], input[aria-label*="${escapedName}" i], textarea[placeholder*="${escapedName}" i]`,
+      'checkbox': `input[type="checkbox"][aria-label*="${escapedName}" i]`,
     };
     
-    return roleSelectors[role] || `*:has-text("${name}")`;
+    return roleSelectors[role] || `[aria-label*="${escapedName}" i]`;
   }
 
   /**
    * Type text into an element
+   * @param {string} sessionId - Session ID
+   * @param {string} text - Text to type
+   * @param {string} ref - Element ref to focus first (optional)
+   * @param {boolean} sensitive - If true, mask text in logs (for passwords)
    */
-  async type(sessionId, text, ref = null) {
-    console.log(`[BrowserController] Typing: "${text.substring(0, 20)}..." into ${ref || 'focused element'}`);
+  async type(sessionId, text, ref = null, sensitive = false) {
+    // Mask sensitive text in logs (e.g., passwords)
+    const logText = sensitive ? '********' : `${text.substring(0, 10)}...`;
+    console.log(`[BrowserController] Typing: "${logText}" into ${ref || 'focused element'}`);
     const page = await this.getPage(sessionId);
     
-    // If ref provided, click it first to focus
+    let focusSucceeded = false;
+    
+    // If ref provided, try to focus the element
     if (ref) {
       const refMap = this.elementRefs.get(sessionId);
       if (refMap && refMap.has(ref)) {
         const element = refMap.get(ref);
+        
+        // Strategy 1: Use click method to focus
         try {
           await this.click(sessionId, ref);
-          await page.waitForTimeout(100);
+          await new Promise(r => setTimeout(r, 100));
+          focusSucceeded = true;
         } catch (err) {
-          console.log(`[BrowserController] Failed to focus element, trying direct type`);
+          console.log(`[BrowserController] Click-to-focus failed: ${err.message}`);
+        }
+        
+        // Strategy 2: Use page.evaluate to find and focus by name/role
+        if (!focusSucceeded && element.name) {
+          try {
+            const focused = await page.evaluate((name, role) => {
+              // Clean up search name
+              const searchName = name.toLowerCase().replace(/\*+$/, '').trim();
+              
+              // Find input/textarea elements
+              const inputs = document.querySelectorAll('input:not([type="hidden"]), textarea, [contenteditable="true"]');
+              
+              for (const el of inputs) {
+                const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+                const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+                const title = (el.getAttribute('title') || '').toLowerCase();
+                const elName = (el.getAttribute('name') || '').toLowerCase();
+                const id = (el.id || '').toLowerCase();
+                
+                // Check for match
+                if (
+                  placeholder.includes(searchName) || searchName.includes(placeholder.split(' ')[0]) ||
+                  ariaLabel.includes(searchName) || searchName.includes(ariaLabel.split(' ')[0]) ||
+                  title.includes(searchName) ||
+                  elName.includes(searchName.split(' ')[0]) ||
+                  id.includes(searchName.split(' ')[0])
+                ) {
+                  el.focus();
+                  el.click();
+                  return true;
+                }
+              }
+              
+              // Fallback: find search boxes specifically
+              const searchInputs = document.querySelectorAll(
+                'input[type="search"], input[name*="search" i], input[id*="search" i], ' +
+                'input[placeholder*="search" i], input[aria-label*="search" i], ' +
+                '#twotabsearchtextbox, .nav-search-field input'
+              );
+              if (searchInputs.length > 0) {
+                searchInputs[0].focus();
+                searchInputs[0].click();
+                return true;
+              }
+              
+              return false;
+            }, element.name, element.role);
+            
+            if (focused) {
+              focusSucceeded = true;
+              console.log(`[BrowserController] Focused via page.evaluate`);
+              await new Promise(r => setTimeout(r, 100));
+            }
+          } catch (err) {
+            console.log(`[BrowserController] page.evaluate focus failed: ${err.message}`);
+          }
+        }
+        
+        // Strategy 3: Try to focus by element index
+        if (!focusSucceeded) {
+          try {
+            const refIndex = parseInt(ref.replace('e', ''), 10);
+            const focused = await page.evaluate((targetIndex) => {
+              const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]), textarea'));
+              const visible = inputs.filter(el => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden';
+              });
+              
+              if (targetIndex < visible.length) {
+                visible[targetIndex].focus();
+                visible[targetIndex].click();
+                return true;
+              }
+              
+              // If index is out of bounds but we have inputs, focus the first visible one
+              if (visible.length > 0) {
+                visible[0].focus();
+                visible[0].click();
+                return true;
+              }
+              
+              return false;
+            }, refIndex);
+            
+            if (focused) {
+              focusSucceeded = true;
+              console.log(`[BrowserController] Focused via index fallback`);
+              await new Promise(r => setTimeout(r, 100));
+            }
+          } catch (err) {
+            console.log(`[BrowserController] Index focus failed: ${err.message}`);
+          }
         }
       }
     }
     
-    // Clear existing content and type new text
-    await page.keyboard.down('Control');
-    await page.keyboard.press('KeyA');
-    await page.keyboard.up('Control');
-    await page.keyboard.type(text, { delay: 50 });
+    // Check if anything is focused before typing
+    const hasFocus = await page.evaluate(() => {
+      const active = document.activeElement;
+      return active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable);
+    });
     
-    return { success: true, typed: text.substring(0, 50) };
+    if (!hasFocus) {
+      console.log(`[BrowserController] Warning: No input element focused, typing may not work`);
+    }
+    
+    // Clear existing content and type new text
+    // Use platform-specific modifier key
+    const isMac = process.platform === 'darwin';
+    const modifier = isMac ? 'Meta' : 'Control';
+    
+    await page.keyboard.down(modifier);
+    await page.keyboard.press('KeyA');
+    await page.keyboard.up(modifier);
+    await page.keyboard.type(text, { delay: 30 });
+    
+    return { success: true, typed: text.substring(0, 50), focused: focusSucceeded };
   }
 
   /**
@@ -772,728 +1036,6 @@ async function addPendingMessageToTask(taskId, pendingMessage) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Playwright CLI State (replacing MCP for better token efficiency)
-// ─────────────────────────────────────────────────────────────────────────────
-let playwrightCliInstalled = null; // null = unknown, true/false = checked
-let playwrightEnabled = false;
-// Default to "chromium" - Playwright's bundled browser that won't conflict with running Chrome
-// "chrome" option requires Chrome to be closed since it locks its profile
-let playwrightBrowser = "chromium";
-let playwrightSession = "wovly-default";
-
-/**
- * Check if Playwright CLI is installed
- */
-function checkPlaywrightCliInstalled() {
-  if (playwrightCliInstalled !== null) {
-    return playwrightCliInstalled;
-  }
-  
-  try {
-    execSync('playwright-cli --version', { stdio: 'ignore' });
-    playwrightCliInstalled = true;
-    console.log("[Playwright CLI] Found installed");
-    return true;
-  } catch {
-    playwrightCliInstalled = false;
-    console.log("[Playwright CLI] Not installed");
-    return false;
-  }
-}
-
-/**
- * Auto-install Playwright CLI if not present
- */
-async function ensurePlaywrightCliInstalled() {
-  if (checkPlaywrightCliInstalled()) {
-    return true;
-  }
-  
-  console.log("[Playwright CLI] Not found, installing automatically...");
-  
-  return new Promise((resolve) => {
-    exec('npm install -g @playwright/cli@latest', { timeout: 120000 }, (error, stdout, stderr) => {
-      if (error) {
-        console.error("[Playwright CLI] Auto-install failed:", stderr || error.message);
-        resolve(false);
-      } else {
-        console.log("[Playwright CLI] Installed successfully");
-        playwrightCliInstalled = true;
-        // Also install chromium browser
-        exec('npx playwright install chromium', { timeout: 120000 }, (err2) => {
-          if (err2) {
-            console.log("[Playwright CLI] Warning: Could not auto-install chromium browser");
-          } else {
-            console.log("[Playwright CLI] Chromium browser installed");
-          }
-          resolve(true);
-        });
-      }
-    });
-  });
-}
-
-// Track if we've already tried to install chromium this session
-let chromiumInstallAttempted = false;
-
-/**
- * Ensure chromium browser is installed for Playwright
- */
-async function ensureChromiumInstalled() {
-  if (chromiumInstallAttempted) {
-    return; // Don't retry multiple times in same session
-  }
-  chromiumInstallAttempted = true;
-  
-  return new Promise((resolve) => {
-    console.log("[Playwright CLI] Ensuring chromium browser is installed...");
-    exec('npx playwright install chromium', { timeout: 120000 }, (error) => {
-      if (error) {
-        console.log("[Playwright CLI] Warning: Could not install chromium:", error.message);
-      } else {
-        console.log("[Playwright CLI] Chromium browser ready");
-      }
-      resolve();
-    });
-  });
-}
-
-/**
- * Clear Playwright CLI session data (helps with stuck sessions)
- */
-async function clearPlaywrightSession() {
-  return new Promise((resolve) => {
-    const sessionDir = path.join(process.cwd(), '.playwright-cli');
-    console.log(`[Playwright CLI] Clearing session data from ${sessionDir}...`);
-    exec(`rm -rf "${sessionDir}"`, (error) => {
-      if (error) {
-        console.log("[Playwright CLI] Could not clear session:", error.message);
-      } else {
-        console.log("[Playwright CLI] Session cleared");
-      }
-      resolve();
-    });
-  });
-}
-
-/**
- * Execute a Playwright CLI command
- * SECURITY: Credentials are passed via environment variables in credentialEnv,
- * NEVER as command-line arguments. This prevents exposure in process listings.
- * 
- * @param {string} command - The CLI command (e.g., "open https://example.com", "snapshot")
- * @param {Object} options - Options like session, browser, credentialEnv
- * @returns {Promise<{output?: string, error?: string}>}
- */
-async function executePlaywrightCli(command, options = {}) {
-  const { 
-    session = playwrightSession, 
-    browser = playwrightBrowser,
-    timeout = 60000,
-    credentialEnv = {} // Secure credentials passed as env vars
-  } = options;
-  
-  // Ensure CLI is installed
-  const installed = await ensurePlaywrightCliInstalled();
-  if (!installed) {
-    return { error: "Playwright CLI not installed and auto-install failed. Please run: npm install -g @playwright/cli@latest" };
-  }
-  
-  // Ensure chromium browser is installed (runs once per session)
-  await ensureChromiumInstalled();
-  
-  // Build environment with session, browser, and secure credentials
-  // SECURITY: Credentials are passed via environment variables, not command line
-  // Anti-detection: Add browser arguments to avoid bot detection
-  const antiDetectionArgs = [
-    '--disable-blink-features=AutomationControlled',
-    '--disable-features=IsolateOrigins,site-per-process',
-    '--disable-site-isolation-trials',
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--window-size=1920,1080',
-    '--start-maximized',
-    '--disable-infobars'
-  ].join(' ');
-  
-  // Realistic user agent (Chrome 120 on macOS)
-  const userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-  
-  const env = { 
-    ...process.env, 
-    PLAYWRIGHT_CLI_SESSION: session,
-    PLAYWRIGHT_MCP_BROWSER: browser,
-    // Anti-detection environment variables
-    PLAYWRIGHT_CHROMIUM_ARGS: antiDetectionArgs,
-    PLAYWRIGHT_USER_AGENT: userAgent,
-    PWDEBUG: '0', // Disable debugging indicators
-    ...credentialEnv // Merge in any credential env vars (WOVLY_SECRET_0, etc.)
-  };
-  
-  // Build full command - note: any ${WOVLY_SECRET_X} in command will be
-  // expanded by the shell from the environment variables above
-  const fullCommand = `playwright-cli ${command}`;
-  
-  // Log command and browser being used
-  console.log(`[Playwright CLI] Executing: ${fullCommand} (browser: ${browser})`);
-  if (Object.keys(credentialEnv).length > 0) {
-    console.log(`[Playwright CLI] With ${Object.keys(credentialEnv).length} secure credential(s) via env`);
-  }
-  
-  return new Promise((resolve) => {
-    exec(fullCommand, { timeout, env, maxBuffer: 1024 * 1024 * 10 }, async (error, stdout, stderr) => {
-      const output = stdout?.trim() || "";
-      
-      // Check for errors - either from exec error OR from error messages in stdout
-      // playwright-cli sometimes returns exit code 0 but prints errors to stdout
-      const hasExecError = !!error;
-      const hasOutputError = output.includes('Error:') && output.includes('browserType.launchPersistentContext');
-      const hasBrowserLaunchFailure = output.includes('Failed to launch the browser process') || 
-                                       (stderr && stderr.includes('Failed to launch the browser process'));
-      const hasBrowserNotInstalled = output.includes('Browser specified in your config is not installed') ||
-                                      (stderr && stderr.includes('Browser specified in your config is not installed'));
-      
-      if (hasExecError || hasOutputError || hasBrowserLaunchFailure || hasBrowserNotInstalled) {
-        const errorMsg = stderr || (hasOutputError || hasBrowserNotInstalled ? output : error?.message || "Unknown error");
-        console.error(`[Playwright CLI] Error detected:`, errorMsg.slice(0, 300));
-        
-        // Check for browser launch failure or not installed - try fallback to chromium
-        const shouldFallback = (errorMsg.includes('Failed to launch the browser process') || 
-                                hasBrowserLaunchFailure || hasBrowserNotInstalled) && 
-                               browser !== 'chromium';
-        
-        if (shouldFallback) {
-          console.log(`[Playwright CLI] ${browser} failed - browser may not be installed or is running. Falling back to chromium...`);
-          
-          // Try again with chromium (Playwright's bundled browser)
-          const fallbackEnv = { ...env, PLAYWRIGHT_MCP_BROWSER: 'chromium' };
-          exec(fullCommand, { timeout, env: fallbackEnv, maxBuffer: 1024 * 1024 * 10 }, async (err2, stdout2, stderr2) => {
-            const fallbackOutput = stdout2?.trim() || "";
-            const fallbackHasError = err2 || fallbackOutput.includes('Error:');
-            const chromiumNotInstalled = fallbackOutput.includes('Browser specified in your config is not installed');
-            
-            if (chromiumNotInstalled) {
-              // Try to install chromium
-              console.log(`[Playwright CLI] Chromium not installed, attempting to install...`);
-              exec('npx playwright install chromium', { timeout: 120000 }, (installErr) => {
-                if (installErr) {
-                  resolve({ 
-                    error: `Browser not available. Please run: npx playwright install chromium\n` +
-                           `Then try again.`
-                  });
-                } else {
-                  // Retry after install
-                  console.log(`[Playwright CLI] Chromium installed, retrying command...`);
-                  exec(fullCommand, { timeout, env: fallbackEnv, maxBuffer: 1024 * 1024 * 10 }, (err3, stdout3, stderr3) => {
-                    if (err3 || (stdout3 && stdout3.includes('Error:'))) {
-                      resolve({ error: `Browser still failing after install: ${stderr3 || err3?.message}` });
-                    } else {
-                      resolve({ output: stdout3?.trim() || "" });
-                    }
-                  });
-                }
-              });
-            } else if (fallbackHasError) {
-              resolve({ 
-                error: `Browser launch failed. ${browser} may not be installed or is locked. ` +
-                       `Chromium fallback also failed: ${stderr2 || err2?.message || "unknown"}. ` +
-                       `Try running: npx playwright install chromium`
-              });
-            } else {
-              console.log(`[Playwright CLI] Fallback to chromium succeeded (${fallbackOutput.length} chars)`);
-              // Update global browser preference so subsequent commands also use chromium
-              playwrightBrowser = 'chromium';
-              console.log(`[Playwright CLI] Switched default browser to chromium for this session`);
-              
-              // Also persist this preference to settings
-              (async () => {
-                try {
-                  const settingsPath = await getSettingsPath();
-                  let settings = {};
-                  try {
-                    settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-                  } catch {}
-                  settings.playwrightBrowser = 'chromium';
-                  await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-                  console.log(`[Playwright CLI] Saved chromium as default browser in settings`);
-                } catch (e) {
-                  console.log(`[Playwright CLI] Could not save browser preference:`, e.message);
-                }
-              })();
-              
-              resolve({ output: fallbackOutput });
-            }
-          });
-        } else if (hasBrowserLaunchFailure || hasBrowserNotInstalled) {
-          // Browser is chromium but still failed - try clearing session and reinstalling
-          console.log(`[Playwright CLI] Browser not available, clearing session and reinstalling...`);
-          
-          // Clear any stuck session data first
-          clearPlaywrightSession().then(() => {
-            exec('npx playwright install chromium --force', { timeout: 180000 }, (installErr) => {
-              if (installErr) {
-                resolve({ 
-                  error: `Failed to launch browser and auto-install failed.\n` +
-                         `Please try: npx playwright install chromium --force\n\n` +
-                         `Original error: ${errorMsg.slice(0, 300)}`
-                });
-              } else {
-                // Retry after install
-                console.log(`[Playwright CLI] Chromium reinstalled, retrying command...`);
-                exec(fullCommand, { timeout, env, maxBuffer: 1024 * 1024 * 10 }, (err3, stdout3, stderr3) => {
-                  if (err3 || (stdout3 && stdout3.includes('Error:'))) {
-                    resolve({ error: `Browser still failing after reinstall: ${stderr3 || err3?.message}` });
-                  } else {
-                    resolve({ output: stdout3?.trim() || "" });
-                  }
-                });
-              }
-            });
-          });
-        } else {
-          resolve({ error: errorMsg });
-        }
-      } else {
-        console.log(`[Playwright CLI] Output (${output.length} chars):`, output.slice(0, 500));
-        resolve({ output });
-      }
-    });
-  });
-}
-
-/**
- * Detect Playwright CLI commands in LLM response text
- * Looks for commands in code blocks or inline
- * @param {string} text - LLM response text
- * @returns {Array<string>} Array of commands found
- */
-function detectPlaywrightCommands(text) {
-  const commands = [];
-  
-  // First, extract all code blocks (bash, shell, etc.)
-  const codeBlockRegex = /```(?:bash|shell|sh|plaintext)?\n?([\s\S]*?)```/gi;
-  let match;
-  while ((match = codeBlockRegex.exec(text)) !== null) {
-    const blockContent = match[1];
-    // Find all playwright-cli commands within this block
-    const lines = blockContent.split('\n');
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('playwright-cli ')) {
-        // Skip multiline commands (those with unclosed quotes or braces)
-        const quoteCount = (trimmed.match(/"/g) || []).length;
-        const hasUnclosedQuote = quoteCount % 2 !== 0;
-        const hasUnclosedBrace = trimmed.includes('{') && !trimmed.includes('}');
-        
-        if (hasUnclosedQuote || hasUnclosedBrace) {
-          console.log(`[Playwright CLI] Skipping incomplete multiline command: ${trimmed.substring(0, 50)}...`);
-          continue;
-        }
-        
-        commands.push(trimmed);
-      }
-    }
-  }
-  
-  // Also match inline backtick commands
-  const inlineRegex = /`(playwright-cli[^`]+)`/gi;
-  while ((match = inlineRegex.exec(text)) !== null) {
-    const cmd = match[1].trim();
-    if (!commands.includes(cmd)) {
-      commands.push(cmd);
-    }
-  }
-  
-  if (commands.length > 0) {
-    console.log(`[Playwright CLI] Detected ${commands.length} command(s):`, commands);
-  }
-  
-  return commands;
-}
-
-/**
- * Execute all Playwright CLI commands found in text and return results
- * SECURITY: Credentials are NEVER passed as command-line arguments.
- * Instead, they are passed via environment variables to prevent exposure in
- * process listings, shell history, and system logs.
- * 
- * @param {string} text - Text containing CLI commands
- * @returns {Promise<{commands: Array<{command: string, result: Object}>, hasCommands: boolean}>}
- */
-async function executePlaywrightCommandsInText(text) {
-  const commands = detectPlaywrightCommands(text);
-  
-  if (commands.length === 0) {
-    return { commands: [], hasCommands: false };
-  }
-  
-  console.log(`[Playwright CLI] Found ${commands.length} command(s) to execute`);
-  
-  const results = [];
-  for (const command of commands) {
-    // Extract just the command part after "playwright-cli "
-    const cmdPart = command.replace(/^playwright-cli\s+/, '');
-    
-    // ─────────────────────────────────────────────────────────────────────────
-    // SECURE CREDENTIAL HANDLING
-    // Credentials are passed via environment variables, NOT command-line args
-    // This prevents exposure in `ps`, shell history, and logs
-    // ─────────────────────────────────────────────────────────────────────────
-    
-    let processedCmd = cmdPart;
-    const credentialEnv = {};
-    const credentialMatches = cmdPart.match(/\{\{credential:([^:}]+):([^}]+)\}\}/g);
-    let usedCredentials = [];
-    
-    if (credentialMatches) {
-      let secretIndex = 0;
-      for (const match of credentialMatches) {
-        const [, domain, field] = match.match(/\{\{credential:([^:}]+):([^}]+)\}\}/) || [];
-        if (domain && field) {
-          const credential = await getCredentialForDomain(domain);
-          if (credential && credential[field]) {
-            // Create a unique env var name for this credential
-            const envVarName = `WOVLY_SECRET_${secretIndex}`;
-            credentialEnv[envVarName] = credential[field];
-            
-            // Replace placeholder with $ENV_VAR reference for the CLI
-            // The CLI will read from the environment variable
-            processedCmd = processedCmd.replace(match, `\${${envVarName}}`);
-            
-            usedCredentials.push({ domain, field });
-            secretIndex++;
-            
-            // Log that we're using credentials (but NEVER the actual values)
-            console.log(`[Playwright CLI] Credential ${domain}:${field} -> env:${envVarName}`);
-          } else {
-            console.warn(`[Playwright CLI] No credential found for ${domain}:${field}`);
-          }
-        }
-      }
-      
-      // Update lastUsed timestamp for used credentials
-      for (const { domain } of usedCredentials) {
-        try {
-          const credentials = await loadCredentials();
-          if (credentials[domain]) {
-            credentials[domain].lastUsed = new Date().toISOString();
-            await saveCredentials(credentials);
-          }
-        } catch (err) {
-          console.error(`[Playwright CLI] Error updating lastUsed:`, err.message);
-        }
-      }
-    }
-    
-    // Execute with credentials passed securely via environment
-    const result = await executePlaywrightCli(processedCmd, { 
-      credentialEnv // Pass credentials as env vars
-    });
-    
-    // Check if this was a screenshot command - extract image path
-    if (cmdPart.startsWith('screenshot') && result.output) {
-      // Screenshot output format: - [Screenshot of viewport](.playwright-cli/page-xxx.png)
-      // Extract just the filename from the markdown link
-      const pathMatch = result.output.match(/\(\.playwright-cli\/([^)]+\.png)\)/i);
-      if (pathMatch) {
-        const filename = pathMatch[1];
-        const absolutePath = path.join(process.cwd(), '.playwright-cli', filename);
-        result.screenshotPath = absolutePath;
-        console.log(`[Playwright CLI] Screenshot saved to: ${absolutePath}`);
-      }
-    }
-    
-    // Check if this was a snapshot command - read the YAML file content and append
-    if (cmdPart.startsWith('snapshot') && result.output) {
-      // Snapshot output format: - [snapshot](.playwright-cli/page-xxx.yml)
-      const yamlMatch = result.output.match(/\(\.playwright-cli\/([^)]+\.yml)\)/i);
-      if (yamlMatch) {
-        const filename = yamlMatch[1];
-        const yamlPath = path.join(process.cwd(), '.playwright-cli', filename);
-        try {
-          const yamlContent = await fs.readFile(yamlPath, 'utf8');
-          // Append the actual element tree to the output
-          result.output += '\n\n### Element Tree (use these refs for click/fill):\n```yaml\n' + yamlContent + '\n```';
-          console.log(`[Playwright CLI] Appended snapshot content from ${filename} (${yamlContent.length} chars)`);
-        } catch (err) {
-          console.error(`[Playwright CLI] Failed to read snapshot YAML: ${err.message}`);
-        }
-      }
-    }
-    
-    // Store the sanitized command (with placeholders, not actual values) for logging
-    results.push({ command, result });
-    
-    // Check for login failure
-    if (usedCredentials.length > 0 && result.output) {
-      const outputLower = result.output.toLowerCase();
-      const loginFailurePatterns = [
-        "incorrect password", "invalid credentials", "login failed",
-        "authentication failed", "wrong password", "access denied"
-      ];
-      if (loginFailurePatterns.some(p => outputLower.includes(p))) {
-        const failedDomain = usedCredentials[0]?.domain || "unknown";
-        result.loginFailed = true;
-        result.error = `Login failed for ${failedDomain} - credentials may be incorrect or outdated`;
-        result.domain = failedDomain;
-        result.suggestion = "Please check your saved credentials in the Credentials page and try again.";
-      }
-    }
-  }
-  
-  return { commands: results, hasCommands: true };
-}
-
-/**
- * Get list of domains that have saved credentials
- * This allows the LLM to know which sites it can auto-login to
- */
-async function getAvailableCredentialDomains() {
-  try {
-    const credentials = await loadCredentials();
-    return Object.keys(credentials);
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Convert a screenshot file to a base64 data URL for display in the UI
- * @param {string} screenshotPath - Path to the screenshot file
- * @returns {Promise<string|null>} - Base64 data URL or null on error
- */
-async function screenshotToDataUrl(screenshotPath) {
-  try {
-    const imageBuffer = await fs.readFile(screenshotPath);
-    const base64Data = imageBuffer.toString("base64");
-    const ext = path.extname(screenshotPath).toLowerCase();
-    const mediaType = ext === ".png" ? "image/png" : ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : "image/png";
-    return `data:${mediaType};base64,${base64Data}`;
-  } catch (err) {
-    console.error(`[Chat] Failed to convert screenshot to data URL: ${err.message}`);
-    return null;
-  }
-}
-
-/**
- * Build a message with screenshot images for the LLM
- * @param {string} text - The text content of the message
- * @param {string[]} screenshotPaths - Array of screenshot file paths
- * @param {string} provider - "anthropic" or "openai"
- * @returns {object} - Message object with text and images
- */
-async function buildMessageWithScreenshots(text, screenshotPaths, provider) {
-  if (!screenshotPaths || screenshotPaths.length === 0) {
-    return { role: "user", content: text };
-  }
-  
-  const imageContents = [];
-  
-  for (const screenshotPath of screenshotPaths) {
-    try {
-      const imageBuffer = await fs.readFile(screenshotPath);
-      const base64Data = imageBuffer.toString("base64");
-      const ext = path.extname(screenshotPath).toLowerCase();
-      const mediaType = ext === ".png" ? "image/png" : ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : "image/png";
-      
-      if (provider === "anthropic") {
-        imageContents.push({
-          type: "image",
-          source: {
-            type: "base64",
-            media_type: mediaType,
-            data: base64Data
-          }
-        });
-      } else {
-        // OpenAI format
-        imageContents.push({
-          type: "image_url",
-          image_url: {
-            url: `data:${mediaType};base64,${base64Data}`
-          }
-        });
-      }
-      console.log(`[Chat] Added screenshot to LLM message: ${screenshotPath}`);
-    } catch (err) {
-      console.error(`[Chat] Failed to read screenshot ${screenshotPath}: ${err.message}`);
-    }
-  }
-  
-  if (imageContents.length === 0) {
-    return { role: "user", content: text };
-  }
-  
-  // Build content array with text first, then images
-  if (provider === "anthropic") {
-    return {
-      role: "user",
-      content: [
-        { type: "text", text: text },
-        ...imageContents
-      ]
-    };
-  } else {
-    // OpenAI format
-    return {
-      role: "user",
-      content: [
-        { type: "text", text: text },
-        ...imageContents
-      ]
-    };
-  }
-}
-
-/**
- * Get Playwright CLI command reference (for system prompts and skills)
- * @param {string[]} availableCredentials - Optional list of domains with saved credentials
- */
-function getPlaywrightCliReference(availableCredentials = []) {
-  let credentialSection = `### Secure Login (NEVER include actual passwords)
-For login forms, use credential placeholders - NEVER type actual passwords:
-- \`playwright-cli fill <ref> {{credential:domain.com:username}}\`
-- \`playwright-cli fill <ref> {{credential:domain.com:password}}\`
-
-SECURITY: Credential placeholders are resolved locally via secure environment variables.
-- Actual credentials are NEVER sent to this AI conversation
-- Actual credentials are NEVER passed as command-line arguments
-- Credentials are injected via environment variables to prevent exposure`;
-
-  // Add list of available credentials if any exist
-  if (availableCredentials.length > 0) {
-    credentialSection += `\n\n### Available Saved Credentials
-The user has credentials saved for these domains - USE THEM when logging in:
-${availableCredentials.map(d => `- ${d}`).join('\n')}
-
-IMPORTANT: When visiting any of these sites and a login is needed, AUTOMATICALLY use the saved credentials with the placeholder syntax. Do NOT ask the user if they have credentials - just use them.`;
-  } else {
-    credentialSection += `\n\nNo saved credentials found. If login is required, inform the user they can save credentials in the Credentials page.`;
-  }
-
-  return `## Browser Automation (playwright-cli) - IMPORTANT: NOT A TOOL
-
-**This is NOT a tool call.** To use browser automation, simply write the command in a bash code block in your response.
-The system will automatically detect and execute these commands, then give you the results.
-
-**HOW TO USE:** Just include commands like this in your response:
-\`\`\`bash
-playwright-cli open https://example.com --headed
-\`\`\`
-
-Commands run in a persistent session (cookies/auth preserved).
-
-### Navigation
-- \`playwright-cli open <url>\` - Navigate to URL
-- \`playwright-cli open <url> --headed\` - Navigate with visible browser
-- \`playwright-cli go-back\` - Go back
-- \`playwright-cli go-forward\` - Go forward
-- \`playwright-cli reload\` - Reload page
-
-### Page Interaction - IMPORTANT: Use element refs from snapshot!
-- \`playwright-cli snapshot\` - Get element refs for clicking/filling (text-based accessibility tree)
-- \`playwright-cli click <ref>\` - Click element. **<ref> must be from snapshot output like "e23", "e45"**
-- \`playwright-cli fill <ref> <text>\` - Fill text field. **<ref> must be element ref, NOT CSS selector**
-- \`playwright-cli type <text>\` - Type text into focused element
-- \`playwright-cli press <key>\` - Press key (Enter, Tab, Escape, etc.)
-- \`playwright-cli check <ref>\` - Check a checkbox
-- \`playwright-cli select <ref> <value>\` - Select dropdown option
-
-**CRITICAL:** CSS selectors like \`[name='email']\` or \`text=Login\` will NOT work!
-You MUST use element refs (e23, e45, etc.) from the snapshot output.
-
-### Screenshots - USE THIS TO SEE THE PAGE
-- \`playwright-cli screenshot\` - **Take screenshot to SEE what's on the page visually**
-
-**IMPORTANT:** \`snapshot\` returns text-based element refs for clicking, NOT visual content!
-If you need to READ text, view images, analyze charts, see calendars, or understand visual layout:
-**YOU MUST USE \`screenshot\`** - this captures the actual page image and lets you see it.
-
-### Other Info
-- \`playwright-cli console\` - Get console messages
-- \`playwright-cli network\` - Get network requests
-
-### Tabs
-- \`playwright-cli tab-list\` - List open tabs
-- \`playwright-cli tab-new [url]\` - Open new tab
-- \`playwright-cli tab-close [index]\` - Close tab
-- \`playwright-cli tab-select <index>\` - Switch to tab
-
-${credentialSection}
-
-### Example Workflow
-1. Open the page:
-\`\`\`bash
-playwright-cli open https://amazon.com --headed
-\`\`\`
-
-2. **TAKE A SCREENSHOT to see the page content:**
-\`\`\`bash
-playwright-cli screenshot
-\`\`\`
-
-3. Get element refs if you need to click/fill:
-\`\`\`bash
-playwright-cli snapshot
-\`\`\`
-
-4. The snapshot shows elements like:
-   - button "Sign In" [e23]
-   - input#email [e45]
-   - input#password [e67]
-
-5. Use those refs to interact:
-\`\`\`bash
-playwright-cli click e23
-\`\`\`
-
-**REMEMBER:** 
-- \`screenshot\` = SEE the page visually (calendars, text, images, charts)
-- \`snapshot\` = GET element refs for clicking/filling forms
-- Use refs like "e23", "e45" - NOT CSS selectors like "[name='email']"
-
-### USE BROWSER AUTOMATION FOR WEB RESEARCH
-When you need to find information from the web (flights, hotels, products, prices, schedules, etc.):
-1. OPEN a relevant website (Google Flights, Kayak, Amazon, etc.)
-2. TAKE A SCREENSHOT to see it
-3. Use SNAPSHOT + FILL/CLICK to search
-4. SCREENSHOT to see results
-5. Extract and report the information
-
-**NEVER say "I don't have access to flight/hotel/product data"** - you have browser automation!
-Just open the website and search like a human would.`;
-}
-
-/**
- * Check if Playwright is enabled
- */
-function isPlaywrightEnabled() {
-  return playwrightEnabled;
-}
-
-/**
- * Set Playwright enabled state
- */
-function setPlaywrightEnabled(enabled) {
-  playwrightEnabled = enabled;
-}
-
-/**
- * Set Playwright browser preference
- */
-function setPlaywrightBrowser(browser) {
-  playwrightBrowser = browser;
-}
-
-/**
- * Get current Playwright browser
- */
-function getPlaywrightBrowser() {
-  return playwrightBrowser;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // WhatsApp State
 // ─────────────────────────────────────────────────────────────────────────────
 let whatsappSocket = null;
@@ -1517,7 +1059,7 @@ const getSettingsPath = async () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Secure Credential Storage System
 // Uses Electron's safeStorage API for OS-level encryption (Keychain/DPAPI/libsecret)
-// Credentials are NEVER sent to LLMs - only used locally for Playwright automation
+// Credentials are NEVER sent to LLMs - only used locally for browser automation
 // ─────────────────────────────────────────────────────────────────────────────
 
 const getCredentialsPath = async () => {
@@ -1575,6 +1117,20 @@ const loadCredentials = async () => {
     console.error("[Credentials] Error loading credentials:", err.message);
     credentialsCache = {};
     return credentialsCache;
+  }
+};
+
+/**
+ * Get list of domains that have saved credentials
+ * This allows the LLM to know which sites have credentials available
+ * @returns {Promise<string[]>} Array of domain names
+ */
+const getAvailableCredentialDomains = async () => {
+  try {
+    const credentials = await loadCredentials();
+    return Object.keys(credentials);
+  } catch {
+    return [];
   }
 };
 
@@ -4783,133 +4339,18 @@ Generate ONLY the welcome message, nothing else.`;
     }
   });
 
-  // Playwright Browser Automation enable/disable handler
-  ipcMain.handle("integrations:setPlaywrightEnabled", async (_event, { enabled }) => {
-    try {
-      const settingsPath = await getSettingsPath();
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch {
-        // No existing settings
-      }
-      settings.playwrightEnabled = enabled;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      
-      // Update internal state
-      setPlaywrightEnabled(enabled);
-      if (settings.playwrightBrowser) {
-        setPlaywrightBrowser(settings.playwrightBrowser);
-      }
-      
-      // If enabling, ensure CLI is installed
-      if (enabled) {
-        await ensurePlaywrightCliInstalled();
-      }
-      
-      return { ok: true, enabled: isPlaywrightEnabled(), cliInstalled: checkPlaywrightCliInstalled() };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
-  });
-
-  ipcMain.handle("integrations:getPlaywrightEnabled", async () => {
+  // Browser Automation Settings (CDP)
+  ipcMain.handle("integrations:getBrowserEnabled", async () => {
     try {
       const settingsPath = await getSettingsPath();
       const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      const enabled = settings.playwrightEnabled === true;
-      setPlaywrightEnabled(enabled);
-      // Default to "chromium" which doesn't conflict with running Chrome
-      const browserSetting = settings.playwrightBrowser || "chromium";
-      setPlaywrightBrowser(browserSetting);
-      console.log(`[Playwright] Settings loaded: enabled=${enabled}, browser=${browserSetting}`);
-      return { 
-        ok: true, 
-        enabled,
-        cliInstalled: checkPlaywrightCliInstalled(),
-        browser: browserSetting
-      };
+      return { ok: true, enabled: settings.browserEnabled === true };
     } catch {
-      return { ok: true, enabled: false, cliInstalled: false, browser: "chromium" };
+      return { ok: true, enabled: false };
     }
   });
 
-  ipcMain.handle("integrations:getAvailableBrowsers", async () => {
-    try {
-      const { execSync } = require("child_process");
-      
-      // List of Playwright-supported browsers
-      // "chrome" uses the system Chrome with existing logins
-      // "chromium" uses isolated Chromium for Testing
-      const browsers = [
-        { id: "chrome", name: "Chrome (uses existing logins)", installed: false },
-        { id: "chromium", name: "Chromium (isolated)", installed: false },
-        { id: "msedge", name: "Microsoft Edge", installed: false },
-        { id: "firefox", name: "Firefox", installed: false },
-        { id: "webkit", name: "WebKit (Safari)", installed: false }
-      ];
-      
-      // Check which system browsers are installed
-      const checkBrowserInstalled = (browserId) => {
-        try {
-          if (process.platform === "darwin") {
-            // macOS paths
-            const macPaths = {
-              chrome: "/Applications/Google Chrome.app",
-              msedge: "/Applications/Microsoft Edge.app",
-              firefox: "/Applications/Firefox.app",
-              webkit: "/Applications/Safari.app"
-            };
-            if (macPaths[browserId]) {
-              require("fs").accessSync(macPaths[browserId]);
-              return true;
-            }
-          } else if (process.platform === "win32") {
-            // Windows - check common paths
-            const winPaths = {
-              chrome: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-              msedge: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-              firefox: "C:\\Program Files\\Mozilla Firefox\\firefox.exe"
-            };
-            if (winPaths[browserId]) {
-              require("fs").accessSync(winPaths[browserId]);
-              return true;
-            }
-          }
-          
-          // For chromium, check Playwright's cache
-          if (browserId === "chromium") {
-            const playwrightCache = path.join(os.homedir(), ".cache", "ms-playwright");
-            const files = require("fs").readdirSync(playwrightCache);
-            return files.some(f => f.toLowerCase().startsWith("chromium"));
-          }
-          
-          return false;
-        } catch {
-          return false;
-        }
-      };
-      
-      for (const browser of browsers) {
-        browser.installed = checkBrowserInstalled(browser.id);
-      }
-      
-      return { ok: true, browsers };
-    } catch (err) {
-      return { 
-        ok: true, 
-        browsers: [
-          { id: "chrome", name: "Chrome (uses existing logins)", installed: false },
-          { id: "chromium", name: "Chromium (isolated)", installed: false },
-          { id: "msedge", name: "Microsoft Edge", installed: false },
-          { id: "firefox", name: "Firefox", installed: false },
-          { id: "webkit", name: "WebKit (Safari)", installed: false }
-        ]
-      };
-    }
-  });
-
-  ipcMain.handle("integrations:setPlaywrightBrowser", async (_event, { browser }) => {
+  ipcMain.handle("integrations:setBrowserEnabled", async (_event, { enabled }) => {
     try {
       const settingsPath = await getSettingsPath();
       let settings = {};
@@ -4917,43 +4358,10 @@ Generate ONLY the welcome message, nothing else.`;
         settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
       } catch {}
       
-      settings.playwrightBrowser = browser;
+      settings.browserEnabled = enabled;
       await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
       
-      // Update internal browser preference
-      setPlaywrightBrowser(browser);
-      
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
-  });
-
-  // Browser Engine setting (cdp vs playwright-cli)
-  ipcMain.handle("integrations:getBrowserEngine", async () => {
-    try {
-      const settingsPath = await getSettingsPath();
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      // Default to CDP if playwright is enabled but no engine specified
-      const engine = settings.browserEngine || (settings.playwrightEnabled ? "cdp" : null);
-      return { ok: true, engine };
-    } catch {
-      return { ok: true, engine: null };
-    }
-  });
-
-  ipcMain.handle("integrations:setBrowserEngine", async (_event, { engine }) => {
-    try {
-      const settingsPath = await getSettingsPath();
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch {}
-      
-      settings.browserEngine = engine; // "cdp" or "playwright-cli"
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      
-      console.log(`[Settings] Browser engine set to: ${engine}`);
+      console.log(`[Settings] Browser automation ${enabled ? 'enabled' : 'disabled'}`);
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err.message };
@@ -4961,7 +4369,7 @@ Generate ONLY the welcome message, nothing else.`;
   });
 
   // Test CDP browser
-  ipcMain.handle("integrations:testCdpBrowser", async () => {
+  ipcMain.handle("integrations:testBrowser", async () => {
     try {
       const controller = await getBrowserController();
       const snapshot = await controller.navigate("test", "https://example.com");
@@ -4975,49 +4383,12 @@ Generate ONLY the welcome message, nothing else.`;
       
       return { 
         ok: true, 
-        message: `CDP Browser working! Navigated to ${snapshot.title}. Found ${snapshot.elementCount} interactive elements.`,
+        message: `Browser working! Navigated to ${snapshot.title}. Found ${snapshot.elementCount} interactive elements.`,
         screenshot: snapshot.screenshot
       };
     } catch (err) {
       return { ok: false, error: err.message };
     }
-  });
-
-  ipcMain.handle("integrations:testPlaywright", async () => {
-    try {
-      // Ensure CLI is installed
-      const installed = await ensurePlaywrightCliInstalled();
-      if (!installed) {
-        return { ok: false, error: "Playwright CLI is not installed. Please check your npm installation." };
-      }
-
-      // Test by navigating to a simple page using CLI
-      const result = await executePlaywrightCli("open https://example.com --headed");
-
-      if (result.error) {
-        return { ok: false, error: result.error };
-      }
-
-      // Get a snapshot to verify it worked
-      const snapshot = await executePlaywrightCli("snapshot");
-      
-      if (snapshot.error) {
-        return { ok: false, error: snapshot.error };
-      }
-
-      return { 
-        ok: true, 
-        message: "Browser automation is working! Navigated to example.com successfully using Playwright CLI."
-      };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
-  });
-  
-  // Get Playwright CLI reference for skills
-  ipcMain.handle("integrations:getPlaywrightCliReference", async () => {
-    const availableCredentials = await getAvailableCredentialDomains();
-    return { ok: true, reference: getPlaywrightCliReference(availableCredentials) };
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -8563,6 +7934,9 @@ If no conflicts found, return empty conflicts array and all fact indexes in nonC
   async function understandQuery(query, context, apiKeys, activeProvider) {
     const { profile, conversationContext, calendarEvents, currentDate, sessionMessages } = context;
     
+    // Get available credentials for security context
+    const availableCredentials = await getAvailableCredentialDomains();
+    
     // Format current date for the prompt
     const dateStr = currentDate.toLocaleDateString('en-US', { 
       weekday: 'long', 
@@ -8611,6 +7985,17 @@ If no conflicts found, return empty conflicts array and all fact indexes in nonC
     }
 
     const understandingPrompt = `You are a query understanding system. Your job is to extract entities, resolve ambiguities, and enrich the user's query using available context.
+
+## CRITICAL SECURITY RULES - READ FIRST
+**NEVER ask for login credentials, passwords, usernames, or API keys.** This is a major security violation.
+- If a website/service needs login, check if credentials exist (listed below)
+- If credentials exist for the domain → proceed without asking
+- If credentials DON'T exist → the enriched query should note the user needs to add credentials in the Credentials page
+- ABSOLUTELY NO clarification questions about passwords, usernames, or login details
+
+## Saved Credentials Available
+${availableCredentials.length > 0 ? `The user has saved credentials for: ${availableCredentials.join(', ')}` : 'No saved credentials'}
+If the query involves logging into one of these sites, proceed - credentials are available.
 
 ## Current Context
 Today is ${dateStr}.
@@ -8722,7 +8107,16 @@ IMPORTANT RULES:
 - Only set clarification_needed=true when execution is IMPOSSIBLE without user input.
 - NEVER ask generic questions like "what specific details are you looking for?" - be specific or don't ask at all.
 
+## SECURITY: FORBIDDEN CLARIFICATION QUESTIONS
+NEVER, UNDER ANY CIRCUMSTANCES, ask for:
+- Passwords or login credentials
+- Usernames or email addresses for login
+- API keys or tokens
+- Any authentication information
+If login is needed: check Saved Credentials above. If credentials exist, proceed. If not, mention the Credentials page.
+
 ## When to NOT ask for clarification:
+- **Login/credential requests** → NEVER ask, use saved credentials or mention Credentials page
 - Message retrieval queries (e.g., "messages from Igor") → proceed with available platforms
 - Contact lookups → just look up the contact
 - Calendar queries → just fetch the calendar
@@ -9251,14 +8645,16 @@ ${formatDecomposedSteps(steps)}
             for (const toolUse of toolUseBlocks) {
               console.log(`[QueryDecomposition] Step ${stepNum} tool: ${toolUse.name}`);
               const result = await toolExecutor.executeTool(toolUse.name, toolUse.input);
+              // Remove screenshotDataUrl to prevent token explosion
+              const { screenshotDataUrl, ...resultForLLM } = result;
               
               // Store tool results in accumulated context
-              accumulatedContext[`step${stepNum}_${toolUse.name}`] = result;
+              accumulatedContext[`step${stepNum}_${toolUse.name}`] = resultForLLM;
               
               toolResults.push({
                 type: "tool_result",
                 tool_use_id: toolUse.id,
-                content: JSON.stringify(result)
+                content: JSON.stringify(resultForLLM)
               });
             }
 
@@ -9312,13 +8708,15 @@ ${formatDecomposedSteps(steps)}
               const toolInput = JSON.parse(toolCall.function.arguments);
               console.log(`[QueryDecomposition] Step ${stepNum} tool: ${toolCall.function.name}`);
               const result = await toolExecutor.executeTool(toolCall.function.name, toolInput);
+              // Remove screenshotDataUrl to prevent token explosion
+              const { screenshotDataUrl, ...resultForLLM } = result;
               
-              accumulatedContext[`step${stepNum}_${toolCall.function.name}`] = result;
+              accumulatedContext[`step${stepNum}_${toolCall.function.name}`] = resultForLLM;
 
               iterationMessages.push({
                 role: "tool",
                 tool_call_id: toolCall.id,
-                content: JSON.stringify(result)
+                content: JSON.stringify(resultForLLM)
               });
             }
           }
@@ -9510,6 +8908,29 @@ ${formatDecomposedSteps(steps)}
         properties: {},
         required: []
       }
+    },
+    {
+      name: "browser_fill_credential",
+      description: "Securely fill a login form field with a saved credential. Use this for login forms when the user has saved credentials for the domain. The actual credential value is never exposed.",
+      input_schema: {
+        type: "object",
+        properties: {
+          domain: {
+            type: "string",
+            description: "The domain to get credentials for (e.g., 'mybrightwheel.com', 'amazon.com')"
+          },
+          field: {
+            type: "string",
+            enum: ["username", "password"],
+            description: "Which credential field to fill: 'username' or 'password'"
+          },
+          ref: {
+            type: "string",
+            description: "Element ref of the input field to fill (e.g., 'e5')"
+          }
+        },
+        required: ["domain", "field", "ref"]
+      }
     }
   ];
 
@@ -9532,7 +8953,7 @@ ${formatDecomposedSteps(steps)}
             url: snapshot.url,
             title: snapshot.title,
             elementCount: snapshot.elementCount,
-            elements: snapshot.elements.slice(0, 30), // Limit elements to save tokens
+            elements: snapshot.elements.slice(0, 50), // Limit elements to save tokens
             screenshotDataUrl: snapshot.screenshot,
             message: `Navigated to ${snapshot.url}. Found ${snapshot.elementCount} interactive elements. A screenshot is attached.`
           };
@@ -9553,7 +8974,7 @@ ${formatDecomposedSteps(steps)}
             url: snapshot.url,
             title: snapshot.title,
             elementCount: snapshot.elementCount,
-            elements: snapshot.elements.slice(0, 30),
+            elements: snapshot.elements.slice(0, 50),
             screenshotDataUrl: snapshot.screenshot,
             message: `Clicked ${toolInput.ref}. Page updated. Screenshot attached.`
           };
@@ -9563,11 +8984,22 @@ ${formatDecomposedSteps(steps)}
           if (!toolInput.text) {
             return { error: "Text is required" };
           }
-          await controller.type(sessionId, toolInput.text, toolInput.ref);
+          const typeResult = await controller.type(sessionId, toolInput.text, toolInput.ref);
+          
+          // Get a snapshot to verify typing worked
+          await new Promise(resolve => setTimeout(resolve, 300));
+          const snapshot = await controller.snapshot(sessionId);
+          
           return {
             success: true,
             typed: toolInput.text.substring(0, 50) + (toolInput.text.length > 50 ? '...' : ''),
-            message: `Typed "${toolInput.text.substring(0, 30)}...". Use browser_press with 'Enter' to submit.`
+            focused: typeResult.focused,
+            url: snapshot.url,
+            elements: snapshot.elements.slice(0, 50),
+            screenshotDataUrl: snapshot.screenshot,
+            message: typeResult.focused 
+              ? `Typed "${toolInput.text.substring(0, 30)}..." into the input. Screenshot shows current state. Use browser_press with 'Enter' to submit.`
+              : `Warning: Could not confirm focus on input element. Text may not have been typed. Check the screenshot and try clicking the input field first with browser_click.`
           };
         }
         
@@ -9587,7 +9019,7 @@ ${formatDecomposedSteps(steps)}
               url: snapshot.url,
               title: snapshot.title,
               elementCount: snapshot.elementCount,
-              elements: snapshot.elements.slice(0, 30),
+              elements: snapshot.elements.slice(0, 50),
               screenshotDataUrl: snapshot.screenshot,
               message: `Pressed ${toolInput.key}. Page may have updated. Screenshot attached.`
             };
@@ -9606,7 +9038,7 @@ ${formatDecomposedSteps(steps)}
             url: snapshot.url,
             title: snapshot.title,
             elementCount: snapshot.elementCount,
-            elements: snapshot.elements.slice(0, 30),
+            elements: snapshot.elements.slice(0, 50),
             screenshotDataUrl: snapshot.screenshot,
             message: `Current page: ${snapshot.title}. Found ${snapshot.elementCount} interactive elements. Screenshot attached.`
           };
@@ -9623,7 +9055,7 @@ ${formatDecomposedSteps(steps)}
             scrolled: direction,
             url: snapshot.url,
             elementCount: snapshot.elementCount,
-            elements: snapshot.elements.slice(0, 30),
+            elements: snapshot.elements.slice(0, 50),
             screenshotDataUrl: snapshot.screenshot,
             message: `Scrolled ${direction}. Screenshot attached.`
           };
@@ -9636,9 +9068,56 @@ ${formatDecomposedSteps(steps)}
             url: snapshot.url,
             title: snapshot.title,
             elementCount: snapshot.elementCount,
-            elements: snapshot.elements.slice(0, 30),
+            elements: snapshot.elements.slice(0, 50),
             screenshotDataUrl: snapshot.screenshot,
             message: `Went back to ${snapshot.url}. Screenshot attached.`
+          };
+        }
+        
+        case "browser_fill_credential": {
+          const { domain, field, ref } = toolInput;
+          if (!domain || !field || !ref) {
+            return { error: "domain, field, and ref are all required" };
+          }
+          
+          // Load credentials for this domain
+          const credentials = await loadCredentials();
+          const cred = credentials[domain];
+          
+          if (!cred) {
+            return { 
+              error: `No credentials found for domain: ${domain}`,
+              suggestion: `The user needs to add credentials for ${domain} in the Credentials page of the app.`
+            };
+          }
+          
+          let valueToFill;
+          if (field === 'username') {
+            valueToFill = cred.username;
+            if (!valueToFill) {
+              return { error: `No username saved for ${domain}` };
+            }
+          } else if (field === 'password') {
+            valueToFill = cred.password;
+            if (!valueToFill) {
+              return { error: `No password saved for ${domain}` };
+            }
+          } else {
+            return { error: `Invalid field: ${field}. Must be 'username' or 'password'` };
+          }
+          
+          // Use the controller to type the credential value
+          // First click the ref to focus, then type
+          // Pass sensitive=true for passwords to mask in logs
+          await controller.click(sessionId, ref);
+          await controller.type(sessionId, valueToFill, null, field === 'password');
+          
+          console.log(`[BrowserController] Filled ${field} credential for ${domain} into ${ref}`);
+          
+          return {
+            success: true,
+            message: `Securely filled ${field} for ${domain} into field ${ref}. The actual credential value is not shown for security.`,
+            // Note: Don't include the value or screenshot here - just confirm it worked
           };
         }
         
@@ -9677,8 +9156,7 @@ ${formatDecomposedSteps(steps)}
       slackAccessToken = null,
       weatherEnabled = true,
       iMessageEnabled = false,
-      playwrightEnabled = false,
-      cdpBrowserEnabled = false, // New CDP browser engine
+      browserEnabled = false, // CDP browser automation
       includeProfileTools = true,
       includeTaskTools = true,
       includeMemoryTools = true,
@@ -9696,14 +9174,11 @@ ${formatDecomposedSteps(steps)}
     if (weatherEnabled) tools.push(...weatherTools);
     if (slackAccessToken) tools.push(...slackTools);
     
-    // CDP Browser tools (new direct CDP control - faster and more reliable)
-    if (cdpBrowserEnabled) {
+    // Browser tools (CDP-based direct control)
+    if (browserEnabled) {
       tools.push(...cdpBrowserTools);
-      console.log("[Tools] CDP browser tools enabled");
+      console.log("[Tools] Browser tools enabled");
     }
-    
-    // Note: Playwright CLI commands are NOT added as tools when CDP is enabled
-    // Instead, use the browser_* tools above for better performance
     
     if (additionalTools.length > 0) tools.push(...additionalTools);
 
@@ -9774,13 +9249,10 @@ ${formatDecomposedSteps(steps)}
         return await executeSlackTool(toolName, toolInput, slackAccessToken);
       }
       
-      // CDP Browser tools (new direct control)
-      if (cdpBrowserEnabled && cdpBrowserTools.find(t => t.name === toolName)) {
+      // Browser tools (CDP-based)
+      if (browserEnabled && cdpBrowserTools.find(t => t.name === toolName)) {
         return await executeCdpBrowserTool(toolName, toolInput);
       }
-      
-      // Note: Playwright CLI commands are NOT handled as tools when CDP is disabled
-      // They are detected and executed inline from LLM response text
       
       return { error: `Tool ${toolName} not available` };
     };
@@ -9790,7 +9262,7 @@ ${formatDecomposedSteps(steps)}
 
   /**
    * Loads integration settings and builds tools
-   * @returns {Object} { tools, executeTool, googleAccessToken, slackAccessToken, weatherEnabled, iMessageEnabled, playwrightEnabled }
+   * @returns {Object} { tools, executeTool, googleAccessToken, slackAccessToken, weatherEnabled, iMessageEnabled, browserEnabled }
    */
   const loadIntegrationsAndBuildTools = async (options = {}) => {
     const settingsPath = await getSettingsPath();
@@ -9832,33 +9304,11 @@ ${formatDecomposedSteps(steps)}
       // Default to platform check
     }
 
-    // Check Playwright browser automation enabled
-    let playwrightIsEnabled = false;
+    // Check browser automation enabled
+    let browserIsEnabled = false;
     try {
       const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      if (settings.playwrightEnabled === true) {
-        playwrightIsEnabled = true;
-        setPlaywrightEnabled(true);
-        if (settings.playwrightBrowser) {
-          setPlaywrightBrowser(settings.playwrightBrowser);
-        }
-      }
-    } catch {
-      // Default disabled
-    }
-
-    // Check CDP browser engine setting (new architecture - preferred over Playwright CLI)
-    let cdpBrowserIsEnabled = false;
-    try {
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      // CDP is enabled if browserEngine is "cdp" OR if playwrightEnabled is true and no browserEngine specified
-      // This allows gradual migration
-      if (settings.browserEngine === "cdp") {
-        cdpBrowserIsEnabled = true;
-      } else if (settings.playwrightEnabled === true && !settings.browserEngine) {
-        // Default to CDP when playwright is enabled but no engine specified (new default)
-        cdpBrowserIsEnabled = true;
-      }
+      browserIsEnabled = settings.browserEnabled === true;
     } catch {
       // Default disabled
     }
@@ -9868,8 +9318,7 @@ ${formatDecomposedSteps(steps)}
       slackAccessToken,
       weatherEnabled,
       iMessageEnabled,
-      playwrightEnabled: playwrightIsEnabled,
-      cdpBrowserEnabled: cdpBrowserIsEnabled,
+      browserEnabled: browserIsEnabled,
       ...options
     });
 
@@ -9880,8 +9329,7 @@ ${formatDecomposedSteps(steps)}
       slackAccessToken,
       weatherEnabled,
       iMessageEnabled,
-      playwrightEnabled: playwrightIsEnabled,
-      cdpBrowserEnabled: cdpBrowserIsEnabled
+      browserEnabled: browserIsEnabled
     };
   };
 
@@ -10157,14 +9605,41 @@ ${formatDecomposedSteps(steps)}
         
         // Check if clarification is needed
         if (queryUnderstanding.clarification_needed && queryUnderstanding.clarification_questions?.length > 0) {
-          console.log("[QueryUnderstanding] Clarification needed, returning to user");
-          return {
-            ok: true,
-            response: `Before I proceed, I need to clarify a few things:\n\n${queryUnderstanding.clarification_questions.map((q, i) => `${i + 1}. ${q.question || q}`).join('\n')}\n\nPlease provide these details so I can help you better.`,
-            clarification_needed: true,
-            clarification_questions: queryUnderstanding.clarification_questions,
-            original_query: userMessage
-          };
+          // SECURITY FILTER: Remove any credential-related questions
+          const credentialPatterns = [
+            /password/i,
+            /username/i,
+            /login\s*credential/i,
+            /api\s*key/i,
+            /secret/i,
+            /authentication/i,
+            /log\s*in\s*(details|info)/i,
+            /sign\s*in\s*(details|info)/i,
+            /\bcredential/i
+          ];
+          
+          const safeQuestions = queryUnderstanding.clarification_questions.filter(q => {
+            const questionText = (q.question || q).toLowerCase();
+            const isCredentialQuestion = credentialPatterns.some(pattern => pattern.test(questionText));
+            if (isCredentialQuestion) {
+              console.warn("[QueryUnderstanding] BLOCKED credential question:", q.question || q);
+            }
+            return !isCredentialQuestion;
+          });
+          
+          // Only return clarification if there are still valid questions after filtering
+          if (safeQuestions.length > 0) {
+            console.log("[QueryUnderstanding] Clarification needed, returning to user");
+            return {
+              ok: true,
+              response: `Before I proceed, I need to clarify a few things:\n\n${safeQuestions.map((q, i) => `${i + 1}. ${q.question || q}`).join('\n')}\n\nPlease provide these details so I can help you better.`,
+              clarification_needed: true,
+              clarification_questions: safeQuestions,
+              original_query: userMessage
+            };
+          } else {
+            console.log("[QueryUnderstanding] All clarification questions were credential-related and blocked, proceeding without clarification");
+          }
         }
         
         // Use enriched query for subsequent processing
@@ -10215,7 +9690,7 @@ ${formatDecomposedSteps(steps)}
     }
     
     // Also check queryUnderstanding for extracted entities
-    if (!detectedRecipient && queryUnderstanding?.entities) {
+    if (!detectedRecipient && queryUnderstanding?.entities && Array.isArray(queryUnderstanding.entities)) {
       const recipientEntity = queryUnderstanding.entities.find(e => 
         e.type === 'person' || e.type === 'contact' || e.type === 'email'
       );
@@ -10315,31 +9790,21 @@ ${formatDecomposedSteps(steps)}
           // Build tools list for decomposition
           const accessToken = await getGoogleAccessToken();
           const slackToken = await getSlackAccessToken().catch(() => null);
-          const hasPlaywright = await (async () => {
+          const hasBrowser = await (async () => {
             try {
               const s = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-              return s.playwrightEnabled === true;
+              return s.browserEnabled === true;
             } catch { return false; }
           })();
           
-          // Note: Playwright CLI commands are not included as tools
-          // The LLM will generate CLI commands inline instead
           const toolsForDecomposition = [
             ...profileTools, ...taskTools, ...memoryTools,
             ...(accessToken ? googleWorkspaceTools : []),
             ...(process.platform === "darwin" ? iMessageTools : []),
             ...weatherTools,
-            ...(slackToken ? slackTools : [])
+            ...(slackToken ? slackTools : []),
+            ...(hasBrowser ? cdpBrowserTools : [])
           ];
-          
-          // Add a pseudo-tool to indicate browser automation is available
-          if (hasPlaywright) {
-            toolsForDecomposition.push({
-              name: "browser_automation",
-              description: "Browser automation via playwright-cli. Can navigate, click, fill forms, take screenshots. Use CLI commands like: playwright-cli open <url>, playwright-cli snapshot, playwright-cli click <ref>",
-              input_schema: { type: "object", properties: {} }
-            });
-          }
           
           const queryDecomposition = await decomposeQuery(enrichedQuery, toolsForDecomposition, apiKeys, activeProvider);
           
@@ -10404,7 +9869,7 @@ ${formatDecomposedSteps(steps)}
 ## CRITICAL BEHAVIOR RULES
 1. **RESOLVE PRONOUNS FROM CONVERSATION** - When user says "him", "her", "them", "they", "that person", "the email", etc., ALWAYS check the previous messages in this conversation to identify who/what they're referring to. If you just mentioned "jeff@wovly.ai", and user says "send an email to him", YOU KNOW "him" is jeff@wovly.ai. NEVER ask who "him" is when you just mentioned them.
 2. **DO NOT over-interpret requests** - If user asks to "find" something, don't assume they want to "book" or "purchase". Just find it.
-3. **DO NOT refuse tasks you CAN do** - If you have browser automation, USE IT to search the web. Never say "I cannot access flight/hotel/product information" when you have Playwright available.
+3. **DO NOT refuse tasks you CAN do** - If you have browser automation, USE IT to search the web. Never say "I cannot access flight/hotel/product information" when you have browser tools available.
 4. **Take action, don't just offer options** - When user asks you to find something, actually go find it. Don't just offer to help or list what you could do.
 5. **Web research is a CORE capability** - Finding flights, hotels, products, prices, news, schedules online is something you DO. Use browser automation.
 6. **Ask for clarification only when necessary - If you can infer information from the conversation with reasonable confidence, don't ask for clarification.  But if confidence is low you should ask for clarification.
@@ -10413,18 +9878,11 @@ ${formatDecomposedSteps(steps)}
 9. **USE CONVERSATION CONTEXT** - The messages in this chat ARE your context. If you mentioned something 2 messages ago, USE that information. Don't pretend you don't know what the user is talking about.
 
 ## CRITICAL SECURITY RULES - CREDENTIALS
-- NEVER include actual passwords, API keys, or login credentials in your responses
-- NEVER ask users to share their passwords or sensitive credentials in chat
-- If a user shares a password in chat, politely remind them to use the Credentials page instead for security
-- When filling login forms with Playwright, use the secure placeholder syntax: {{credential:domain.com:username}} and {{credential:domain.com:password}}
-- The actual credentials are injected locally by the system and NEVER pass through this conversation
-- NEVER log, store, or repeat credential values - only use the placeholder syntax
-
-## LOGIN FAILURE HANDLING
-- If a Playwright tool returns error: "login_failed", inform the user clearly:
-  "I wasn't able to log in to [domain]. The credentials may be incorrect or outdated. Please check your saved credentials in the Credentials page and try again."
-- Do NOT retry with different credentials or ask the user for their password
-- Do NOT attempt to guess or reset passwords`;
+- **NEVER ask users for their login credentials, passwords, or API keys** - this is a major security violation
+- NEVER include actual passwords in your responses
+- If login is required, check if credentials are available (listed below) and use them automatically
+- If no credentials exist for a site, tell the user: "I don't have saved credentials for this site. Please add them in the Credentials page of the app, then try again."
+- If a user tries to share a password in chat, STOP them and redirect to the Credentials page`;
 
     if (profile) {
       systemPrompt += `\n\nUser Profile:\n- Name: ${profile.firstName} ${profile.lastName}\n- Occupation: ${profile.occupation || "Not specified"}\n- City: ${profile.city || "Not specified"}\n- Home Life: ${profile.homeLife || "Not specified"}`;
@@ -10503,7 +9961,7 @@ ${conversationStyleContext.messages.slice(0, 5).map((m, i) => `${i + 1}. "${m.su
 No prior message history found with "${conversationStyleContext.recipient}". Using standard professional tone. Adjust based on the context of the request.`;
     }
 
-    // Continue with the rest of the chat flow (Slack, Weather, Playwright, Task tools, LLM calls)
+    // Continue with the rest of the chat flow (Slack, Weather, Browser, Task tools, LLM calls)
     // This is handled by the caller (IPC handler) since it contains provider-specific logic
     return {
       ok: true,
@@ -10644,12 +10102,12 @@ You have FULL access to the user's tools including calendar, email, contacts, et
         }
       }));
 
-      // Process with tool calls (up to 5 iterations)
+      // Process with tool calls (up to 6 iterations)
       if (useProvider === "anthropic" && apiKeys.anthropic) {
         const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
         let currentMessages = [...messages];
         
-        for (let iteration = 0; iteration < 5; iteration++) {
+        for (let iteration = 0; iteration < 20; iteration++) {
           const response = await fetch("https://api.anthropic.com/v1/messages", {
             method: "POST",
             headers: {
@@ -10686,10 +10144,12 @@ You have FULL access to the user's tools including calendar, email, contacts, et
           for (const toolUse of toolUseBlocks) {
             console.log(`[WhatsApp] Executing tool: ${toolUse.name}`);
             const result = await executeTool(toolUse.name, toolUse.input);
+            // Remove screenshotDataUrl to prevent token explosion
+            const { screenshotDataUrl, ...resultForLLM } = result;
             toolResults.push({
               type: "tool_result",
               tool_use_id: toolUse.id,
-              content: typeof result === 'string' ? result : JSON.stringify(result)
+              content: typeof resultForLLM === 'string' ? resultForLLM : JSON.stringify(resultForLLM)
             });
           }
 
@@ -10707,7 +10167,7 @@ You have FULL access to the user's tools including calendar, email, contacts, et
           ...messages
         ];
         
-        for (let iteration = 0; iteration < 5; iteration++) {
+        for (let iteration = 0; iteration < 20; iteration++) {
           const response = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
             headers: {
@@ -10742,11 +10202,13 @@ You have FULL access to the user's tools including calendar, email, contacts, et
             const toolInput = JSON.parse(toolCall.function.arguments);
             console.log(`[WhatsApp] Executing tool: ${toolCall.function.name}`);
             const result = await executeTool(toolCall.function.name, toolInput);
+            // Remove screenshotDataUrl to prevent token explosion
+            const { screenshotDataUrl, ...resultForLLM } = result;
 
             currentMessages.push({
               role: "tool",
               tool_call_id: toolCall.id,
-              content: typeof result === 'string' ? result : JSON.stringify(result)
+              content: typeof resultForLLM === 'string' ? resultForLLM : JSON.stringify(resultForLLM)
             });
           }
         }
@@ -10819,30 +10281,21 @@ You have FULL access to the user's tools including calendar, email, contacts, et
         systemPrompt += `\n\nYou have access to Slack. You can list channels, read messages, send messages, and search for users. Always confirm before sending messages.`;
       }
 
-      // Check if browser automation is enabled (CDP or Playwright)
-      let hasPlaywrightTools = false;
-      let hasCdpBrowser = false;
+      // Check if browser automation is enabled
+      let hasBrowserTools = false;
       try {
         const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-        if (settings.playwrightEnabled === true) {
-          hasPlaywrightTools = true;
-          setPlaywrightEnabled(true);
-          if (settings.playwrightBrowser) {
-            setPlaywrightBrowser(settings.playwrightBrowser);
-          }
-        }
-        // Check for CDP browser engine (new architecture)
-        if (settings.browserEngine === "cdp" || (settings.playwrightEnabled && !settings.browserEngine)) {
-          hasCdpBrowser = true;
-        }
+        hasBrowserTools = settings.browserEnabled === true;
       } catch {
         // Default disabled
       }
 
+      // Get available credentials for browser login
+      const availableCredentials = await getAvailableCredentialDomains();
+
       // Add browser automation system prompt
-      if (hasCdpBrowser) {
-        // CDP Browser tools (new architecture - uses tool calls)
-        systemPrompt += `\n\n## WEB RESEARCH CAPABILITY - BROWSER AUTOMATION
+      if (hasBrowserTools) {
+        let browserPrompt = `\n\n## WEB RESEARCH CAPABILITY - BROWSER AUTOMATION
 
 You have FULL browser automation capability via the browser_* tools. Use these to research online:
 
@@ -10869,34 +10322,40 @@ If blocked, try alternative sites:
 - Flights: Google Flights → Kayak → Skyscanner
 - Hotels: Google Hotels → Booking.com → Expedia
 - Products: Amazon → Walmart → Target`;
-      } else if (hasPlaywrightTools) {
-        // Legacy Playwright CLI system prompt
-        const availableCredentials = await getAvailableCredentialDomains();
-        systemPrompt += `\n\n## WEB RESEARCH CAPABILITY - YOU CAN BROWSE THE INTERNET
-You have FULL browser automation capability. This means:
-- Finding flights → GO TO Google Flights/Kayak and search
-- Finding hotels → GO TO Booking.com/Hotels.com and search  
-- Finding products/prices → GO TO Amazon and search
-- Finding information → GO TO the website and read it
 
-**DO NOT SAY "I cannot access" or "I don't have access to" when asked to find information online.**
-**JUST GO TO THE WEBSITE AND LOOK.** You are capable of browsing like a human.
+        // Add credential information
+        if (availableCredentials.length > 0) {
+          browserPrompt += `
 
-### HANDLING CAPTCHA/BOT DETECTION
-Some websites may show captcha, bot detection, or access denied pages. If you encounter:
-- **Captcha/CAPTCHA**: Take a screenshot and inform the user. They may need to solve it manually or try a different site.
-- **"Access Denied"/"Forbidden"**: Try an alternative website (e.g., if Zillow blocks, try Redfin or Realtor.com)
-- **"Please verify you're human"**: Same as captcha - inform user and try alternatives
-- **Rate limiting**: Wait a moment and try again, or use a different site
+**SAVED CREDENTIALS AVAILABLE FOR LOGIN:**
+The user has credentials saved for these domains - use them automatically when logging in:
+${availableCredentials.map(d => `- ${d}`).join('\n')}
 
-**ALTERNATIVES FOR COMMON SEARCHES:**
-- Real estate: Zillow → Redfin → Realtor.com → Homes.com
-- Flights: Google Flights → Kayak → Skyscanner → Expedia
-- Hotels: Google Hotels → Booking.com → Hotels.com → Expedia
-- Products: Amazon → Walmart → Target → Best Buy
-- General info: Google → Bing → DuckDuckGo
+**HOW TO LOG IN (using browser_fill_credential):**
+1. Navigate to the login page
+2. Take a snapshot to find the username and password field refs
+3. Use \`browser_fill_credential\` with domain, field="username", and the username field ref
+4. Use \`browser_fill_credential\` with domain, field="password", and the password field ref
+5. Click the login/submit button
 
-${getPlaywrightCliReference(availableCredentials)}`;
+Example for brightwheel.com:
+- \`browser_fill_credential({ domain: "mybrightwheel.com", field: "username", ref: "e5" })\`
+- \`browser_fill_credential({ domain: "mybrightwheel.com", field: "password", ref: "e6" })\`
+- Then click the submit button
+
+**CRITICAL: NEVER ASK THE USER FOR CREDENTIALS.** If a site needs login and it's not in the list above, say:
+"I don't have saved credentials for [domain]. Please add them in the Credentials page of the app, then try again."`;
+        } else {
+          browserPrompt += `
+
+**LOGIN CREDENTIALS:**
+No saved credentials found. If a website requires login, inform the user:
+"I need to log into [site], but I don't have saved credentials. Please add them in the Credentials page of the app, then try again."
+
+**NEVER ASK THE USER FOR THEIR PASSWORD OR LOGIN CREDENTIALS.**`;
+        }
+        
+        systemPrompt += browserPrompt;
       }
 
       // Add task system prompt
@@ -10953,7 +10412,8 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
       if (hasIMessageTools) allTools.push(...iMessageTools);
       if (weatherEnabled) allTools.push(...weatherTools);
       if (hasSlackTools) allTools.push(...slackTools);
-      // Note: Playwright CLI commands are NOT added as tools - they're executed inline from LLM response
+      // Browser tools (CDP-based)
+      if (hasBrowserTools) allTools.push(...cdpBrowserTools);
 
       // Determine which provider to use
       const useProvider = apiKeys[activeProvider] ? activeProvider : 
@@ -10970,7 +10430,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
         const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
         let currentMessages = messages.map(m => ({ role: m.role, content: m.content }));
         
-        for (let iteration = 0; iteration < 5; iteration++) {
+        for (let iteration = 0; iteration < 20; iteration++) {
           const response = await fetch("https://api.anthropic.com/v1/messages", {
             method: "POST",
             headers: {
@@ -10997,62 +10457,6 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
           if (data.stop_reason === "end_turn" || !data.content.some(b => b.type === "tool_use")) {
             const textBlock = data.content.find(b => b.type === "text");
             let responseText = textBlock?.text || "";
-            
-            // ─────────────────────────────────────────────────────────────────
-            // PLAYWRIGHT CLI COMMAND DETECTION & EXECUTION
-            // If response contains CLI commands, execute them and continue
-            // ─────────────────────────────────────────────────────────────────
-            if (hasPlaywrightTools && responseText) {
-              const cliResult = await executePlaywrightCommandsInText(responseText);
-              
-              if (cliResult.hasCommands && cliResult.commands.length > 0) {
-                console.log(`[Chat] Detected ${cliResult.commands.length} Playwright CLI command(s), executing...`);
-                
-                // Build result summary and collect screenshots
-                let cliResultSummary = "\n\n---\n**CLI Execution Results:**\n";
-                let screenshots = [];
-                
-                for (const { command, result } of cliResult.commands) {
-                  const cmdShort = command.replace(/^playwright-cli\s*/, '');
-                  if (result.error) {
-                    cliResultSummary += `\n\`${cmdShort}\`: ERROR - ${result.error}`;
-                    if (result.loginFailed) {
-                      cliResultSummary += `\n⚠️ Login failed for ${result.domain}. ${result.suggestion}`;
-                    }
-                  } else {
-                    // Truncate long outputs
-                    const output = result.output || "";
-                    const truncated = output.length > 4000 ? output.slice(0, 4000) + "\n... (truncated)" : output;
-                    cliResultSummary += `\n\`${cmdShort}\`:\n\`\`\`\n${truncated}\n\`\`\``;
-                    
-                    // Collect screenshots to send to LLM
-                    if (result.screenshotPath) {
-                      screenshots.push(result.screenshotPath);
-                    }
-                  }
-                }
-                
-                // Send screenshots to UI for display (as base64 data URLs)
-                if (screenshots.length > 0 && win && win.webContents) {
-                  for (const screenshotPath of screenshots) {
-                    const dataUrl = await screenshotToDataUrl(screenshotPath);
-                    if (dataUrl) {
-                      win.webContents.send("chat:screenshot", { dataUrl });
-                    }
-                  }
-                }
-                
-                // Continue conversation with CLI results (include screenshots for LLM to see)
-                currentMessages.push({ role: "assistant", content: data.content });
-                const resultText = `The CLI commands in your response have been executed. Here are the results:\n${cliResultSummary}\n\n${screenshots.length > 0 ? "A screenshot is attached showing the current page state. Analyze it carefully." : ""}\n\nPlease analyze these results and continue with the task. If you need to execute more commands, include them in code blocks.`;
-                const userMessage = await buildMessageWithScreenshots(resultText, screenshots, "anthropic");
-                currentMessages.push(userMessage);
-                
-                // Continue the iteration loop
-                continue;
-              }
-            }
-            
             return { ok: true, response: responseText };
           }
 
@@ -11066,18 +10470,52 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             slackAccessToken,
             weatherEnabled,
             iMessageEnabled: hasIMessageTools,
-            playwrightEnabled: hasPlaywrightTools
+            browserEnabled: hasBrowserTools
           });
 
           for (const toolUse of toolUseBlocks) {
             console.log(`Tool: ${toolUse.name}`, toolUse.input);
             const result = await chatToolExecutor.executeTool(toolUse.name, toolUse.input);
 
-            toolResults.push({
-              type: "tool_result",
-              tool_use_id: toolUse.id,
-              content: JSON.stringify(result)
-            });
+            // Handle CDP browser tool screenshots - send to UI for display
+            if (result.screenshotDataUrl && win && !win.isDestroyed()) {
+              win.webContents.send("chat:screenshot", { dataUrl: result.screenshotDataUrl });
+            }
+
+            // For browser tools with screenshots, send image to LLM so it can see the page
+            const { screenshotDataUrl, ...resultForLLM } = result;
+            
+            if (screenshotDataUrl && screenshotDataUrl.startsWith('data:image/')) {
+              // Extract base64 data from data URL for Anthropic's image format
+              const base64Match = screenshotDataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
+              if (base64Match) {
+                const mediaType = `image/${base64Match[1]}`;
+                const base64Data = base64Match[2];
+                
+                // Send as multipart content: text result + image
+                toolResults.push({
+                  type: "tool_result",
+                  tool_use_id: toolUse.id,
+                  content: [
+                    { type: "text", text: JSON.stringify(resultForLLM) },
+                    { type: "image", source: { type: "base64", media_type: mediaType, data: base64Data } }
+                  ]
+                });
+              } else {
+                // Fallback if format doesn't match
+                toolResults.push({
+                  type: "tool_result",
+                  tool_use_id: toolUse.id,
+                  content: JSON.stringify(resultForLLM)
+                });
+              }
+            } else {
+              toolResults.push({
+                type: "tool_result",
+                tool_use_id: toolUse.id,
+                content: JSON.stringify(resultForLLM)
+              });
+            }
           }
 
           currentMessages.push({ role: "assistant", content: data.content });
@@ -11100,7 +10538,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
           ...messages.map(m => ({ role: m.role, content: m.content }))
         ];
 
-        for (let iteration = 0; iteration < 5; iteration++) {
+        for (let iteration = 0; iteration < 20; iteration++) {
           const response = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
             headers: {
@@ -11124,56 +10562,6 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
 
           if (choice.finish_reason === "stop" || !choice.message.tool_calls) {
             let responseText = choice.message.content || "";
-            
-            // ─────────────────────────────────────────────────────────────────
-            // PLAYWRIGHT CLI COMMAND DETECTION & EXECUTION
-            // ─────────────────────────────────────────────────────────────────
-            if (hasPlaywrightTools && responseText) {
-              const cliResult = await executePlaywrightCommandsInText(responseText);
-              
-              if (cliResult.hasCommands && cliResult.commands.length > 0) {
-                console.log(`[Chat] Detected ${cliResult.commands.length} Playwright CLI command(s), executing...`);
-                
-                let cliResultSummary = "\n\n---\n**CLI Execution Results:**\n";
-                let screenshots = [];
-                
-                for (const { command, result } of cliResult.commands) {
-                  const cmdShort = command.replace(/^playwright-cli\s*/, '');
-                  if (result.error) {
-                    cliResultSummary += `\n\`${cmdShort}\`: ERROR - ${result.error}`;
-                    if (result.loginFailed) {
-                      cliResultSummary += `\n⚠️ Login failed for ${result.domain}. ${result.suggestion}`;
-                    }
-                  } else {
-                    const output = result.output || "";
-                    const truncated = output.length > 4000 ? output.slice(0, 4000) + "\n... (truncated)" : output;
-                    cliResultSummary += `\n\`${cmdShort}\`:\n\`\`\`\n${truncated}\n\`\`\``;
-                    
-                    // Collect screenshots
-                    if (result.screenshotPath) {
-                      screenshots.push(result.screenshotPath);
-                    }
-                  }
-                }
-                
-                // Send screenshots to UI for display (as base64 data URLs)
-                if (screenshots.length > 0 && win && win.webContents) {
-                  for (const screenshotPath of screenshots) {
-                    const dataUrl = await screenshotToDataUrl(screenshotPath);
-                    if (dataUrl) {
-                      win.webContents.send("chat:screenshot", { dataUrl });
-                    }
-                  }
-                }
-                
-                currentMessages.push({ role: "assistant", content: responseText });
-                const resultText = `The CLI commands in your response have been executed. Here are the results:\n${cliResultSummary}\n\n${screenshots.length > 0 ? "A screenshot is attached showing the current page state. Analyze it carefully." : ""}\n\nPlease analyze these results and continue with the task.`;
-                const userMessage = await buildMessageWithScreenshots(resultText, screenshots, "openai");
-                currentMessages.push(userMessage);
-                continue;
-              }
-            }
-            
             return { ok: true, response: responseText };
           }
 
@@ -11185,17 +10573,46 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             slackAccessToken,
             weatherEnabled,
             iMessageEnabled: hasIMessageTools,
-            playwrightEnabled: hasPlaywrightTools
+            browserEnabled: hasBrowserTools
           });
 
+          let pendingScreenshots = [];
+          
           for (const toolCall of choice.message.tool_calls) {
             const toolInput = JSON.parse(toolCall.function.arguments);
             const result = await openaiToolExecutor.executeTool(toolCall.function.name, toolInput);
 
+            // Handle CDP browser tool screenshots - send to UI for display
+            if (result.screenshotDataUrl && win && !win.isDestroyed()) {
+              win.webContents.send("chat:screenshot", { dataUrl: result.screenshotDataUrl });
+            }
+
+            // For OpenAI, collect screenshots to add as a user message after tool results
+            const { screenshotDataUrl, ...resultForLLM } = result;
+            if (screenshotDataUrl) {
+              pendingScreenshots.push(screenshotDataUrl);
+              resultForLLM.screenshotAttached = true;
+            }
+
             currentMessages.push({
               role: "tool",
               tool_call_id: toolCall.id,
-              content: JSON.stringify(result)
+              content: JSON.stringify(resultForLLM)
+            });
+          }
+          
+          // For OpenAI, add screenshots as a user message (vision models can see these)
+          if (pendingScreenshots.length > 0) {
+            const imageContent = pendingScreenshots.map(dataUrl => ({
+              type: "image_url",
+              image_url: { url: dataUrl, detail: "low" } // Use low detail to reduce tokens
+            }));
+            currentMessages.push({
+              role: "user",
+              content: [
+                { type: "text", text: "Here is the current browser screenshot. Analyze it to understand the page and continue with the task." },
+                ...imageContent
+              ]
             });
           }
         }
@@ -11387,43 +10804,28 @@ Be concise. Execute the step and provide the answer.` }
           // Get Slack token
           const slackAccessToken = await getSlackAccessToken().catch(() => null);
           
-          // Get settings for weather, playwright, and CDP browser
+          // Get settings for weather and browser
           const settingsPath = await getSettingsPath();
           let weatherEnabled = true;
-          let hasPlaywrightTools = false;
-          let hasCdpBrowser = false;
+          let hasBrowserTools = false;
           try {
             const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
             weatherEnabled = settings.weatherEnabled !== false;
-            
-            // Check if Playwright CLI is enabled
-            if (settings.playwrightEnabled === true) {
-              hasPlaywrightTools = true;
-              setPlaywrightEnabled(true);
-              if (settings.playwrightBrowser) {
-                setPlaywrightBrowser(settings.playwrightBrowser);
-              }
-              console.log(`[Chat] Step ${stepNum}: Playwright CLI enabled`);
-            }
-            
-            // Check for CDP browser engine (new architecture)
-            if (settings.browserEngine === "cdp" || (settings.playwrightEnabled && !settings.browserEngine)) {
-              hasCdpBrowser = true;
-              console.log(`[Chat] Step ${stepNum}: CDP browser enabled`);
+            hasBrowserTools = settings.browserEnabled === true;
+            if (hasBrowserTools) {
+              console.log(`[Chat] Step ${stepNum}: Browser tools enabled`);
             }
           } catch (err) {
             console.error(`[Chat] Step ${stepNum}: Error loading settings:`, err.message);
           }
           
           // Build tool executor with all tools
-          // Include CDP browser tools if enabled (they handle browser via tool calls)
           const { executeTool, tools: allTools } = buildToolsAndExecutor({
             googleAccessToken: accessToken,
             slackAccessToken,
             weatherEnabled,
             iMessageEnabled: process.platform === "darwin",
-            playwrightEnabled: false, // CLI commands handled separately
-            cdpBrowserEnabled: hasCdpBrowser
+            browserEnabled: hasBrowserTools
           });
           
           console.log(`[Chat] Step ${stepNum} tools available: ${allTools.length}`, allTools.map(t => t.name));
@@ -11448,9 +10850,9 @@ When getting DMs from a specific person, use get_slack_messages with their name 
           }
           
           // Add browser automation system prompt
-          if (hasCdpBrowser) {
-            // CDP Browser tools (new architecture)
-            fullSystemPrompt += `\n\n## WEB RESEARCH CAPABILITY - BROWSER TOOLS
+          if (hasBrowserTools) {
+            const stepCredentials = await getAvailableCredentialDomains();
+            let browserStepPrompt = `\n\n## WEB RESEARCH CAPABILITY - BROWSER TOOLS
 
 You have browser automation via browser_* tools:
 - \`browser_navigate\`: Go to URL, returns snapshot with element refs
@@ -11461,31 +10863,20 @@ You have browser automation via browser_* tools:
 - \`browser_scroll\`: Scroll page up/down
 
 **DO NOT SAY you cannot access websites. USE THE BROWSER TOOLS.**`;
-            console.log(`[Chat] Step ${stepNum}: Added CDP browser tools to prompt`);
-          } else if (hasPlaywrightTools) {
-            // Legacy Playwright CLI system prompt
-            const availableCredentials = await getAvailableCredentialDomains();
-            const cliRef = getPlaywrightCliReference(availableCredentials);
-            fullSystemPrompt += `\n\n## WEB RESEARCH CAPABILITY - YOU CAN BROWSE THE INTERNET
-You have FULL browser automation capability. This means:
-- Finding flights → GO TO Google Flights/Kayak and search
-- Finding hotels → GO TO Booking.com/Hotels.com and search  
-- Finding products/prices → GO TO Amazon and search
-- Finding information → GO TO the website and read it
 
-**DO NOT SAY "I cannot access" or "I don't have access to" when asked to find information online.**
-**JUST GO TO THE WEBSITE AND LOOK.** You are capable of browsing like a human.
+            if (stepCredentials.length > 0) {
+              browserStepPrompt += `
 
-### HANDLING CAPTCHA/BOT DETECTION
-If you encounter captcha, bot detection, or access denied:
-- Take a screenshot and inform the user
-- Try alternative websites (e.g., Zillow blocked → try Redfin)
-- Real estate: Zillow → Redfin → Realtor.com
-- Flights: Google Flights → Kayak → Skyscanner
-- Hotels: Google Hotels → Booking.com → Expedia
+**SAVED CREDENTIALS:** ${stepCredentials.join(', ')}
+If logging into these sites, use the saved credentials. **NEVER ask the user for passwords.**`;
+            } else {
+              browserStepPrompt += `
 
-${cliRef}`;
-            console.log(`[Chat] Step ${stepNum}: Added Playwright CLI reference to prompt (${cliRef.length} chars), available creds: ${availableCredentials.join(', ') || 'none'}`);
+**NO SAVED CREDENTIALS.** If login is needed, tell user to add credentials in the Credentials page. **NEVER ask for passwords.**`;
+            }
+            
+            fullSystemPrompt += browserStepPrompt;
+            console.log(`[Chat] Step ${stepNum}: Added browser tools to prompt (credentials: ${stepCredentials.length})`);
           } else {
             console.log(`[Chat] Step ${stepNum}: Browser automation NOT enabled`);
           }
@@ -11516,11 +10907,9 @@ ${cliRef}`;
 4. **Use data from previous steps** - Don't re-fetch what's already available in context.
 
 ## BROWSER AUTOMATION REMINDER:
-${hasCdpBrowser ? `- Use browser_navigate to go to websites - it automatically returns a screenshot
+${hasBrowserTools ? `- Use browser_navigate to go to websites - it automatically returns a screenshot
 - Use browser_snapshot to see the current page state
-- All browser tools return visual snapshots - you can SEE what's on the page` : `- If you open a website and need to SEE what's on the page, **USE \`playwright-cli screenshot\`**
-- The \`snapshot\` command only gives element refs for clicking - it does NOT let you see the page
-- ALWAYS take a screenshot after opening a page if you need to analyze its visual content`}
+- All browser tools return visual snapshots - you can SEE what's on the page` : `- Browser automation is not enabled`}
 
 ${uniqueUrls.length > 0 ? `## URLs available:
 ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
@@ -11537,7 +10926,7 @@ ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
             const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
             let iterationMessages = stepMessages.map(m => ({ role: m.role, content: m.content }));
             
-            for (let iteration = 0; iteration < 15; iteration++) { // Increased from 5 for browser automation
+            for (let iteration = 0; iteration < 20; iteration++) { // Increased for browser automation
               const response = await fetch("https://api.anthropic.com/v1/messages", {
                 method: "POST",
                 headers: {
@@ -11567,59 +10956,6 @@ ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
                 const textBlock = data.content.find(b => b.type === "text");
                 stepResponse = textBlock?.text || "";
                 console.log(`[Chat] Step ${stepNum} completed without tool use, response length: ${stepResponse.length}`);
-                
-                // ─────────────────────────────────────────────────────────────
-                // PLAYWRIGHT CLI COMMAND DETECTION & EXECUTION (inline mode)
-                // ─────────────────────────────────────────────────────────────
-                console.log(`[Chat] Step ${stepNum}: Checking for CLI commands. hasPlaywrightTools=${hasPlaywrightTools}, responseLength=${stepResponse.length}`);
-                console.log(`[Chat] Step ${stepNum}: Response preview: ${stepResponse.substring(0, 500)}`);
-                
-                if (hasPlaywrightTools && stepResponse) {
-                  const cliResult = await executePlaywrightCommandsInText(stepResponse);
-                  console.log(`[Chat] Step ${stepNum}: CLI detection result: hasCommands=${cliResult.hasCommands}, count=${cliResult.commands?.length || 0}`);
-                  
-                  if (cliResult.hasCommands && cliResult.commands.length > 0) {
-                    console.log(`[Chat] Step ${stepNum} detected ${cliResult.commands.length} CLI command(s), executing...`);
-                    
-                    let cliResultSummary = "";
-                    let screenshots = [];
-                    
-                    for (const { command, result } of cliResult.commands) {
-                      const cmdShort = command.replace(/^playwright-cli\s*/, '');
-                      if (result.error) {
-                        cliResultSummary += `\n${cmdShort}: ERROR - ${result.error}`;
-                      } else {
-                        const output = result.output || "";
-                        const truncated = output.length > 4000 ? output.slice(0, 4000) + "...(truncated)" : output;
-                        cliResultSummary += `\n${cmdShort}:\n${truncated}`;
-                        
-                        // Collect screenshots to display in chat
-                        if (result.screenshotPath) {
-                          screenshots.push(result.screenshotPath);
-                        }
-                      }
-                    }
-                    
-                    // Send screenshots to UI for display (as base64 data URLs)
-                    if (screenshots.length > 0 && win && win.webContents) {
-                      for (const screenshotPath of screenshots) {
-                        const dataUrl = await screenshotToDataUrl(screenshotPath);
-                        if (dataUrl) {
-                          win.webContents.send("chat:screenshot", { dataUrl });
-                        }
-                      }
-                    }
-                    
-                    // Add results to context and continue conversation (include screenshots for LLM)
-                    accumulatedContext[`step${stepNum}_cli_results`] = cliResultSummary.slice(0, 3000);
-                    iterationMessages.push({ role: "assistant", content: data.content });
-                    const resultText = `CLI commands executed. Results:\n${cliResultSummary}\n\n${screenshots.length > 0 ? "A screenshot is attached showing the current page state. Analyze it carefully to see what's on screen." : ""}\n\nAnalyze these results and continue.`;
-                    const userMessage = await buildMessageWithScreenshots(resultText, screenshots, "anthropic");
-                    iterationMessages.push(userMessage);
-                    continue; // Continue iteration to let LLM process results
-                  }
-                }
-                
                 break;
               }
 
@@ -11634,15 +10970,47 @@ ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
                 const result = await executeTool(toolUse.name, toolUse.input);
                 console.log(`[Chat] Step ${stepNum} tool ${toolUse.name} result:`, JSON.stringify(result).substring(0, 300));
                 
+                // Handle CDP browser tool screenshots - send to UI for display
+                if (result.screenshotDataUrl && win && !win.isDestroyed()) {
+                  win.webContents.send("chat:screenshot", { dataUrl: result.screenshotDataUrl });
+                }
+                
+                // For browser tools with screenshots, send image to LLM
+                const { screenshotDataUrl, ...resultForLLM } = result;
+                
                 // Truncate large results (especially browser_snapshot) to save tokens
-                const truncatedResult = truncateResult(result, toolUse.name.includes('snapshot') ? 4000 : 3000);
+                const truncatedResult = truncateResult(resultForLLM, toolUse.name.includes('snapshot') ? 4000 : 3000);
                 accumulatedContext[`step${stepNum}_${toolUse.name}`] = truncatedResult;
                 
-                toolResults.push({
-                  type: "tool_result",
-                  tool_use_id: toolUse.id,
-                  content: typeof result === 'string' ? result : JSON.stringify(result)
-                });
+                if (screenshotDataUrl && screenshotDataUrl.startsWith('data:image/')) {
+                  // Extract base64 data from data URL for Anthropic's image format
+                  const base64Match = screenshotDataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
+                  if (base64Match) {
+                    const mediaType = `image/${base64Match[1]}`;
+                    const base64Data = base64Match[2];
+                    
+                    toolResults.push({
+                      type: "tool_result",
+                      tool_use_id: toolUse.id,
+                      content: [
+                        { type: "text", text: JSON.stringify(resultForLLM) },
+                        { type: "image", source: { type: "base64", media_type: mediaType, data: base64Data } }
+                      ]
+                    });
+                  } else {
+                    toolResults.push({
+                      type: "tool_result",
+                      tool_use_id: toolUse.id,
+                      content: JSON.stringify(resultForLLM)
+                    });
+                  }
+                } else {
+                  toolResults.push({
+                    type: "tool_result",
+                    tool_use_id: toolUse.id,
+                    content: JSON.stringify(resultForLLM)
+                  });
+                }
               }
 
               iterationMessages.push({ role: "assistant", content: data.content });
@@ -11661,7 +11029,7 @@ ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
               ...stepMessages.map(m => ({ role: m.role, content: m.content }))
             ];
 
-            for (let iteration = 0; iteration < 15; iteration++) { // Increased from 5 for browser automation
+            for (let iteration = 0; iteration < 20; iteration++) { // Increased for browser automation
               const response = await fetch("https://api.openai.com/v1/chat/completions", {
                 method: "POST",
                 headers: {
@@ -11685,70 +11053,53 @@ ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
 
               if (choice.finish_reason === "stop" || !choice.message.tool_calls) {
                 stepResponse = choice.message.content || "";
-                
-                // PLAYWRIGHT CLI COMMAND DETECTION & EXECUTION (OpenAI inline)
-                if (hasPlaywrightTools && stepResponse) {
-                  const cliResult = await executePlaywrightCommandsInText(stepResponse);
-                  
-                  if (cliResult.hasCommands && cliResult.commands.length > 0) {
-                    console.log(`[Chat] Step ${stepNum} detected ${cliResult.commands.length} CLI command(s)`);
-                    
-                    let cliResultSummary = "";
-                    let screenshots = [];
-                    
-                    for (const { command, result } of cliResult.commands) {
-                      const cmdShort = command.replace(/^playwright-cli\s*/, '');
-                      if (result.error) {
-                        cliResultSummary += `\n${cmdShort}: ERROR - ${result.error}`;
-                      } else {
-                        const output = result.output || "";
-                        const truncated = output.length > 4000 ? output.slice(0, 4000) + "...(truncated)" : output;
-                        cliResultSummary += `\n${cmdShort}:\n${truncated}`;
-                        
-                        // Collect screenshots
-                        if (result.screenshotPath) {
-                          screenshots.push(result.screenshotPath);
-                        }
-                      }
-                    }
-                    
-                    // Send screenshots to UI for display (as base64 data URLs)
-                    if (screenshots.length > 0 && win && win.webContents) {
-                      for (const screenshotPath of screenshots) {
-                        const dataUrl = await screenshotToDataUrl(screenshotPath);
-                        if (dataUrl) {
-                          win.webContents.send("chat:screenshot", { dataUrl });
-                        }
-                      }
-                    }
-                    
-                    accumulatedContext[`step${stepNum}_cli_results`] = cliResultSummary.slice(0, 3000);
-                    iterationMessages.push({ role: "assistant", content: stepResponse });
-                    const resultText = `CLI commands executed. Results:\n${cliResultSummary}\n\n${screenshots.length > 0 ? "A screenshot is attached showing the current page state. Analyze it carefully." : ""}\n\nAnalyze and continue.`;
-                    const userMessage = await buildMessageWithScreenshots(resultText, screenshots, "openai");
-                    iterationMessages.push(userMessage);
-                    continue;
-                  }
-                }
-                
                 break;
               }
 
               iterationMessages.push(choice.message);
 
+              let pendingScreenshots = [];
+              
               for (const toolCall of choice.message.tool_calls) {
                 const toolInput = JSON.parse(toolCall.function.arguments);
                 console.log(`[Chat] Step ${stepNum} tool: ${toolCall.function.name}`);
                 const result = await executeTool(toolCall.function.name, toolInput);
                 
+                // Handle CDP browser tool screenshots - send to UI for display
+                if (result.screenshotDataUrl && win && !win.isDestroyed()) {
+                  win.webContents.send("chat:screenshot", { dataUrl: result.screenshotDataUrl });
+                }
+                
+                // For OpenAI, collect screenshots to add as a user message
+                const { screenshotDataUrl, ...resultForLLM } = result;
+                if (screenshotDataUrl) {
+                  pendingScreenshots.push(screenshotDataUrl);
+                  resultForLLM.screenshotAttached = true;
+                }
+                
                 // Truncate large results to save tokens
-                const truncatedResult = truncateResult(result, toolCall.function.name.includes('snapshot') ? 4000 : 3000);
+                const truncatedResult = truncateResult(resultForLLM, toolCall.function.name.includes('snapshot') ? 4000 : 3000);
                 accumulatedContext[`step${stepNum}_${toolCall.function.name}`] = truncatedResult;
 
                 iterationMessages.push({
                   role: "tool",
                   tool_call_id: toolCall.id,
-                  content: typeof result === 'string' ? result : JSON.stringify(result)
+                  content: typeof resultForLLM === 'string' ? resultForLLM : JSON.stringify(resultForLLM)
+                });
+              }
+              
+              // For OpenAI, add screenshots as a user message (vision models can see these)
+              if (pendingScreenshots.length > 0) {
+                const imageContent = pendingScreenshots.map(dataUrl => ({
+                  type: "image_url",
+                  image_url: { url: dataUrl, detail: "low" }
+                }));
+                iterationMessages.push({
+                  role: "user",
+                  content: [
+                    { type: "text", text: "Browser screenshot attached. Analyze it and continue." },
+                    ...imageContent
+                  ]
                 });
               }
             }

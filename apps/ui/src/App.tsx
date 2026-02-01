@@ -2373,19 +2373,16 @@ function SkillsPage() {
       ]
     },
     {
-      category: "Browser (Playwright CLI)",
+      category: "Browser Automation",
       tools: [
-        { name: "playwright-cli open <url>", desc: "Navigate to a URL (add --headed to show browser)" },
-        { name: "playwright-cli snapshot", desc: "Get page content with element refs (e23, e45, etc.)" },
-        { name: "playwright-cli click <ref>", desc: "Click an element by its ref" },
-        { name: "playwright-cli fill <ref> <text>", desc: "Fill a text input field" },
-        { name: "playwright-cli type <text>", desc: "Type text into focused element" },
-        { name: "playwright-cli press <key>", desc: "Press keyboard key (Enter, Tab, etc.)" },
-        { name: "playwright-cli screenshot", desc: "Take a screenshot of the page" },
-        { name: "playwright-cli select <ref> <val>", desc: "Select dropdown option" },
-        { name: "playwright-cli tab-list", desc: "List open browser tabs" },
-        { name: "playwright-cli tab-new [url]", desc: "Open a new tab" },
-        { name: "playwright-cli check <ref>", desc: "Check a checkbox" },
+        { name: "browser_navigate", desc: "Navigate to a URL and return page snapshot" },
+        { name: "browser_snapshot", desc: "Get current page screenshot and element refs" },
+        { name: "browser_click", desc: "Click an element by its ref (e.g., 'e5')" },
+        { name: "browser_type", desc: "Type text into an input field" },
+        { name: "browser_press", desc: "Press keyboard key (Enter, Tab, etc.)" },
+        { name: "browser_scroll", desc: "Scroll page up or down" },
+        { name: "browser_back", desc: "Navigate back to previous page" },
+        { name: "browser_fill_credential", desc: "Securely fill login form with saved credential" },
       ]
     },
   ];
@@ -2739,12 +2736,10 @@ function IntegrationsPage() {
   const [testingWeather, setTestingWeather] = useState(false);
   const [weatherTestResult, setWeatherTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
 
-  // Playwright (Browser Automation) state
-  const [playwrightEnabled, setPlaywrightEnabled] = useState(false);
-  const [testingPlaywright, setTestingPlaywright] = useState(false);
-  const [playwrightTestResult, setPlaywrightTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
-  const [playwrightBrowser, setPlaywrightBrowser] = useState<string>("chrome");
-  const [availableBrowsers, setAvailableBrowsers] = useState<Array<{ id: string; name: string; installed: boolean }>>([]);
+  // Browser Automation state (CDP-based)
+  const [browserEnabled, setBrowserEnabled] = useState(false);
+  const [testingBrowser, setTestingBrowser] = useState(false);
+  const [browserTestResult, setBrowserTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
 
   useEffect(() => {
     const checkConnections = async () => {
@@ -2765,19 +2760,10 @@ function IntegrationsPage() {
         setWeatherEnabled(weatherResult.enabled);
       }
 
-      // Check Playwright enabled and browser settings
-      const playwrightResult = await window.wovly.integrations.getPlaywrightEnabled();
-      if (playwrightResult.ok) {
-        setPlaywrightEnabled(playwrightResult.enabled);
-        if (playwrightResult.browser) {
-          setPlaywrightBrowser(playwrightResult.browser);
-        }
-      }
-      
-      // Get available browsers
-      const browsersResult = await window.wovly.integrations.getAvailableBrowsers?.();
-      if (browsersResult?.ok && browsersResult.browsers) {
-        setAvailableBrowsers(browsersResult.browsers);
+      // Check browser automation enabled
+      const browserResult = await window.wovly.integrations.getBrowserEnabled?.();
+      if (browserResult?.ok) {
+        setBrowserEnabled(browserResult.enabled);
       }
     };
     checkConnections();
@@ -2833,30 +2819,22 @@ function IntegrationsPage() {
     setSlackTestResult(null);
   };
 
-  const handleTestPlaywright = async () => {
-    setTestingPlaywright(true);
-    setPlaywrightTestResult(null);
-    const result = await window.wovly.integrations.testPlaywright();
-    setPlaywrightTestResult(result);
-    setTestingPlaywright(false);
+  const handleTestBrowser = async () => {
+    setTestingBrowser(true);
+    setBrowserTestResult(null);
+    const result = await window.wovly.integrations.testBrowser?.();
+    setBrowserTestResult(result || { ok: false, message: "Browser test not available" });
+    setTestingBrowser(false);
   };
 
-  const handleTogglePlaywright = async () => {
-    const newValue = !playwrightEnabled;
-    setPlaywrightTestResult(null);
-    const result = await window.wovly.integrations.setPlaywrightEnabled(newValue);
-    if (result.ok) {
-      setPlaywrightEnabled(newValue);
+  const handleToggleBrowser = async () => {
+    const newValue = !browserEnabled;
+    setBrowserTestResult(null);
+    const result = await window.wovly.integrations.setBrowserEnabled?.(newValue);
+    if (result?.ok) {
+      setBrowserEnabled(newValue);
     } else {
-      setPlaywrightTestResult({ ok: false, message: result.error || "Failed to toggle" });
-    }
-  };
-
-  const handleBrowserChange = async (browser: string) => {
-    setPlaywrightBrowser(browser);
-    const result = await window.wovly.integrations.setPlaywrightBrowser?.(browser);
-    if (!result?.ok) {
-      setPlaywrightTestResult({ ok: false, message: result?.error || "Failed to change browser" });
+      setBrowserTestResult({ ok: false, message: result?.error || "Failed to toggle" });
     }
   };
 
@@ -2975,51 +2953,39 @@ function IntegrationsPage() {
         )}
       </div>
 
-      {/* Playwright CLI - Browser Automation */}
+      {/* Browser Automation */}
       <div className="integration-row">
         <div className="integration-icon">
           <PlaywrightIcon size={32} />
         </div>
         <div className="integration-info">
-          <h3>Playwright CLI - Browser Automation</h3>
-          <p>Web navigation, clicking, typing, screenshots. CLI auto-installs on first use.</p>
+          <h3>Browser Automation</h3>
+          <p>Web navigation, clicking, typing, screenshots for researching online.</p>
           <span className="integration-detail no-key">No API key required</span>
-          {playwrightEnabled && availableBrowsers.length > 0 && (
-            <div className="browser-select-row">
-              <label>Browser:</label>
-              <select 
-                value={playwrightBrowser} 
-                onChange={(e) => handleBrowserChange(e.target.value)}
-                className="browser-select"
-              >
-                {availableBrowsers.map(browser => (
-                  <option key={browser.id} value={browser.id}>
-                    {browser.name} {browser.installed ? "" : "(will download)"}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
         </div>
         <div className="integration-status">
-          {playwrightEnabled ? (
+          {browserEnabled ? (
             <>
               <span className="status connected">Enabled</span>
-              <button className="secondary small" onClick={handleTestPlaywright} disabled={testingPlaywright}>
-                {testingPlaywright ? "Testing..." : "Test"}
+              <button 
+                className="secondary small" 
+                onClick={handleTestBrowser} 
+                disabled={testingBrowser}
+              >
+                {testingBrowser ? "Testing..." : "Test"}
               </button>
-              <button className="secondary small" onClick={handleTogglePlaywright}>Disable</button>
+              <button className="secondary small" onClick={handleToggleBrowser}>Disable</button>
             </>
           ) : (
             <>
               <span className="status disconnected">Disabled</span>
-              <button className="primary small" onClick={handleTogglePlaywright}>Enable</button>
+              <button className="primary small" onClick={handleToggleBrowser}>Enable</button>
             </>
           )}
         </div>
-        {playwrightTestResult && (
-          <div className={`test-result ${playwrightTestResult.ok ? "success" : "error"}`}>
-            {playwrightTestResult.ok ? `✓ ${playwrightTestResult.message}` : `✗ ${playwrightTestResult.message}`}
+        {browserTestResult && (
+          <div className={`test-result ${browserTestResult.ok ? "success" : "error"}`}>
+            {browserTestResult.ok ? `✓ ${browserTestResult.message}` : `✗ ${browserTestResult.message}`}
           </div>
         )}
       </div>
@@ -3268,8 +3234,8 @@ function CredentialsPage() {
       )}
 
       <div className="credentials-help">
-        <h4>How to use credentials with Playwright</h4>
-        <p>When Wovly needs to log into a website, it will automatically use your saved credentials. The AI assistant uses secure placeholders like <code>{"{{credential:domain.com:password}}"}</code> which are replaced locally with the actual values - your passwords are never sent to AI providers.</p>
+        <h4>How credentials work</h4>
+        <p>Credentials are stored securely on your device using OS-level encryption. They are used locally for browser automation when logging into websites - your passwords are never sent to AI providers.</p>
       </div>
 
       {/* Add/Edit Modal */}

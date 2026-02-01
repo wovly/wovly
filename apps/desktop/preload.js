@@ -51,17 +51,10 @@ contextBridge.exposeInMainWorld("wovly", {
     disconnectSlack: () => ipcRenderer.invoke("integrations:disconnectSlack"),
     setWeatherEnabled: (enabled) => ipcRenderer.invoke("integrations:setWeatherEnabled", { enabled }),
     getWeatherEnabled: () => ipcRenderer.invoke("integrations:getWeatherEnabled"),
-    // Playwright CLI - Browser Automation
-    setPlaywrightEnabled: (enabled) => ipcRenderer.invoke("integrations:setPlaywrightEnabled", { enabled }),
-    getPlaywrightEnabled: () => ipcRenderer.invoke("integrations:getPlaywrightEnabled"),
-    testPlaywright: () => ipcRenderer.invoke("integrations:testPlaywright"),
-    getAvailableBrowsers: () => ipcRenderer.invoke("integrations:getAvailableBrowsers"),
-    setPlaywrightBrowser: (browser) => ipcRenderer.invoke("integrations:setPlaywrightBrowser", { browser }),
-    getPlaywrightCliReference: () => ipcRenderer.invoke("integrations:getPlaywrightCliReference"),
-    // CDP Browser Engine (new architecture)
-    getBrowserEngine: () => ipcRenderer.invoke("integrations:getBrowserEngine"),
-    setBrowserEngine: (engine) => ipcRenderer.invoke("integrations:setBrowserEngine", { engine }),
-    testCdpBrowser: () => ipcRenderer.invoke("integrations:testCdpBrowser")
+    // Browser Automation (CDP-based)
+    getBrowserEnabled: () => ipcRenderer.invoke("integrations:getBrowserEnabled"),
+    setBrowserEnabled: (enabled) => ipcRenderer.invoke("integrations:setBrowserEnabled", { enabled }),
+    testBrowser: () => ipcRenderer.invoke("integrations:testBrowser")
   },
   profile: {
     get: () => ipcRenderer.invoke("profile:get"),

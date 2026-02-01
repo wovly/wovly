@@ -3256,39 +3256,6 @@ input {
   color: #4a6dff;
 }
 
-.browser-select-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-}
-
-.browser-select-row label {
-  font-size: 0.85rem;
-  color: #666;
-}
-
-.browser-select {
-  padding: 6px 10px;
-  border: 1px solid #ddd;
-  border-radius: 6px;
-  font-size: 0.85rem;
-  background: white;
-  color: #333;
-  cursor: pointer;
-  min-width: 150px;
-}
-
-.browser-select:hover {
-  border-color: #5a4bff;
-}
-
-.browser-select:focus {
-  outline: none;
-  border-color: #5a4bff;
-  box-shadow: 0 0 0 2px rgba(90, 75, 255, 0.1);
-}
-
 .interface-status {
   display: flex;
   align-items: center;

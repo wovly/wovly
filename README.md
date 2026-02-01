@@ -44,6 +44,18 @@ Most AI assistants have amnesia. Wovly remembers, making your communication fast
 
 - **Intelligent Summarization** – Wovly reads your daily logs and condenses them, so it can recall details from a Slack conversation three weeks ago to inform an email draft today.
 
+### 3. Voice Mimic
+
+Wovly learns how you communicate with each person and mimics your voice when drafting messages.
+
+- **Per-Recipient Style Analysis** – Wovly analyzes your past messages to each contact and learns your unique communication patterns: formality level, emoji usage, greeting style, sign-off preferences, and typical message length.
+
+- **Automatic Voice Matching** – When drafting a message to someone you've communicated with before, Wovly automatically applies your learned style. Your email to your boss will sound professional, while your text to your best friend will be casual with your usual emoji patterns.
+
+- **Platform-Aware Tone** – Wovly adjusts tone based on the communication platform. Slack messages tend to be more casual, emails more formal, and texts more personal—just like how you naturally adapt.
+
+- **Continuous Learning** – As you send more messages, Wovly refines its understanding of your voice with each recipient, getting better at matching your style over time.
+
 ---
 
 ## Core Capabilities
@@ -58,7 +70,7 @@ Wovly enables this communication automation through a suite of deep integrations
 | **Slack** | Send messages as yourself (User OAuth), read channels, search DMs |
 | **iMessage** | Native macOS integration to send texts and read threads |
 | **WhatsApp** | Control Wovly remotely from your phone |
-| **Web Automation (Playwright)** | Navigates websites to fill contact forms, scrape data for emails, or take screenshots |
+| **Web Automation (Browser)** | Navigates websites to fill contact forms, scrape data for emails, login to services, or take screenshots |
 
 ### Multi-LLM Support
 
@@ -166,24 +178,23 @@ Go to **Settings** in the app and add your API keys:
 - Grant Wovly access to Contacts when prompted
 - Full Disk Access may be required for reading message history
 
-#### 5. Playwright Browser Automation
+#### 5. Browser Automation
 
-1. Go to **Integrations** → **Playwright - Browser Automation**
+1. Go to **Integrations** → **Browser Automation**
 2. Click **Enable** to start the browser automation service
-3. Select your preferred browser:
-   - **Chromium** (recommended) - Reliable automation browser, auto-installs if needed
-   - **Chrome** - Uses your existing Chrome (may have profile conflicts)
-   - **Firefox** / **Edge** / **WebKit** - Alternative browser engines
+3. Uses Chrome/Chromium via CDP (Chrome DevTools Protocol) for reliable automation
 
-Playwright allows Wovly to:
+Browser automation allows Wovly to:
 - Navigate to any website and extract information
 - Fill out forms and submit data
 - Click buttons and interact with web pages
 - Take screenshots for visual reference
 - Automate multi-step web workflows
+- **Login to websites using saved credentials** (securely stored in the Credentials page)
 
-**Anti-Detection Features:**
-- Automatic browser fallback if the selected browser fails
+**Features:**
+- Visual snapshots with element references for precise interactions
+- Automatic credential filling for saved login credentials
 - Anti-detection browser flags to reduce bot detection
 - Graceful captcha handling with suggestions for alternative sites
 - Session persistence for maintaining login state
@@ -213,13 +224,14 @@ Tasks will:
 6. Notify you of progress and completion in chat
 
 ### Web Automation
-With Playwright enabled, Wovly can interact with any website:
+With Browser Automation enabled, Wovly can interact with any website:
 - Navigate and browse pages
 - Extract text, links, and structured data
 - Fill out forms and submit information
 - Click buttons and interact with UI elements
 - Handle multi-page workflows (login, search, checkout)
 - Take screenshots for documentation
+- **Login to websites using saved credentials** from the Credentials page
 
 ### Skills
 View and edit skills in the **Skills** page. Skills define procedures for:

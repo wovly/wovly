@@ -316,13 +316,10 @@ type WovlyIpcApi = {
     disconnectSlack: () => Promise<{ ok: boolean; error?: string }>;
     setWeatherEnabled: (enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
     getWeatherEnabled: () => Promise<{ ok: boolean; enabled: boolean }>;
-    // Playwright CLI - Browser Automation
-    setPlaywrightEnabled: (enabled: boolean) => Promise<{ ok: boolean; enabled?: boolean; cliInstalled?: boolean; error?: string }>;
-    getPlaywrightEnabled: () => Promise<{ ok: boolean; enabled: boolean; cliInstalled: boolean; browser?: string }>;
-    testPlaywright: () => Promise<{ ok: boolean; message?: string; error?: string }>;
-    getAvailableBrowsers: () => Promise<{ ok: boolean; browsers: Array<{ id: string; name: string; installed: boolean }> }>;
-    setPlaywrightBrowser: (browser: string) => Promise<{ ok: boolean; error?: string }>;
-    getPlaywrightCliReference: () => Promise<{ ok: boolean; reference?: string }>;
+    // Browser Automation (CDP-based)
+    getBrowserEnabled: () => Promise<{ ok: boolean; enabled: boolean }>;
+    setBrowserEnabled: (enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
+    testBrowser: () => Promise<{ ok: boolean; message?: string; screenshot?: string; error?: string }>;
   };
   profile: {
     get: () => Promise<{
