@@ -1,13 +1,14 @@
 import React, { useEffect, useState, useRef, Fragment } from "react";
-import { WovlyIcon, GoogleIcon, IMessageIcon, WeatherIcon, SlackIcon, WhatsAppIcon, TelegramIcon, DiscordIcon, ClaudeIcon, OpenAIIcon, GeminiIcon, PlaywrightIcon, ChatIcon, TasksIcon, SkillsIcon, InterfacesIcon, IntegrationsIcon, SettingsIcon } from "./icons";
+import { WovlyIcon, GoogleIcon, IMessageIcon, WeatherIcon, SlackIcon, WhatsAppIcon, TelegramIcon, DiscordIcon, ClaudeIcon, OpenAIIcon, GeminiIcon, PlaywrightIcon, ChatIcon, TasksIcon, SkillsIcon, AboutMeIcon, InterfacesIcon, IntegrationsIcon, SettingsIcon, CredentialsIcon } from "./icons";
 
-type NavItem = "chat" | "tasks" | "skills" | "interfaces" | "integrations" | "settings";
+type NavItem = "chat" | "tasks" | "skills" | "about-me" | "interfaces" | "integrations" | "credentials" | "settings";
 
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
-  source?: "app" | "whatsapp" | "task"; // Where the message originated from
+  source?: "app" | "whatsapp" | "task" | "decomposed" | "clarification"; // Where the message originated from
+  images?: string[]; // Screenshot paths from browser automation
 };
 
 type CalendarEvent = {
@@ -379,6 +380,30 @@ type DecompositionResult = {
   reason_for_task?: string | null;
 };
 
+// Types for fact confirmation (informational statements)
+type ExtractedFact = {
+  category: string;
+  summary: string;
+  entities: Record<string, string>;
+  subject: string;
+};
+
+type FactConflict = {
+  newFactIndex: number;
+  existingNoteIndex: number;
+  newFact: string;
+  existingNote: string;
+  subject: string;
+  conflictDescription: string;
+};
+
+type PendingFactConfirmation = {
+  facts: ExtractedFact[];
+  conflicts: FactConflict[];
+  originalInput: string;
+  conflictResolutions: { [key: number]: boolean }; // newFactIndex -> keepNew (true) or keepExisting (false)
+};
+
 function ChatPanel({
   messages,
   setMessages,
@@ -399,6 +424,10 @@ function ChatPanel({
   // Query decomposition state
   const [pendingDecomposition, setPendingDecomposition] = useState<DecompositionResult | null>(null);
   const [isCreatingTask, setIsCreatingTask] = useState(false);
+  
+  // Fact confirmation state (for informational statements)
+  const [pendingFactConfirmation, setPendingFactConfirmation] = useState<PendingFactConfirmation | null>(null);
+  const [isSavingFacts, setIsSavingFacts] = useState(false);
 
   // Auto-scroll
   useEffect(() => {
@@ -432,6 +461,28 @@ function ChatPanel({
         }
       }
     });
+    
+    // Listen for screenshots from browser automation
+    const screenshotUnsubscribe = window.wovly.chat.onScreenshot?.((data: { dataUrl: string }) => {
+      if (data.dataUrl) {
+        // Add screenshot as a new message with image (using base64 data URL)
+        setMessages(prev => [...prev, {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: "📸 Browser screenshot:",
+          source: "app",
+          images: [data.dataUrl]
+        }]);
+        
+        // Auto-scroll
+        setTimeout(() => {
+          const chatContainer = document.querySelector('.chat-messages');
+          if (chatContainer) {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+          }
+        }, 100);
+      }
+    });
 
     // Check if WhatsApp sync is ready
     window.wovly.whatsapp.isSyncReady().then(result => {
@@ -448,6 +499,7 @@ function ChatPanel({
     return () => {
       unsubscribe();
       statusUnsubscribe();
+      screenshotUnsubscribe?.();
     };
   }, [setMessages]);
 
@@ -506,21 +558,57 @@ function ChatPanel({
         content: m.content
       }));
 
-      const result = await window.wovly.chat.send(chatHistory);
+      const result = await window.wovly.chat.send(chatHistory) as {
+        ok: boolean;
+        response?: string;
+        error?: string;
+        informationType?: boolean;
+        facts?: ExtractedFact[];
+        conflicts?: FactConflict[];
+        originalInput?: string;
+        suggestTask?: boolean;
+        decomposition?: DecompositionResult;
+        clarification_needed?: boolean;
+        executedInline?: boolean;
+      };
 
       if (result.ok && result.response) {
         const responseText = result.response;
+        
+        // Check if this is an informational statement that needs confirmation
+        if (result.informationType && result.facts && result.facts.length > 0) {
+          // Initialize conflict resolutions - default to keeping new facts
+          const initialResolutions: { [key: number]: boolean } = {};
+          (result.conflicts || []).forEach((conflict) => {
+            initialResolutions[conflict.newFactIndex] = true; // Default to keeping new
+          });
+          
+          setPendingFactConfirmation({
+            facts: result.facts,
+            conflicts: result.conflicts || [],
+            originalInput: result.originalInput || "",
+            conflictResolutions: initialResolutions
+          });
+        }
         
         // Check if this is a task suggestion from query decomposition
         if (result.suggestTask && result.decomposition) {
           setPendingDecomposition(result.decomposition as DecompositionResult);
         }
         
+        // Determine the source type based on response flags
+        let messageSource: "app" | "decomposed" | "clarification" = "app";
+        if (result.clarification_needed) {
+          messageSource = "clarification";
+        } else if (result.executedInline) {
+          messageSource = "decomposed";
+        }
+        
         setMessages(prev => [...prev, {
           id: crypto.randomUUID(),
           role: "assistant" as const,
           content: responseText,
-          source: result.executedInline ? "decomposed" : "app"
+          source: messageSource
         }]);
 
         // Sync AI response to WhatsApp if connected
@@ -564,10 +652,10 @@ function ChatPanel({
         taskType: taskType,
         // For continuous tasks, pass monitoring info
         ...(isContinuous ? {
-          monitoringCondition: pendingDecomposition.monitoring_condition,
-          triggerAction: pendingDecomposition.trigger_action
+          monitoringCondition: pendingDecomposition.monitoring_condition ?? undefined,
+          triggerAction: pendingDecomposition.trigger_action ?? undefined
         } : {
-          successCriteria: pendingDecomposition.success_criteria
+          successCriteria: pendingDecomposition.success_criteria ?? undefined
         }),
         context: {}
       });
@@ -620,11 +708,12 @@ function ChatPanel({
       const result = await window.wovly.chat.executeInline(decomposition, originalMessage);
       
       if (result.ok && result.response) {
+        const responseContent = result.response; // TypeScript narrowing
         setMessages(prev => [...prev, {
           id: crypto.randomUUID(),
-          role: "assistant",
-          content: result.response,
-          source: "decomposed"
+          role: "assistant" as const,
+          content: responseContent,
+          source: "decomposed" as const
         }]);
       } else if (result.error) {
         setError(result.error);
@@ -634,6 +723,68 @@ function ChatPanel({
     } finally {
       setIsLoading(false);
     }
+  };
+
+  // Handle saving facts to profile
+  const handleSaveFacts = async () => {
+    if (!pendingFactConfirmation || !window.wovly) return;
+    
+    setIsSavingFacts(true);
+    try {
+      // Build conflict resolutions for the API
+      const conflictResolutions = pendingFactConfirmation.conflicts.map(conflict => ({
+        newFact: conflict.newFact,
+        existingNote: conflict.existingNote,
+        keepNew: pendingFactConfirmation.conflictResolutions[conflict.newFactIndex] ?? true
+      }));
+      
+      const result = await (window.wovly.profile as {
+        addFacts: (facts: ExtractedFact[], conflictResolutions: Array<{newFact: string; existingNote: string; keepNew: boolean}>) => Promise<{ok: boolean; error?: string}>;
+      }).addFacts(
+        pendingFactConfirmation.facts,
+        conflictResolutions
+      );
+      
+      if (result.ok) {
+        setMessages(prev => [...prev, {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: "✅ I've saved that information to your profile! I'll remember this for our future conversations.",
+          source: "app"
+        }]);
+        setPendingFactConfirmation(null);
+      } else {
+        setError(result.error || "Failed to save facts");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save facts");
+    } finally {
+      setIsSavingFacts(false);
+    }
+  };
+
+  // Handle skipping fact save
+  const handleSkipFacts = () => {
+    setMessages(prev => [...prev, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content: "No problem! I won't save this information. Let me know if you need anything else.",
+      source: "app"
+    }]);
+    setPendingFactConfirmation(null);
+  };
+
+  // Handle conflict resolution toggle
+  const handleConflictResolutionChange = (newFactIndex: number, keepNew: boolean) => {
+    if (!pendingFactConfirmation) return;
+    
+    setPendingFactConfirmation({
+      ...pendingFactConfirmation,
+      conflictResolutions: {
+        ...pendingFactConfirmation.conflictResolutions,
+        [newFactIndex]: keepNew
+      }
+    });
   };
 
   return (
@@ -648,10 +799,24 @@ function ChatPanel({
       </div>
       <div className="chat-body" ref={chatBodyRef}>
         {messages.map(msg => (
-          <div key={msg.id} className={`chat-bubble ${msg.role} ${msg.source === "whatsapp" ? "from-whatsapp" : ""} ${msg.source === "task" ? "from-task" : ""}`}>
+          <div key={msg.id} className={`chat-bubble ${msg.role} ${msg.source === "whatsapp" ? "from-whatsapp" : ""} ${msg.source === "task" ? "from-task" : ""} ${msg.source === "clarification" ? "clarification" : ""}`}>
             {msg.source === "whatsapp" && <span className="source-badge">📱</span>}
             {msg.source === "task" && <span className="source-badge">📋</span>}
+            {msg.source === "clarification" && <span className="source-badge">❓</span>}
             {msg.role === "assistant" ? renderMarkdown(msg.content) : msg.content}
+            {msg.images && msg.images.length > 0 && (
+              <div className="chat-images">
+                {msg.images.map((imgSrc, idx) => (
+                  <img 
+                    key={idx} 
+                    src={imgSrc} 
+                    alt="Browser screenshot" 
+                    className="chat-screenshot"
+                    onClick={() => window.open(imgSrc, '_blank')}
+                  />
+                ))}
+              </div>
+            )}
           </div>
         ))}
         {isLoading && (
@@ -690,6 +855,92 @@ function ChatPanel({
             >
               No, Help Me Directly
             </button>
+          </div>
+        )}
+        
+        {/* Fact Confirmation UI (for informational statements) */}
+        {pendingFactConfirmation && (
+          <div className="fact-confirmation-panel">
+            <div className="fact-confirmation-header">
+              <h4>📝 Save to Profile?</h4>
+              <button 
+                className="fact-confirmation-close"
+                onClick={handleSkipFacts}
+                disabled={isSavingFacts}
+                title="Skip"
+              >
+                ×
+              </button>
+            </div>
+            
+            {/* Conflicts Section */}
+            {pendingFactConfirmation.conflicts.length > 0 && (
+              <div className="fact-conflicts-section">
+                <div className="conflict-warning">⚠️ Conflicts Detected</div>
+                {pendingFactConfirmation.conflicts.map((conflict, idx) => (
+                  <div key={idx} className="fact-conflict-item">
+                    <p className="conflict-description">{conflict.conflictDescription}</p>
+                    <div className="conflict-options">
+                      <label className="conflict-option">
+                        <input
+                          type="radio"
+                          name={`conflict-${idx}`}
+                          checked={!pendingFactConfirmation.conflictResolutions[conflict.newFactIndex]}
+                          onChange={() => handleConflictResolutionChange(conflict.newFactIndex, false)}
+                        />
+                        <span>Keep existing: "{conflict.existingNote}"</span>
+                      </label>
+                      <label className="conflict-option">
+                        <input
+                          type="radio"
+                          name={`conflict-${idx}`}
+                          checked={pendingFactConfirmation.conflictResolutions[conflict.newFactIndex] ?? true}
+                          onChange={() => handleConflictResolutionChange(conflict.newFactIndex, true)}
+                        />
+                        <span>Use new: "{conflict.newFact}"</span>
+                      </label>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            
+            {/* Facts to Save */}
+            <div className="facts-to-save">
+              <div className="facts-label">Facts to save:</div>
+              {pendingFactConfirmation.facts.map((fact, idx) => {
+                const isConflicted = pendingFactConfirmation.conflicts.some(c => c.newFactIndex === idx);
+                const keepNew = pendingFactConfirmation.conflictResolutions[idx] ?? true;
+                return (
+                  <div 
+                    key={idx} 
+                    className={`fact-item ${isConflicted ? (keepNew ? 'will-save' : 'will-skip') : 'will-save'}`}
+                  >
+                    <span className="fact-icon">{isConflicted && !keepNew ? '○' : '✓'}</span>
+                    <span className="fact-text">{fact.summary}</span>
+                    {isConflicted && !keepNew && <span className="fact-status">(keeping existing)</span>}
+                  </div>
+                );
+              })}
+            </div>
+            
+            {/* Action Buttons */}
+            <div className="fact-confirmation-actions">
+              <button 
+                className="primary" 
+                onClick={handleSaveFacts}
+                disabled={isSavingFacts}
+              >
+                {isSavingFacts ? "Saving..." : "Save to Profile"}
+              </button>
+              <button 
+                className="secondary" 
+                onClick={handleSkipFacts}
+                disabled={isSavingFacts}
+              >
+                Skip
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -1409,7 +1660,17 @@ function WhatsAppSetupModal({
 // Tasks Page
 // ─────────────────────────────────────────────────────────────────────────────
 
-type TaskStatus = "pending" | "active" | "waiting" | "completed" | "failed" | "cancelled";
+type TaskStatus = "pending" | "active" | "waiting" | "waiting_approval" | "waiting_for_input" | "completed" | "failed" | "cancelled";
+
+type PendingMessageType = {
+  id: string;
+  toolName: string;
+  platform: string;
+  recipient: string;
+  subject?: string;
+  message: string;
+  created: string;
+};
 
 type TaskType = {
   id: string;
@@ -1418,6 +1679,7 @@ type TaskType = {
   created: string;
   lastUpdated: string;
   nextCheck: number | null;
+  autoSend?: boolean;
   originalRequest: string;
   plan: string[];
   currentStep: {
@@ -1428,6 +1690,7 @@ type TaskType = {
   };
   executionLog: Array<{ timestamp: string; message: string }>;
   contextMemory: Record<string, string>;
+  pendingMessages?: PendingMessageType[];
 };
 
 function TaskEditModal({ taskId, onClose }: { taskId: string; onClose: () => void }) {
@@ -1542,6 +1805,10 @@ function TasksPage() {
   const [editingTask, setEditingTask] = useState<string | null>(null);
   const [executing, setExecuting] = useState<string | null>(null);
   const [, setTick] = useState(0); // Force re-render for countdown updates
+  
+  // Pending message state
+  const [editingMessage, setEditingMessage] = useState<{ taskId: string; messageId: string; content: string } | null>(null);
+  const [sendingMessage, setSendingMessage] = useState<string | null>(null);
 
   const loadTasks = async () => {
     if (!window.wovly) return;
@@ -1557,9 +1824,16 @@ function TasksPage() {
     
     // Subscribe to task updates
     let unsubscribe: (() => void) | undefined;
+    let unsubscribePending: (() => void) | undefined;
+    
     if (window.wovly) {
       unsubscribe = window.wovly.tasks.onUpdate(() => {
         loadTasks(); // Reload tasks on any update
+      });
+      
+      // Subscribe to pending message events
+      unsubscribePending = window.wovly.tasks.onPendingMessage?.(() => {
+        loadTasks(); // Reload tasks when new pending message arrives
       });
     }
     
@@ -1571,6 +1845,7 @@ function TasksPage() {
     
     return () => {
       if (unsubscribe) unsubscribe();
+      if (unsubscribePending) unsubscribePending();
       clearInterval(refreshInterval);
     };
   }, []);
@@ -1603,16 +1878,76 @@ function TasksPage() {
     setExecuting(null);
   };
 
-  const getStatusBadge = (status: TaskStatus) => {
+  // Approve and send a pending message
+  const handleApproveMessage = async (taskId: string, messageId: string) => {
+    if (!window.wovly) return;
+    setSendingMessage(messageId);
+    
+    const editedContent = editingMessage?.messageId === messageId ? editingMessage.content : undefined;
+    const result = await window.wovly.tasks.approvePendingMessage(taskId, messageId, editedContent);
+    
+    if (result.ok) {
+      setEditingMessage(null);
+      await loadTasks();
+    } else {
+      alert(result.error || "Failed to send message");
+    }
+    setSendingMessage(null);
+  };
+
+  // Reject/discard a pending message
+  const handleRejectMessage = async (taskId: string, messageId: string) => {
+    if (!window.wovly) return;
+    if (!confirm("Are you sure you want to discard this message? It will not be sent.")) return;
+    
+    const result = await window.wovly.tasks.rejectPendingMessage(taskId, messageId);
+    if (result.ok) {
+      await loadTasks();
+    } else {
+      alert(result.error || "Failed to discard message");
+    }
+  };
+
+  // Toggle auto-send for a task
+  const handleToggleAutoSend = async (taskId: string, currentValue: boolean) => {
+    if (!window.wovly) return;
+    
+    const newValue = !currentValue;
+    if (newValue && !confirm("Enable auto-send? Future messages from this task will be sent automatically without requiring approval.")) {
+      return;
+    }
+    
+    const result = await window.wovly.tasks.setAutoSend(taskId, newValue);
+    if (result.ok) {
+      await loadTasks();
+    } else {
+      alert(result.error || "Failed to update auto-send setting");
+    }
+  };
+
+  const getStatusBadge = (status: TaskStatus, hasPendingMessages = false) => {
     const badges: Record<TaskStatus, { className: string; label: string }> = {
       pending: { className: "status-pending", label: "Pending" },
       active: { className: "status-active", label: "Active" },
       waiting: { className: "status-waiting", label: "Waiting" },
+      waiting_approval: { className: "status-approval", label: "Needs Approval" },
+      waiting_for_input: { className: "status-input", label: "Needs Input" },
       completed: { className: "status-completed", label: "Completed" },
       failed: { className: "status-failed", label: "Failed" },
       cancelled: { className: "status-cancelled", label: "Cancelled" }
     };
-    const badge = badges[status];
+    const badge = badges[status] || { className: "status-pending", label: status };
+    
+    // Show approval indicator if task has pending messages
+    if (hasPendingMessages || status === "waiting_approval") {
+      return <span className={`status-badge status-approval`}>⚠️ Needs Approval</span>;
+    }
+    
+    // Show input needed indicator
+    if (status === "waiting_for_input") {
+      return <span className={`status-badge status-input`}>❓ Needs Input</span>;
+    }
+    
     return <span className={`status-badge ${badge.className}`}>{badge.label}</span>;
   };
 
@@ -1647,15 +1982,31 @@ function TasksPage() {
       ) : (
         <div className="tasks-list">
           {tasks.map(task => (
-            <div key={task.id} className={`task-card ${expandedTask === task.id ? "expanded" : ""}`}>
+            <div key={task.id} className={`task-card ${expandedTask === task.id ? "expanded" : ""} ${(task.pendingMessages?.length || 0) > 0 ? "has-pending" : ""}`}>
               <div className="task-header" onClick={() => setExpandedTask(expandedTask === task.id ? null : task.id)}>
                 <div className="task-title-row">
                   <span className="expand-icon">{expandedTask === task.id ? "▼" : "▶"}</span>
                   <h3>{task.title}</h3>
-                  {getStatusBadge(task.status)}
+                  {getStatusBadge(task.status, (task.pendingMessages?.length || 0) > 0)}
+                  {/* Quick remove button for completed/failed tasks */}
+                  {(task.status === "completed" || task.status === "failed" || task.status === "cancelled") && (
+                    <button
+                      className="quick-remove-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleHide(task.id);
+                      }}
+                      title="Remove task"
+                    >
+                      ×
+                    </button>
+                  )}
                 </div>
                 <div className="task-meta">
                   Step {task.currentStep.step} of {task.plan.length} • Updated {formatDate(task.lastUpdated)}
+                  {(task.pendingMessages?.length || 0) > 0 && (
+                    <span className="pending-count"> • {task.pendingMessages?.length} message{task.pendingMessages?.length !== 1 ? 's' : ''} awaiting approval</span>
+                  )}
                 </div>
               </div>
 
@@ -1719,6 +2070,96 @@ function TasksPage() {
                       </ul>
                     </div>
                   )}
+
+                  {/* Pending Messages Section */}
+                  {task.pendingMessages && task.pendingMessages.length > 0 && (
+                    <div className="task-section pending-messages-section">
+                      <h4>⚠️ Messages Awaiting Approval</h4>
+                      <div className="pending-messages-list">
+                        {task.pendingMessages.map((msg) => (
+                          <div key={msg.id} className="pending-message-card">
+                            <div className="pending-message-header">
+                              <span className="platform-badge">{msg.platform}</span>
+                              <span className="recipient">To: {msg.recipient}</span>
+                            </div>
+                            {msg.subject && (
+                              <div className="pending-message-subject">
+                                <strong>Subject:</strong> {msg.subject}
+                              </div>
+                            )}
+                            <div className="pending-message-content">
+                              {editingMessage?.messageId === msg.id ? (
+                                <textarea
+                                  className="message-editor"
+                                  value={editingMessage.content}
+                                  onChange={(e) => setEditingMessage({ ...editingMessage, content: e.target.value })}
+                                  rows={4}
+                                />
+                              ) : (
+                                <pre className="message-preview">{msg.message}</pre>
+                              )}
+                            </div>
+                            <div className="pending-message-actions">
+                              {editingMessage?.messageId === msg.id ? (
+                                <>
+                                  <button
+                                    className="secondary small"
+                                    onClick={() => setEditingMessage(null)}
+                                  >
+                                    Cancel Edit
+                                  </button>
+                                  <button
+                                    className="primary small"
+                                    onClick={() => handleApproveMessage(task.id, msg.id)}
+                                    disabled={sendingMessage === msg.id}
+                                  >
+                                    {sendingMessage === msg.id ? "Sending..." : "Send Edited"}
+                                  </button>
+                                </>
+                              ) : (
+                                <>
+                                  <button
+                                    className="secondary small"
+                                    onClick={() => setEditingMessage({ taskId: task.id, messageId: msg.id, content: msg.message })}
+                                  >
+                                    Edit
+                                  </button>
+                                  <button
+                                    className="danger small"
+                                    onClick={() => handleRejectMessage(task.id, msg.id)}
+                                  >
+                                    Discard
+                                  </button>
+                                  <button
+                                    className="primary small"
+                                    onClick={() => handleApproveMessage(task.id, msg.id)}
+                                    disabled={sendingMessage === msg.id}
+                                  >
+                                    {sendingMessage === msg.id ? "Sending..." : "Send"}
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Auto-send Toggle */}
+                  <div className="task-section auto-send-section">
+                    <label className="auto-send-toggle">
+                      <input
+                        type="checkbox"
+                        checked={task.autoSend || false}
+                        onChange={() => handleToggleAutoSend(task.id, task.autoSend || false)}
+                      />
+                      <span className="toggle-label">
+                        Auto-send messages
+                        <span className="toggle-hint">(Skip approval for future messages from this task)</span>
+                      </span>
+                    </label>
+                  </div>
 
                   <div className="task-actions">
                     {(task.status === "pending" || task.status === "active" || task.status === "waiting") && (
@@ -1932,19 +2373,19 @@ function SkillsPage() {
       ]
     },
     {
-      category: "Browser (Playwright)",
+      category: "Browser (Playwright CLI)",
       tools: [
-        { name: "browser_navigate", desc: "Navigate to a URL" },
-        { name: "browser_click", desc: "Click an element on the page" },
-        { name: "browser_type", desc: "Type text into an input field" },
-        { name: "browser_fill", desc: "Clear and fill an input field" },
-        { name: "browser_snapshot", desc: "Get structured page content (accessibility tree)" },
-        { name: "browser_take_screenshot", desc: "Capture a screenshot of the page" },
-        { name: "browser_select_option", desc: "Select an option from a dropdown" },
-        { name: "browser_press_key", desc: "Press a keyboard key" },
-        { name: "browser_wait", desc: "Wait for specified time" },
-        { name: "browser_tabs", desc: "List, create, close, or select browser tabs" },
-        { name: "browser_close", desc: "Close the browser" },
+        { name: "playwright-cli open <url>", desc: "Navigate to a URL (add --headed to show browser)" },
+        { name: "playwright-cli snapshot", desc: "Get page content with element refs (e23, e45, etc.)" },
+        { name: "playwright-cli click <ref>", desc: "Click an element by its ref" },
+        { name: "playwright-cli fill <ref> <text>", desc: "Fill a text input field" },
+        { name: "playwright-cli type <text>", desc: "Type text into focused element" },
+        { name: "playwright-cli press <key>", desc: "Press keyboard key (Enter, Tab, etc.)" },
+        { name: "playwright-cli screenshot", desc: "Take a screenshot of the page" },
+        { name: "playwright-cli select <ref> <val>", desc: "Select dropdown option" },
+        { name: "playwright-cli tab-list", desc: "List open browser tabs" },
+        { name: "playwright-cli tab-new [url]", desc: "Open a new tab" },
+        { name: "playwright-cli check <ref>", desc: "Check a checkbox" },
       ]
     },
   ];
@@ -2534,14 +2975,14 @@ function IntegrationsPage() {
         )}
       </div>
 
-      {/* Playwright - Browser Automation */}
+      {/* Playwright CLI - Browser Automation */}
       <div className="integration-row">
         <div className="integration-icon">
           <PlaywrightIcon size={32} />
         </div>
         <div className="integration-info">
-          <h3>Playwright - Browser Automation</h3>
-          <p>Web navigation, clicking, typing, screenshots</p>
+          <h3>Playwright CLI - Browser Automation</h3>
+          <p>Web navigation, clicking, typing, screenshots. CLI auto-installs on first use.</p>
           <span className="integration-detail no-key">No API key required</span>
           {playwrightEnabled && availableBrowsers.length > 0 && (
             <div className="browser-select-row">
@@ -2639,6 +3080,430 @@ const GOOGLE_MODELS = [
   { id: "gemini-1.5-flash", name: "Gemini 1.5 Flash (Fast)" },
   { id: "gemini-pro", name: "Gemini Pro" },
 ];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Credentials Page - Secure local storage for website logins
+// ─────────────────────────────────────────────────────────────────────────────
+
+function CredentialsPage() {
+  const [credentials, setCredentials] = useState<CredentialListItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [editingDomain, setEditingDomain] = useState<string | null>(null);
+  const [showPassword, setShowPassword] = useState<Record<string, boolean>>({});
+  
+  // Form state for add/edit modal
+  const [formDomain, setFormDomain] = useState("");
+  const [formDisplayName, setFormDisplayName] = useState("");
+  const [formUsername, setFormUsername] = useState("");
+  const [formPassword, setFormPassword] = useState("");
+  const [formNotes, setFormNotes] = useState("");
+  const [showFormPassword, setShowFormPassword] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  // Load credentials on mount
+  useEffect(() => {
+    loadCredentials();
+  }, []);
+
+  const loadCredentials = async () => {
+    if (!window.wovly) return;
+    setLoading(true);
+    setError(null);
+    
+    try {
+      const result = await window.wovly.credentials.list();
+      if (result.ok && result.credentials) {
+        setCredentials(result.credentials);
+      } else {
+        setError(result.error || "Failed to load credentials");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load credentials");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAdd = () => {
+    setEditingDomain(null);
+    setFormDomain("");
+    setFormDisplayName("");
+    setFormUsername("");
+    setFormPassword("");
+    setFormNotes("");
+    setShowFormPassword(false);
+    setShowAddModal(true);
+  };
+
+  const handleEdit = async (domain: string) => {
+    if (!window.wovly) return;
+    
+    try {
+      const result = await window.wovly.credentials.get(domain, true);
+      if (result.ok && result.credential) {
+        const cred = result.credential as WovlyCredential;
+        setEditingDomain(domain);
+        setFormDomain(cred.domain);
+        setFormDisplayName(cred.displayName);
+        setFormUsername(cred.username);
+        setFormPassword(cred.password || "");
+        setFormNotes(cred.notes);
+        setShowFormPassword(false);
+        setShowAddModal(true);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load credential");
+    }
+  };
+
+  const handleSave = async () => {
+    if (!window.wovly || !formDomain.trim()) return;
+    
+    setSaving(true);
+    setError(null);
+    
+    try {
+      const result = await window.wovly.credentials.save({
+        domain: formDomain.trim(),
+        displayName: formDisplayName.trim() || undefined,
+        username: formUsername.trim() || undefined,
+        password: formPassword || undefined,
+        notes: formNotes.trim() || undefined
+      });
+      
+      if (result.ok) {
+        setShowAddModal(false);
+        await loadCredentials();
+      } else {
+        setError(result.error || "Failed to save credential");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save credential");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async (domain: string) => {
+    if (!window.wovly) return;
+    
+    if (!confirm(`Delete credentials for ${domain}? This cannot be undone.`)) {
+      return;
+    }
+    
+    try {
+      const result = await window.wovly.credentials.delete(domain);
+      if (result.ok) {
+        await loadCredentials();
+      } else {
+        setError(result.error || "Failed to delete credential");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete credential");
+    }
+  };
+
+  const togglePasswordVisibility = (domain: string) => {
+    setShowPassword(prev => ({ ...prev, [domain]: !prev[domain] }));
+  };
+
+  return (
+    <div className="credentials-page">
+      <div className="page-header">
+        <div>
+          <h1>Credentials</h1>
+          <p className="page-subtitle">Securely stored website logins for browser automation. Credentials are encrypted locally and never sent to AI providers.</p>
+        </div>
+        <button className="primary" onClick={handleAdd}>
+          + Add Credential
+        </button>
+      </div>
+
+      {error && <div className="credentials-error">{error}</div>}
+
+      {loading ? (
+        <div className="credentials-loading">Loading credentials...</div>
+      ) : credentials.length === 0 ? (
+        <div className="credentials-empty">
+          <div className="empty-icon">🔐</div>
+          <h3>No credentials saved</h3>
+          <p>Add website credentials to enable automatic login during browser automation.</p>
+          <button className="primary" onClick={handleAdd}>Add Your First Credential</button>
+        </div>
+      ) : (
+        <div className="credentials-list">
+          {credentials.map((cred) => (
+            <div key={cred.domain} className="credential-row">
+              <div className="credential-icon">🔐</div>
+              <div className="credential-info">
+                <div className="credential-domain">{cred.displayName || cred.domain}</div>
+                <div className="credential-username">{cred.username || "(no username)"}</div>
+                {cred.hasPassword && (
+                  <div className="credential-password">
+                    {showPassword[cred.domain] ? "••••••••" : "Password saved"}
+                    <button 
+                      className="show-password-btn"
+                      onClick={() => togglePasswordVisibility(cred.domain)}
+                    >
+                      {showPassword[cred.domain] ? "Hide" : "Show"}
+                    </button>
+                  </div>
+                )}
+                {cred.notes && <div className="credential-notes">{cred.notes}</div>}
+                {cred.lastUsed && (
+                  <div className="credential-last-used">
+                    Last used: {new Date(cred.lastUsed).toLocaleDateString()}
+                  </div>
+                )}
+              </div>
+              <div className="credential-actions">
+                <button className="secondary small" onClick={() => handleEdit(cred.domain)}>Edit</button>
+                <button className="danger small" onClick={() => handleDelete(cred.domain)}>Delete</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="credentials-help">
+        <h4>How to use credentials with Playwright</h4>
+        <p>When Wovly needs to log into a website, it will automatically use your saved credentials. The AI assistant uses secure placeholders like <code>{"{{credential:domain.com:password}}"}</code> which are replaced locally with the actual values - your passwords are never sent to AI providers.</p>
+      </div>
+
+      {/* Add/Edit Modal */}
+      {showAddModal && (
+        <div className="modal-overlay" onClick={() => setShowAddModal(false)}>
+          <div className="modal credential-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>{editingDomain ? "Edit Credential" : "Add Credential"}</h2>
+              <button className="modal-close" onClick={() => setShowAddModal(false)}>×</button>
+            </div>
+            <div className="modal-body">
+              <div className="form-group">
+                <label>Website Domain *</label>
+                <input
+                  type="text"
+                  value={formDomain}
+                  onChange={e => setFormDomain(e.target.value)}
+                  placeholder="e.g., amazon.com"
+                  disabled={!!editingDomain}
+                />
+                <span className="form-hint">The website domain this credential is for</span>
+              </div>
+              
+              <div className="form-group">
+                <label>Display Name</label>
+                <input
+                  type="text"
+                  value={formDisplayName}
+                  onChange={e => setFormDisplayName(e.target.value)}
+                  placeholder="e.g., Amazon Shopping"
+                />
+              </div>
+              
+              <div className="form-group">
+                <label>Username / Email</label>
+                <input
+                  type="text"
+                  value={formUsername}
+                  onChange={e => setFormUsername(e.target.value)}
+                  placeholder="e.g., user@email.com"
+                />
+              </div>
+              
+              <div className="form-group">
+                <label>Password</label>
+                <div className="password-input-wrapper">
+                  <input
+                    type={showFormPassword ? "text" : "password"}
+                    value={formPassword}
+                    onChange={e => setFormPassword(e.target.value)}
+                    placeholder={editingDomain ? "(unchanged)" : "Enter password"}
+                  />
+                  <button 
+                    type="button"
+                    className="password-toggle"
+                    onClick={() => setShowFormPassword(!showFormPassword)}
+                  >
+                    {showFormPassword ? "Hide" : "Show"}
+                  </button>
+                </div>
+                <span className="form-hint">Encrypted locally using OS-level security</span>
+              </div>
+              
+              <div className="form-group">
+                <label>Notes (optional)</label>
+                <textarea
+                  value={formNotes}
+                  onChange={e => setFormNotes(e.target.value)}
+                  placeholder="e.g., Work account, 2FA enabled"
+                  rows={2}
+                />
+              </div>
+
+              {error && <div className="form-error">{error}</div>}
+            </div>
+            <div className="modal-footer">
+              <button className="secondary" onClick={() => setShowAddModal(false)}>Cancel</button>
+              <button 
+                className="primary" 
+                onClick={handleSave}
+                disabled={saving || !formDomain.trim()}
+              >
+                {saving ? "Saving..." : "Save Credential"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// About Me Page - Profile Viewer/Editor
+// ─────────────────────────────────────────────────────────────────────────────
+
+function AboutMePage() {
+  const [markdown, setMarkdown] = useState("");
+  const [isEditing, setIsEditing] = useState(false);
+  const [editedMarkdown, setEditedMarkdown] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const loadProfile = async () => {
+      setLoading(true);
+      try {
+        const profileApi = window.wovly.profile as {
+          getMarkdown: () => Promise<{ok: boolean; markdown?: string; error?: string}>;
+        };
+        const result = await profileApi.getMarkdown();
+        if (result.ok && result.markdown !== undefined) {
+          setMarkdown(result.markdown);
+          setEditedMarkdown(result.markdown);
+        } else {
+          setError(result.error || "Failed to load profile");
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to load profile");
+      } finally {
+        setLoading(false);
+      }
+    };
+    loadProfile();
+  }, []);
+
+  const handleSave = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      const profileApi = window.wovly.profile as {
+        saveMarkdown: (markdown: string) => Promise<{ok: boolean; error?: string}>;
+      };
+      const result = await profileApi.saveMarkdown(editedMarkdown);
+      if (result.ok) {
+        setMarkdown(editedMarkdown);
+        setIsEditing(false);
+      } else {
+        setError(result.error || "Failed to save profile");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save profile");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleCancel = () => {
+    setIsEditing(false);
+    setEditedMarkdown(markdown);
+  };
+
+  if (loading) {
+    return (
+      <div className="about-me-page">
+        <div className="loading-state">Loading profile...</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="about-me-page">
+      {/* Important Description Header */}
+      <div className="about-me-header">
+        <h1>About Me</h1>
+        <div className="about-me-description">
+          <p><strong>This is your personal profile that Wovly uses to understand you better.</strong></p>
+          <p>
+            The information here helps me remember important details about your life, 
+            relationships, preferences, and context. The more I know about you, the 
+            better I can assist you with personalized responses and actions.
+          </p>
+          <p className="important-note">
+            🔒 This file is stored locally on your device and is never shared. 
+            Keep it updated with information you want me to remember!
+          </p>
+        </div>
+      </div>
+
+      {/* Error display */}
+      {error && (
+        <div className="error-banner">
+          {error}
+        </div>
+      )}
+
+      {/* View/Edit Toggle */}
+      <div className="about-me-actions">
+        {isEditing ? (
+          <>
+            <button 
+              className="btn-primary" 
+              onClick={handleSave} 
+              disabled={saving}
+            >
+              {saving ? "Saving..." : "Save"}
+            </button>
+            <button 
+              className="btn-secondary" 
+              onClick={handleCancel}
+              disabled={saving}
+            >
+              Cancel
+            </button>
+          </>
+        ) : (
+          <button 
+            className="btn-primary" 
+            onClick={() => setIsEditing(true)}
+          >
+            Edit Profile
+          </button>
+        )}
+      </div>
+
+      {/* Content Area */}
+      <div className="about-me-content">
+        {isEditing ? (
+          <textarea
+            value={editedMarkdown}
+            onChange={(e) => setEditedMarkdown(e.target.value)}
+            className="profile-editor"
+            placeholder="Enter your profile information in markdown format..."
+          />
+        ) : (
+          <div className="profile-viewer">
+            <pre>{markdown || "No profile information yet. Click 'Edit Profile' to add your information."}</pre>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 type LLMProvider = "anthropic" | "openai" | "google";
 
@@ -2844,6 +3709,157 @@ function SettingsPage() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Message Confirmation Modal - Requires user approval before sending messages
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface MessageConfirmation {
+  confirmationId: string;
+  toolName: string;
+  preview: {
+    type: string;
+    platform: string;
+    recipient: string;
+    subject?: string;
+    message: string;
+    cc?: string;
+  };
+}
+
+function MessageConfirmationModal({ 
+  confirmation, 
+  onApprove, 
+  onReject 
+}: { 
+  confirmation: MessageConfirmation;
+  onApprove: () => void;
+  onReject: () => void;
+}) {
+  const { preview } = confirmation;
+  
+  const getPlatformIcon = () => {
+    switch (confirmation.toolName) {
+      case 'send_email': return '📧';
+      case 'send_imessage': return '💬';
+      case 'send_slack_message': return '💼';
+      default: return '📤';
+    }
+  };
+
+  return (
+    <div className="modal-overlay" style={{ zIndex: 9999 }}>
+      <div className="modal confirmation-modal" style={{ maxWidth: '600px' }}>
+        <div className="modal-header" style={{ 
+          display: 'flex', 
+          alignItems: 'center', 
+          gap: '12px',
+          borderBottom: '1px solid var(--border-color)',
+          paddingBottom: '16px',
+          marginBottom: '16px'
+        }}>
+          <span style={{ fontSize: '32px' }}>{getPlatformIcon()}</span>
+          <div>
+            <h2 style={{ margin: 0, fontSize: '18px' }}>Confirm Message</h2>
+            <p style={{ margin: '4px 0 0 0', color: 'var(--text-secondary)', fontSize: '14px' }}>
+              {preview.platform}
+            </p>
+          </div>
+        </div>
+        
+        <div className="confirmation-content" style={{ marginBottom: '20px' }}>
+          <div style={{ 
+            background: 'var(--bg-secondary)', 
+            borderRadius: '8px', 
+            padding: '16px',
+            marginBottom: '16px'
+          }}>
+            <div style={{ marginBottom: '12px' }}>
+              <strong style={{ color: 'var(--text-secondary)', fontSize: '12px', textTransform: 'uppercase' }}>
+                To:
+              </strong>
+              <p style={{ margin: '4px 0 0 0', fontSize: '15px' }}>{preview.recipient}</p>
+            </div>
+            
+            {preview.subject && (
+              <div style={{ marginBottom: '12px' }}>
+                <strong style={{ color: 'var(--text-secondary)', fontSize: '12px', textTransform: 'uppercase' }}>
+                  Subject:
+                </strong>
+                <p style={{ margin: '4px 0 0 0', fontSize: '15px' }}>{preview.subject}</p>
+              </div>
+            )}
+            
+            {preview.cc && (
+              <div style={{ marginBottom: '12px' }}>
+                <strong style={{ color: 'var(--text-secondary)', fontSize: '12px', textTransform: 'uppercase' }}>
+                  CC:
+                </strong>
+                <p style={{ margin: '4px 0 0 0', fontSize: '15px' }}>{preview.cc}</p>
+              </div>
+            )}
+            
+            <div>
+              <strong style={{ color: 'var(--text-secondary)', fontSize: '12px', textTransform: 'uppercase' }}>
+                Message:
+              </strong>
+              <p style={{ 
+                margin: '8px 0 0 0', 
+                fontSize: '14px',
+                whiteSpace: 'pre-wrap',
+                lineHeight: '1.5',
+                maxHeight: '300px',
+                overflow: 'auto'
+              }}>
+                {preview.message}
+              </p>
+            </div>
+          </div>
+          
+          <p style={{ 
+            color: 'var(--text-secondary)', 
+            fontSize: '13px',
+            margin: 0,
+            textAlign: 'center'
+          }}>
+            This message will be sent immediately upon approval.
+          </p>
+        </div>
+        
+        <div className="modal-actions" style={{ 
+          display: 'flex', 
+          gap: '12px',
+          justifyContent: 'flex-end'
+        }}>
+          <button 
+            onClick={onReject}
+            className="btn btn-secondary"
+            style={{ 
+              padding: '10px 24px',
+              borderRadius: '8px',
+              fontSize: '14px'
+            }}
+          >
+            Cancel
+          </button>
+          <button 
+            onClick={onApprove}
+            className="btn btn-primary"
+            style={{ 
+              padding: '10px 24px',
+              borderRadius: '8px',
+              fontSize: '14px',
+              background: '#10b981',
+              color: 'white'
+            }}
+          >
+            ✓ Send Message
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main App
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2853,6 +3869,34 @@ export default function App() {
   // Chat state lifted for persistence across navigation
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInitialized, setChatInitialized] = useState(false);
+  
+  // Message confirmation state
+  const [pendingConfirmation, setPendingConfirmation] = useState<MessageConfirmation | null>(null);
+  
+  // Subscribe to message confirmation requests
+  useEffect(() => {
+    const unsubscribe = window.wovly.messageConfirmation?.onConfirmationRequired((data) => {
+      console.log('[UI] Message confirmation required:', data);
+      setPendingConfirmation(data);
+    });
+    return () => unsubscribe?.();
+  }, []);
+  
+  const handleConfirmationApprove = async () => {
+    if (pendingConfirmation) {
+      console.log('[UI] User approved message:', pendingConfirmation.confirmationId);
+      await window.wovly.messageConfirmation.approve(pendingConfirmation.confirmationId);
+      setPendingConfirmation(null);
+    }
+  };
+  
+  const handleConfirmationReject = async () => {
+    if (pendingConfirmation) {
+      console.log('[UI] User rejected message:', pendingConfirmation.confirmationId);
+      await window.wovly.messageConfirmation.reject(pendingConfirmation.confirmationId, 'User cancelled');
+      setPendingConfirmation(null);
+    }
+  };
 
   return (
     <div className="app-shell">
@@ -2887,6 +3931,14 @@ export default function App() {
           </li>
           <li>
             <button
+              className={`nav-btn ${navItem === "about-me" ? "active" : ""}`}
+              onClick={() => setNavItem("about-me")}
+            >
+              <AboutMeIcon size={18} /> About Me
+            </button>
+          </li>
+          <li>
+            <button
               className={`nav-btn ${navItem === "interfaces" ? "active" : ""}`}
               onClick={() => setNavItem("interfaces")}
             >
@@ -2899,6 +3951,14 @@ export default function App() {
               onClick={() => setNavItem("integrations")}
             >
               <IntegrationsIcon size={18} /> Integrations
+            </button>
+          </li>
+          <li>
+            <button
+              className={`nav-btn ${navItem === "credentials" ? "active" : ""}`}
+              onClick={() => setNavItem("credentials")}
+            >
+              <CredentialsIcon size={18} /> Credentials
             </button>
           </li>
           <li>
@@ -2926,10 +3986,21 @@ export default function App() {
         )}
         {navItem === "tasks" && <TasksPage />}
         {navItem === "skills" && <SkillsPage />}
+        {navItem === "about-me" && <AboutMePage />}
         {navItem === "interfaces" && <InterfacesPage />}
         {navItem === "integrations" && <IntegrationsPage />}
+        {navItem === "credentials" && <CredentialsPage />}
         {navItem === "settings" && <SettingsPage />}
       </main>
+      
+      {/* Message Confirmation Modal - Requires approval before sending any message */}
+      {pendingConfirmation && (
+        <MessageConfirmationModal
+          confirmation={pendingConfirmation}
+          onApprove={handleConfirmationApprove}
+          onReject={handleConfirmationReject}
+        />
+      )}
     </div>
   );
 }

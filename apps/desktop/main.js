@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, ipcMain, safeStorage } = require("electron");
 const path = require("path");
 const fs = require("fs/promises");
 const os = require("os");
@@ -6,290 +6,894 @@ const http = require("http");
 const { URL, URLSearchParams } = require("url");
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
 const QRCode = require("qrcode");
-const { spawn } = require("child_process");
+const { spawn, exec, execSync } = require("child_process");
 
 let win;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Playwright MCP State
+// Message Confirmation System - Requires user approval before sending messages
 // ─────────────────────────────────────────────────────────────────────────────
-let playwrightMcpProcess = null;
-let playwrightMcpClient = null;
-let playwrightTools = [];
-let playwrightEnabled = false;
-let playwrightRequestId = 0;
-let playwrightPendingRequests = new Map(); // Map of requestId -> { resolve, reject }
+const pendingConfirmations = new Map(); // confirmationId -> { resolve, reject, details }
+let confirmationIdCounter = 0;
 
-// MCP JSON-RPC message parser state
-let playwrightMcpBuffer = "";
+// Tools that require user confirmation before execution
+const TOOLS_REQUIRING_CONFIRMATION = [
+  'send_email',
+  'send_imessage', 
+  'send_slack_message'
+];
 
 /**
- * Start the Playwright MCP server process and establish connection
+ * Build a human-readable preview for a message tool
  */
-async function startPlaywrightMcp(options = {}) {
-  if (playwrightMcpProcess) {
-    console.log("[Playwright MCP] Already running");
-    return true;
+function buildMessagePreview(toolName, toolInput) {
+  const preview = {
+    type: toolName.replace('send_', '').replace('_', ' '),
+    recipient: '',
+    subject: '',
+    message: '',
+    platform: ''
+  };
+  
+  switch (toolName) {
+    case 'send_email':
+      preview.platform = 'Email (Gmail)';
+      preview.recipient = toolInput.to;
+      preview.subject = toolInput.subject || '(no subject)';
+      preview.message = toolInput.body;
+      if (toolInput.cc) preview.cc = toolInput.cc;
+      break;
+    case 'send_imessage':
+      preview.platform = 'iMessage / SMS';
+      preview.recipient = toolInput.recipient;
+      preview.message = toolInput.message;
+      break;
+    case 'send_slack_message':
+      preview.platform = 'Slack';
+      preview.recipient = toolInput.channel;
+      preview.message = toolInput.message || toolInput.text;
+      break;
   }
+  
+  return preview;
+}
 
-  console.log("[Playwright MCP] Starting server...");
+/**
+ * Request user confirmation for a message before sending
+ * @param {string} toolName - The tool being called
+ * @param {Object} toolInput - The tool input parameters
+ * @param {Object} taskContext - Optional task context { taskId, autoSend }
+ * @returns {Promise<boolean|Object>} - true if approved, throws if rejected, or {pendingInTask: true} if stored in task
+ */
+async function requestMessageConfirmation(toolName, toolInput, taskContext = null) {
+  const confirmationId = `confirm_${++confirmationIdCounter}_${Date.now()}`;
+  const preview = buildMessagePreview(toolName, toolInput);
+  
+  console.log(`[Confirmation] Requesting approval for ${toolName} to ${preview.recipient}`);
+  
+  // If we're in a task context, check for auto-send or store as pending
+  if (taskContext && taskContext.taskId) {
+    // If task has auto-send enabled, skip confirmation
+    if (taskContext.autoSend) {
+      console.log(`[Confirmation] Task ${taskContext.taskId} has auto-send enabled, skipping confirmation`);
+      return true;
+    }
+    
+    // Otherwise, store the pending message in the task
+    console.log(`[Confirmation] Storing pending message in task ${taskContext.taskId}`);
+    
+    const pendingMessage = {
+      id: confirmationId,
+      toolName,
+      platform: preview.platform,
+      recipient: preview.recipient,
+      subject: preview.subject || '',
+      message: preview.message,
+      created: new Date().toISOString(),
+      toolInput: JSON.stringify(toolInput) // Store original input for execution
+    };
+    
+    // Add pending message to task
+    await addPendingMessageToTask(taskContext.taskId, pendingMessage);
+    
+    // Notify UI about the pending message
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('task:pendingMessage', {
+        taskId: taskContext.taskId,
+        message: pendingMessage
+      });
+    }
+    
+    // Return special object indicating message is pending in task
+    return { pendingInTask: true, taskId: taskContext.taskId, messageId: confirmationId };
+  }
+  
+  // Standard flow - show modal for immediate confirmation
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('message:confirmationRequired', {
+      confirmationId,
+      toolName,
+      preview
+    });
+  } else {
+    console.error('[Confirmation] No window available for confirmation');
+    throw new Error('Cannot send message: No UI available for confirmation');
+  }
+  
+  // Wait for user response (with timeout)
+  return new Promise((resolve, reject) => {
+    const timeoutMs = 5 * 60 * 1000; // 5 minute timeout
+    
+    const timeout = setTimeout(() => {
+      pendingConfirmations.delete(confirmationId);
+      reject(new Error('Message confirmation timed out. User did not respond within 5 minutes.'));
+    }, timeoutMs);
+    
+    pendingConfirmations.set(confirmationId, {
+      resolve: (approved) => {
+        clearTimeout(timeout);
+        pendingConfirmations.delete(confirmationId);
+        resolve(approved);
+      },
+      reject: (reason) => {
+        clearTimeout(timeout);
+        pendingConfirmations.delete(confirmationId);
+        reject(reason);
+      },
+      details: { toolName, toolInput, preview }
+    });
+  });
+}
+
+/**
+ * Add a pending message to a task
+ */
+async function addPendingMessageToTask(taskId, pendingMessage) {
+  const task = await getTask(taskId);
+  if (!task) {
+    throw new Error(`Task ${taskId} not found`);
+  }
+  
+  // Initialize pendingMessages if needed
+  if (!task.pendingMessages) {
+    task.pendingMessages = [];
+  }
+  
+  task.pendingMessages.push(pendingMessage);
+  task.status = "waiting_approval"; // New status indicating message needs approval
+  task.lastUpdated = new Date().toISOString();
+  
+  // Save the task
+  const tasksDir = await getTasksDir();
+  const taskPath = path.join(tasksDir, `${taskId}.md`);
+  await fs.writeFile(taskPath, serializeTask(task), "utf8");
+  
+  // Notify about the update
+  addTaskUpdate(taskId, `Message pending approval: ${pendingMessage.platform} to ${pendingMessage.recipient}`);
+  
+  console.log(`[Confirmation] Pending message added to task ${taskId}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Playwright CLI State (replacing MCP for better token efficiency)
+// ─────────────────────────────────────────────────────────────────────────────
+let playwrightCliInstalled = null; // null = unknown, true/false = checked
+let playwrightEnabled = false;
+// Default to "chromium" - Playwright's bundled browser that won't conflict with running Chrome
+// "chrome" option requires Chrome to be closed since it locks its profile
+let playwrightBrowser = "chromium";
+let playwrightSession = "wovly-default";
+
+/**
+ * Check if Playwright CLI is installed
+ */
+function checkPlaywrightCliInstalled() {
+  if (playwrightCliInstalled !== null) {
+    return playwrightCliInstalled;
+  }
   
   try {
-    const args = ["@playwright/mcp@latest"];
-    
-    // Add options
-    if (options.headless) {
-      args.push("--headless");
-    }
-    if (options.browser) {
-      args.push("--browser", options.browser);
-    }
-
-    playwrightMcpProcess = spawn("npx", args, {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env }
-    });
-
-    playwrightMcpBuffer = "";
-
-    // Handle stdout (MCP responses)
-    playwrightMcpProcess.stdout.on("data", (data) => {
-      playwrightMcpBuffer += data.toString();
-      
-      // Try to parse complete JSON-RPC messages (newline delimited)
-      const lines = playwrightMcpBuffer.split("\n");
-      playwrightMcpBuffer = lines.pop() || ""; // Keep incomplete line in buffer
-      
-      for (const line of lines) {
-        if (line.trim()) {
-          try {
-            const message = JSON.parse(line);
-            handlePlaywrightMcpMessage(message);
-          } catch (e) {
-            // Not valid JSON, might be log output
-            console.log("[Playwright MCP stdout]", line);
-          }
-        }
-      }
-    });
-
-    // Handle stderr
-    playwrightMcpProcess.stderr.on("data", (data) => {
-      const msg = data.toString().trim();
-      if (msg) {
-        console.log("[Playwright MCP stderr]", msg);
-      }
-    });
-
-    // Handle process exit
-    playwrightMcpProcess.on("close", (code) => {
-      console.log(`[Playwright MCP] Process exited with code ${code}`);
-      playwrightMcpProcess = null;
-      playwrightMcpClient = null;
-      playwrightTools = [];
-      
-      // Reject any pending requests
-      for (const [id, { reject }] of playwrightPendingRequests) {
-        reject(new Error("MCP process closed"));
-      }
-      playwrightPendingRequests.clear();
-    });
-
-    playwrightMcpProcess.on("error", (err) => {
-      console.error("[Playwright MCP] Process error:", err);
-      playwrightMcpProcess = null;
-    });
-
-    // Wait a moment for the process to start
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    // Initialize the MCP connection
-    await sendPlaywrightMcpRequest("initialize", {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: {
-        name: "wovly-assistant",
-        version: "1.0.0"
-      }
-    });
-
-    // Send initialized notification
-    sendPlaywrightMcpNotification("notifications/initialized", {});
-
-    // Discover available tools
-    await discoverPlaywrightTools();
-
-    console.log(`[Playwright MCP] Started successfully with ${playwrightTools.length} tools`);
-    playwrightEnabled = true;
+    execSync('playwright-cli --version', { stdio: 'ignore' });
+    playwrightCliInstalled = true;
+    console.log("[Playwright CLI] Found installed");
     return true;
-  } catch (error) {
-    console.error("[Playwright MCP] Failed to start:", error);
-    await stopPlaywrightMcp();
+  } catch {
+    playwrightCliInstalled = false;
+    console.log("[Playwright CLI] Not installed");
     return false;
   }
 }
 
 /**
- * Stop the Playwright MCP server process
+ * Auto-install Playwright CLI if not present
  */
-async function stopPlaywrightMcp() {
-  if (playwrightMcpProcess) {
-    console.log("[Playwright MCP] Stopping server...");
-    playwrightMcpProcess.kill();
-    playwrightMcpProcess = null;
+async function ensurePlaywrightCliInstalled() {
+  if (checkPlaywrightCliInstalled()) {
+    return true;
   }
-  playwrightMcpClient = null;
-  playwrightTools = [];
-  playwrightEnabled = false;
-  playwrightPendingRequests.clear();
+  
+  console.log("[Playwright CLI] Not found, installing automatically...");
+  
+  return new Promise((resolve) => {
+    exec('npm install -g @playwright/cli@latest', { timeout: 120000 }, (error, stdout, stderr) => {
+      if (error) {
+        console.error("[Playwright CLI] Auto-install failed:", stderr || error.message);
+        resolve(false);
+      } else {
+        console.log("[Playwright CLI] Installed successfully");
+        playwrightCliInstalled = true;
+        // Also install chromium browser
+        exec('npx playwright install chromium', { timeout: 120000 }, (err2) => {
+          if (err2) {
+            console.log("[Playwright CLI] Warning: Could not auto-install chromium browser");
+          } else {
+            console.log("[Playwright CLI] Chromium browser installed");
+          }
+          resolve(true);
+        });
+      }
+    });
+  });
 }
 
+// Track if we've already tried to install chromium this session
+let chromiumInstallAttempted = false;
+
 /**
- * Send a JSON-RPC request to the MCP server
+ * Ensure chromium browser is installed for Playwright
  */
-function sendPlaywrightMcpRequest(method, params = {}) {
-  return new Promise((resolve, reject) => {
-    if (!playwrightMcpProcess || !playwrightMcpProcess.stdin.writable) {
-      reject(new Error("MCP process not running"));
-      return;
-    }
-
-    const id = ++playwrightRequestId;
-    const request = {
-      jsonrpc: "2.0",
-      id,
-      method,
-      params
-    };
-
-    playwrightPendingRequests.set(id, { resolve, reject });
-
-    // Set timeout for request
-    setTimeout(() => {
-      if (playwrightPendingRequests.has(id)) {
-        playwrightPendingRequests.delete(id);
-        reject(new Error(`MCP request timeout: ${method}`));
+async function ensureChromiumInstalled() {
+  if (chromiumInstallAttempted) {
+    return; // Don't retry multiple times in same session
+  }
+  chromiumInstallAttempted = true;
+  
+  return new Promise((resolve) => {
+    console.log("[Playwright CLI] Ensuring chromium browser is installed...");
+    exec('npx playwright install chromium', { timeout: 120000 }, (error) => {
+      if (error) {
+        console.log("[Playwright CLI] Warning: Could not install chromium:", error.message);
+      } else {
+        console.log("[Playwright CLI] Chromium browser ready");
       }
-    }, 60000); // 60 second timeout for browser operations
-
-    const message = JSON.stringify(request) + "\n";
-    playwrightMcpProcess.stdin.write(message);
+      resolve();
+    });
   });
 }
 
 /**
- * Send a JSON-RPC notification (no response expected)
+ * Clear Playwright CLI session data (helps with stuck sessions)
  */
-function sendPlaywrightMcpNotification(method, params = {}) {
-  if (!playwrightMcpProcess || !playwrightMcpProcess.stdin.writable) {
-    return;
-  }
-
-  const notification = {
-    jsonrpc: "2.0",
-    method,
-    params
-  };
-
-  const message = JSON.stringify(notification) + "\n";
-  playwrightMcpProcess.stdin.write(message);
-}
-
-/**
- * Handle incoming MCP messages
- */
-function handlePlaywrightMcpMessage(message) {
-  // Check if it's a response to a pending request
-  if (message.id !== undefined && playwrightPendingRequests.has(message.id)) {
-    const { resolve, reject } = playwrightPendingRequests.get(message.id);
-    playwrightPendingRequests.delete(message.id);
-
-    if (message.error) {
-      reject(new Error(message.error.message || "MCP error"));
-    } else {
-      resolve(message.result);
-    }
-  } else if (message.method) {
-    // It's a notification or request from the server
-    console.log("[Playwright MCP] Server notification:", message.method);
-  }
-}
-
-/**
- * Discover available tools from the Playwright MCP server
- */
-async function discoverPlaywrightTools() {
-  try {
-    const result = await sendPlaywrightMcpRequest("tools/list", {});
-    
-    if (result && result.tools) {
-      // Convert MCP tool format to our tool format
-      playwrightTools = result.tools.map(tool => ({
-        name: tool.name,
-        description: tool.description || "",
-        input_schema: tool.inputSchema || { type: "object", properties: {} }
-      }));
-
-      console.log("[Playwright MCP] Discovered tools:", playwrightTools.map(t => t.name).join(", "));
-    }
-  } catch (error) {
-    console.error("[Playwright MCP] Failed to discover tools:", error);
-    playwrightTools = [];
-  }
-}
-
-/**
- * Execute a Playwright MCP tool
- */
-async function executePlaywrightTool(toolName, toolInput) {
-  if (!playwrightMcpProcess) {
-    return { error: "Playwright MCP not running. Enable it in Settings > Integrations." };
-  }
-
-  console.log(`[Playwright MCP] Executing tool: ${toolName}`, toolInput);
-
-  try {
-    const result = await sendPlaywrightMcpRequest("tools/call", {
-      name: toolName,
-      arguments: toolInput
+async function clearPlaywrightSession() {
+  return new Promise((resolve) => {
+    const sessionDir = path.join(process.cwd(), '.playwright-cli');
+    console.log(`[Playwright CLI] Clearing session data from ${sessionDir}...`);
+    exec(`rm -rf "${sessionDir}"`, (error) => {
+      if (error) {
+        console.log("[Playwright CLI] Could not clear session:", error.message);
+      } else {
+        console.log("[Playwright CLI] Session cleared");
+      }
+      resolve();
     });
+  });
+}
 
-    console.log(`[Playwright MCP] Tool result:`, JSON.stringify(result).slice(0, 500));
+/**
+ * Execute a Playwright CLI command
+ * SECURITY: Credentials are passed via environment variables in credentialEnv,
+ * NEVER as command-line arguments. This prevents exposure in process listings.
+ * 
+ * @param {string} command - The CLI command (e.g., "open https://example.com", "snapshot")
+ * @param {Object} options - Options like session, browser, credentialEnv
+ * @returns {Promise<{output?: string, error?: string}>}
+ */
+async function executePlaywrightCli(command, options = {}) {
+  const { 
+    session = playwrightSession, 
+    browser = playwrightBrowser,
+    timeout = 60000,
+    credentialEnv = {} // Secure credentials passed as env vars
+  } = options;
+  
+  // Ensure CLI is installed
+  const installed = await ensurePlaywrightCliInstalled();
+  if (!installed) {
+    return { error: "Playwright CLI not installed and auto-install failed. Please run: npm install -g @playwright/cli@latest" };
+  }
+  
+  // Ensure chromium browser is installed (runs once per session)
+  await ensureChromiumInstalled();
+  
+  // Build environment with session, browser, and secure credentials
+  // SECURITY: Credentials are passed via environment variables, not command line
+  // Anti-detection: Add browser arguments to avoid bot detection
+  const antiDetectionArgs = [
+    '--disable-blink-features=AutomationControlled',
+    '--disable-features=IsolateOrigins,site-per-process',
+    '--disable-site-isolation-trials',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--window-size=1920,1080',
+    '--start-maximized',
+    '--disable-infobars'
+  ].join(' ');
+  
+  // Realistic user agent (Chrome 120 on macOS)
+  const userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  
+  const env = { 
+    ...process.env, 
+    PLAYWRIGHT_CLI_SESSION: session,
+    PLAYWRIGHT_MCP_BROWSER: browser,
+    // Anti-detection environment variables
+    PLAYWRIGHT_CHROMIUM_ARGS: antiDetectionArgs,
+    PLAYWRIGHT_USER_AGENT: userAgent,
+    PWDEBUG: '0', // Disable debugging indicators
+    ...credentialEnv // Merge in any credential env vars (WOVLY_SECRET_0, etc.)
+  };
+  
+  // Build full command - note: any ${WOVLY_SECRET_X} in command will be
+  // expanded by the shell from the environment variables above
+  const fullCommand = `playwright-cli ${command}`;
+  
+  // Log command and browser being used
+  console.log(`[Playwright CLI] Executing: ${fullCommand} (browser: ${browser})`);
+  if (Object.keys(credentialEnv).length > 0) {
+    console.log(`[Playwright CLI] With ${Object.keys(credentialEnv).length} secure credential(s) via env`);
+  }
+  
+  return new Promise((resolve) => {
+    exec(fullCommand, { timeout, env, maxBuffer: 1024 * 1024 * 10 }, async (error, stdout, stderr) => {
+      const output = stdout?.trim() || "";
+      
+      // Check for errors - either from exec error OR from error messages in stdout
+      // playwright-cli sometimes returns exit code 0 but prints errors to stdout
+      const hasExecError = !!error;
+      const hasOutputError = output.includes('Error:') && output.includes('browserType.launchPersistentContext');
+      const hasBrowserLaunchFailure = output.includes('Failed to launch the browser process') || 
+                                       (stderr && stderr.includes('Failed to launch the browser process'));
+      const hasBrowserNotInstalled = output.includes('Browser specified in your config is not installed') ||
+                                      (stderr && stderr.includes('Browser specified in your config is not installed'));
+      
+      if (hasExecError || hasOutputError || hasBrowserLaunchFailure || hasBrowserNotInstalled) {
+        const errorMsg = stderr || (hasOutputError || hasBrowserNotInstalled ? output : error?.message || "Unknown error");
+        console.error(`[Playwright CLI] Error detected:`, errorMsg.slice(0, 300));
+        
+        // Check for browser launch failure or not installed - try fallback to chromium
+        const shouldFallback = (errorMsg.includes('Failed to launch the browser process') || 
+                                hasBrowserLaunchFailure || hasBrowserNotInstalled) && 
+                               browser !== 'chromium';
+        
+        if (shouldFallback) {
+          console.log(`[Playwright CLI] ${browser} failed - browser may not be installed or is running. Falling back to chromium...`);
+          
+          // Try again with chromium (Playwright's bundled browser)
+          const fallbackEnv = { ...env, PLAYWRIGHT_MCP_BROWSER: 'chromium' };
+          exec(fullCommand, { timeout, env: fallbackEnv, maxBuffer: 1024 * 1024 * 10 }, async (err2, stdout2, stderr2) => {
+            const fallbackOutput = stdout2?.trim() || "";
+            const fallbackHasError = err2 || fallbackOutput.includes('Error:');
+            const chromiumNotInstalled = fallbackOutput.includes('Browser specified in your config is not installed');
+            
+            if (chromiumNotInstalled) {
+              // Try to install chromium
+              console.log(`[Playwright CLI] Chromium not installed, attempting to install...`);
+              exec('npx playwright install chromium', { timeout: 120000 }, (installErr) => {
+                if (installErr) {
+                  resolve({ 
+                    error: `Browser not available. Please run: npx playwright install chromium\n` +
+                           `Then try again.`
+                  });
+                } else {
+                  // Retry after install
+                  console.log(`[Playwright CLI] Chromium installed, retrying command...`);
+                  exec(fullCommand, { timeout, env: fallbackEnv, maxBuffer: 1024 * 1024 * 10 }, (err3, stdout3, stderr3) => {
+                    if (err3 || (stdout3 && stdout3.includes('Error:'))) {
+                      resolve({ error: `Browser still failing after install: ${stderr3 || err3?.message}` });
+                    } else {
+                      resolve({ output: stdout3?.trim() || "" });
+                    }
+                  });
+                }
+              });
+            } else if (fallbackHasError) {
+              resolve({ 
+                error: `Browser launch failed. ${browser} may not be installed or is locked. ` +
+                       `Chromium fallback also failed: ${stderr2 || err2?.message || "unknown"}. ` +
+                       `Try running: npx playwright install chromium`
+              });
+            } else {
+              console.log(`[Playwright CLI] Fallback to chromium succeeded (${fallbackOutput.length} chars)`);
+              // Update global browser preference so subsequent commands also use chromium
+              playwrightBrowser = 'chromium';
+              console.log(`[Playwright CLI] Switched default browser to chromium for this session`);
+              
+              // Also persist this preference to settings
+              (async () => {
+                try {
+                  const settingsPath = await getSettingsPath();
+                  let settings = {};
+                  try {
+                    settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+                  } catch {}
+                  settings.playwrightBrowser = 'chromium';
+                  await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+                  console.log(`[Playwright CLI] Saved chromium as default browser in settings`);
+                } catch (e) {
+                  console.log(`[Playwright CLI] Could not save browser preference:`, e.message);
+                }
+              })();
+              
+              resolve({ output: fallbackOutput });
+            }
+          });
+        } else if (hasBrowserLaunchFailure || hasBrowserNotInstalled) {
+          // Browser is chromium but still failed - try clearing session and reinstalling
+          console.log(`[Playwright CLI] Browser not available, clearing session and reinstalling...`);
+          
+          // Clear any stuck session data first
+          clearPlaywrightSession().then(() => {
+            exec('npx playwright install chromium --force', { timeout: 180000 }, (installErr) => {
+              if (installErr) {
+                resolve({ 
+                  error: `Failed to launch browser and auto-install failed.\n` +
+                         `Please try: npx playwright install chromium --force\n\n` +
+                         `Original error: ${errorMsg.slice(0, 300)}`
+                });
+              } else {
+                // Retry after install
+                console.log(`[Playwright CLI] Chromium reinstalled, retrying command...`);
+                exec(fullCommand, { timeout, env, maxBuffer: 1024 * 1024 * 10 }, (err3, stdout3, stderr3) => {
+                  if (err3 || (stdout3 && stdout3.includes('Error:'))) {
+                    resolve({ error: `Browser still failing after reinstall: ${stderr3 || err3?.message}` });
+                  } else {
+                    resolve({ output: stdout3?.trim() || "" });
+                  }
+                });
+              }
+            });
+          });
+        } else {
+          resolve({ error: errorMsg });
+        }
+      } else {
+        console.log(`[Playwright CLI] Output (${output.length} chars):`, output.slice(0, 500));
+        resolve({ output });
+      }
+    });
+  });
+}
 
-    // MCP returns content array, extract the text/data
-    if (result && result.content) {
-      const textContent = result.content.find(c => c.type === "text");
-      if (textContent) {
-        return { success: true, result: textContent.text };
+/**
+ * Detect Playwright CLI commands in LLM response text
+ * Looks for commands in code blocks or inline
+ * @param {string} text - LLM response text
+ * @returns {Array<string>} Array of commands found
+ */
+function detectPlaywrightCommands(text) {
+  const commands = [];
+  
+  // First, extract all code blocks (bash, shell, etc.)
+  const codeBlockRegex = /```(?:bash|shell|sh|plaintext)?\n?([\s\S]*?)```/gi;
+  let match;
+  while ((match = codeBlockRegex.exec(text)) !== null) {
+    const blockContent = match[1];
+    // Find all playwright-cli commands within this block
+    const lines = blockContent.split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('playwright-cli ')) {
+        // Skip multiline commands (those with unclosed quotes or braces)
+        const quoteCount = (trimmed.match(/"/g) || []).length;
+        const hasUnclosedQuote = quoteCount % 2 !== 0;
+        const hasUnclosedBrace = trimmed.includes('{') && !trimmed.includes('}');
+        
+        if (hasUnclosedQuote || hasUnclosedBrace) {
+          console.log(`[Playwright CLI] Skipping incomplete multiline command: ${trimmed.substring(0, 50)}...`);
+          continue;
+        }
+        
+        commands.push(trimmed);
       }
-      
-      const imageContent = result.content.find(c => c.type === "image");
-      if (imageContent) {
-        return { success: true, image: imageContent.data, mimeType: imageContent.mimeType };
-      }
-      
-      return { success: true, content: result.content };
     }
+  }
+  
+  // Also match inline backtick commands
+  const inlineRegex = /`(playwright-cli[^`]+)`/gi;
+  while ((match = inlineRegex.exec(text)) !== null) {
+    const cmd = match[1].trim();
+    if (!commands.includes(cmd)) {
+      commands.push(cmd);
+    }
+  }
+  
+  if (commands.length > 0) {
+    console.log(`[Playwright CLI] Detected ${commands.length} command(s):`, commands);
+  }
+  
+  return commands;
+}
 
-    return { success: true, result: result };
-  } catch (error) {
-    console.error(`[Playwright MCP] Tool error:`, error);
-    return { error: error.message };
+/**
+ * Execute all Playwright CLI commands found in text and return results
+ * SECURITY: Credentials are NEVER passed as command-line arguments.
+ * Instead, they are passed via environment variables to prevent exposure in
+ * process listings, shell history, and system logs.
+ * 
+ * @param {string} text - Text containing CLI commands
+ * @returns {Promise<{commands: Array<{command: string, result: Object}>, hasCommands: boolean}>}
+ */
+async function executePlaywrightCommandsInText(text) {
+  const commands = detectPlaywrightCommands(text);
+  
+  if (commands.length === 0) {
+    return { commands: [], hasCommands: false };
+  }
+  
+  console.log(`[Playwright CLI] Found ${commands.length} command(s) to execute`);
+  
+  const results = [];
+  for (const command of commands) {
+    // Extract just the command part after "playwright-cli "
+    const cmdPart = command.replace(/^playwright-cli\s+/, '');
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // SECURE CREDENTIAL HANDLING
+    // Credentials are passed via environment variables, NOT command-line args
+    // This prevents exposure in `ps`, shell history, and logs
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    let processedCmd = cmdPart;
+    const credentialEnv = {};
+    const credentialMatches = cmdPart.match(/\{\{credential:([^:}]+):([^}]+)\}\}/g);
+    let usedCredentials = [];
+    
+    if (credentialMatches) {
+      let secretIndex = 0;
+      for (const match of credentialMatches) {
+        const [, domain, field] = match.match(/\{\{credential:([^:}]+):([^}]+)\}\}/) || [];
+        if (domain && field) {
+          const credential = await getCredentialForDomain(domain);
+          if (credential && credential[field]) {
+            // Create a unique env var name for this credential
+            const envVarName = `WOVLY_SECRET_${secretIndex}`;
+            credentialEnv[envVarName] = credential[field];
+            
+            // Replace placeholder with $ENV_VAR reference for the CLI
+            // The CLI will read from the environment variable
+            processedCmd = processedCmd.replace(match, `\${${envVarName}}`);
+            
+            usedCredentials.push({ domain, field });
+            secretIndex++;
+            
+            // Log that we're using credentials (but NEVER the actual values)
+            console.log(`[Playwright CLI] Credential ${domain}:${field} -> env:${envVarName}`);
+          } else {
+            console.warn(`[Playwright CLI] No credential found for ${domain}:${field}`);
+          }
+        }
+      }
+      
+      // Update lastUsed timestamp for used credentials
+      for (const { domain } of usedCredentials) {
+        try {
+          const credentials = await loadCredentials();
+          if (credentials[domain]) {
+            credentials[domain].lastUsed = new Date().toISOString();
+            await saveCredentials(credentials);
+          }
+        } catch (err) {
+          console.error(`[Playwright CLI] Error updating lastUsed:`, err.message);
+        }
+      }
+    }
+    
+    // Execute with credentials passed securely via environment
+    const result = await executePlaywrightCli(processedCmd, { 
+      credentialEnv // Pass credentials as env vars
+    });
+    
+    // Check if this was a screenshot command - extract image path
+    if (cmdPart.startsWith('screenshot') && result.output) {
+      // Screenshot output format: - [Screenshot of viewport](.playwright-cli/page-xxx.png)
+      // Extract just the filename from the markdown link
+      const pathMatch = result.output.match(/\(\.playwright-cli\/([^)]+\.png)\)/i);
+      if (pathMatch) {
+        const filename = pathMatch[1];
+        const absolutePath = path.join(process.cwd(), '.playwright-cli', filename);
+        result.screenshotPath = absolutePath;
+        console.log(`[Playwright CLI] Screenshot saved to: ${absolutePath}`);
+      }
+    }
+    
+    // Check if this was a snapshot command - read the YAML file content and append
+    if (cmdPart.startsWith('snapshot') && result.output) {
+      // Snapshot output format: - [snapshot](.playwright-cli/page-xxx.yml)
+      const yamlMatch = result.output.match(/\(\.playwright-cli\/([^)]+\.yml)\)/i);
+      if (yamlMatch) {
+        const filename = yamlMatch[1];
+        const yamlPath = path.join(process.cwd(), '.playwright-cli', filename);
+        try {
+          const yamlContent = await fs.readFile(yamlPath, 'utf8');
+          // Append the actual element tree to the output
+          result.output += '\n\n### Element Tree (use these refs for click/fill):\n```yaml\n' + yamlContent + '\n```';
+          console.log(`[Playwright CLI] Appended snapshot content from ${filename} (${yamlContent.length} chars)`);
+        } catch (err) {
+          console.error(`[Playwright CLI] Failed to read snapshot YAML: ${err.message}`);
+        }
+      }
+    }
+    
+    // Store the sanitized command (with placeholders, not actual values) for logging
+    results.push({ command, result });
+    
+    // Check for login failure
+    if (usedCredentials.length > 0 && result.output) {
+      const outputLower = result.output.toLowerCase();
+      const loginFailurePatterns = [
+        "incorrect password", "invalid credentials", "login failed",
+        "authentication failed", "wrong password", "access denied"
+      ];
+      if (loginFailurePatterns.some(p => outputLower.includes(p))) {
+        const failedDomain = usedCredentials[0]?.domain || "unknown";
+        result.loginFailed = true;
+        result.error = `Login failed for ${failedDomain} - credentials may be incorrect or outdated`;
+        result.domain = failedDomain;
+        result.suggestion = "Please check your saved credentials in the Credentials page and try again.";
+      }
+    }
+  }
+  
+  return { commands: results, hasCommands: true };
+}
+
+/**
+ * Get list of domains that have saved credentials
+ * This allows the LLM to know which sites it can auto-login to
+ */
+async function getAvailableCredentialDomains() {
+  try {
+    const credentials = await loadCredentials();
+    return Object.keys(credentials);
+  } catch {
+    return [];
   }
 }
 
 /**
- * Get the list of Playwright tools (for building tool arrays)
+ * Convert a screenshot file to a base64 data URL for display in the UI
+ * @param {string} screenshotPath - Path to the screenshot file
+ * @returns {Promise<string|null>} - Base64 data URL or null on error
  */
-function getPlaywrightTools() {
-  return playwrightTools;
+async function screenshotToDataUrl(screenshotPath) {
+  try {
+    const imageBuffer = await fs.readFile(screenshotPath);
+    const base64Data = imageBuffer.toString("base64");
+    const ext = path.extname(screenshotPath).toLowerCase();
+    const mediaType = ext === ".png" ? "image/png" : ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : "image/png";
+    return `data:${mediaType};base64,${base64Data}`;
+  } catch (err) {
+    console.error(`[Chat] Failed to convert screenshot to data URL: ${err.message}`);
+    return null;
+  }
 }
 
 /**
- * Check if Playwright MCP is running
+ * Build a message with screenshot images for the LLM
+ * @param {string} text - The text content of the message
+ * @param {string[]} screenshotPaths - Array of screenshot file paths
+ * @param {string} provider - "anthropic" or "openai"
+ * @returns {object} - Message object with text and images
  */
-function isPlaywrightMcpRunning() {
-  return !!playwrightMcpProcess;
+async function buildMessageWithScreenshots(text, screenshotPaths, provider) {
+  if (!screenshotPaths || screenshotPaths.length === 0) {
+    return { role: "user", content: text };
+  }
+  
+  const imageContents = [];
+  
+  for (const screenshotPath of screenshotPaths) {
+    try {
+      const imageBuffer = await fs.readFile(screenshotPath);
+      const base64Data = imageBuffer.toString("base64");
+      const ext = path.extname(screenshotPath).toLowerCase();
+      const mediaType = ext === ".png" ? "image/png" : ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : "image/png";
+      
+      if (provider === "anthropic") {
+        imageContents.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: mediaType,
+            data: base64Data
+          }
+        });
+      } else {
+        // OpenAI format
+        imageContents.push({
+          type: "image_url",
+          image_url: {
+            url: `data:${mediaType};base64,${base64Data}`
+          }
+        });
+      }
+      console.log(`[Chat] Added screenshot to LLM message: ${screenshotPath}`);
+    } catch (err) {
+      console.error(`[Chat] Failed to read screenshot ${screenshotPath}: ${err.message}`);
+    }
+  }
+  
+  if (imageContents.length === 0) {
+    return { role: "user", content: text };
+  }
+  
+  // Build content array with text first, then images
+  if (provider === "anthropic") {
+    return {
+      role: "user",
+      content: [
+        { type: "text", text: text },
+        ...imageContents
+      ]
+    };
+  } else {
+    // OpenAI format
+    return {
+      role: "user",
+      content: [
+        { type: "text", text: text },
+        ...imageContents
+      ]
+    };
+  }
+}
+
+/**
+ * Get Playwright CLI command reference (for system prompts and skills)
+ * @param {string[]} availableCredentials - Optional list of domains with saved credentials
+ */
+function getPlaywrightCliReference(availableCredentials = []) {
+  let credentialSection = `### Secure Login (NEVER include actual passwords)
+For login forms, use credential placeholders - NEVER type actual passwords:
+- \`playwright-cli fill <ref> {{credential:domain.com:username}}\`
+- \`playwright-cli fill <ref> {{credential:domain.com:password}}\`
+
+SECURITY: Credential placeholders are resolved locally via secure environment variables.
+- Actual credentials are NEVER sent to this AI conversation
+- Actual credentials are NEVER passed as command-line arguments
+- Credentials are injected via environment variables to prevent exposure`;
+
+  // Add list of available credentials if any exist
+  if (availableCredentials.length > 0) {
+    credentialSection += `\n\n### Available Saved Credentials
+The user has credentials saved for these domains - USE THEM when logging in:
+${availableCredentials.map(d => `- ${d}`).join('\n')}
+
+IMPORTANT: When visiting any of these sites and a login is needed, AUTOMATICALLY use the saved credentials with the placeholder syntax. Do NOT ask the user if they have credentials - just use them.`;
+  } else {
+    credentialSection += `\n\nNo saved credentials found. If login is required, inform the user they can save credentials in the Credentials page.`;
+  }
+
+  return `## Browser Automation (playwright-cli) - IMPORTANT: NOT A TOOL
+
+**This is NOT a tool call.** To use browser automation, simply write the command in a bash code block in your response.
+The system will automatically detect and execute these commands, then give you the results.
+
+**HOW TO USE:** Just include commands like this in your response:
+\`\`\`bash
+playwright-cli open https://example.com --headed
+\`\`\`
+
+Commands run in a persistent session (cookies/auth preserved).
+
+### Navigation
+- \`playwright-cli open <url>\` - Navigate to URL
+- \`playwright-cli open <url> --headed\` - Navigate with visible browser
+- \`playwright-cli go-back\` - Go back
+- \`playwright-cli go-forward\` - Go forward
+- \`playwright-cli reload\` - Reload page
+
+### Page Interaction - IMPORTANT: Use element refs from snapshot!
+- \`playwright-cli snapshot\` - Get element refs for clicking/filling (text-based accessibility tree)
+- \`playwright-cli click <ref>\` - Click element. **<ref> must be from snapshot output like "e23", "e45"**
+- \`playwright-cli fill <ref> <text>\` - Fill text field. **<ref> must be element ref, NOT CSS selector**
+- \`playwright-cli type <text>\` - Type text into focused element
+- \`playwright-cli press <key>\` - Press key (Enter, Tab, Escape, etc.)
+- \`playwright-cli check <ref>\` - Check a checkbox
+- \`playwright-cli select <ref> <value>\` - Select dropdown option
+
+**CRITICAL:** CSS selectors like \`[name='email']\` or \`text=Login\` will NOT work!
+You MUST use element refs (e23, e45, etc.) from the snapshot output.
+
+### Screenshots - USE THIS TO SEE THE PAGE
+- \`playwright-cli screenshot\` - **Take screenshot to SEE what's on the page visually**
+
+**IMPORTANT:** \`snapshot\` returns text-based element refs for clicking, NOT visual content!
+If you need to READ text, view images, analyze charts, see calendars, or understand visual layout:
+**YOU MUST USE \`screenshot\`** - this captures the actual page image and lets you see it.
+
+### Other Info
+- \`playwright-cli console\` - Get console messages
+- \`playwright-cli network\` - Get network requests
+
+### Tabs
+- \`playwright-cli tab-list\` - List open tabs
+- \`playwright-cli tab-new [url]\` - Open new tab
+- \`playwright-cli tab-close [index]\` - Close tab
+- \`playwright-cli tab-select <index>\` - Switch to tab
+
+${credentialSection}
+
+### Example Workflow
+1. Open the page:
+\`\`\`bash
+playwright-cli open https://amazon.com --headed
+\`\`\`
+
+2. **TAKE A SCREENSHOT to see the page content:**
+\`\`\`bash
+playwright-cli screenshot
+\`\`\`
+
+3. Get element refs if you need to click/fill:
+\`\`\`bash
+playwright-cli snapshot
+\`\`\`
+
+4. The snapshot shows elements like:
+   - button "Sign In" [e23]
+   - input#email [e45]
+   - input#password [e67]
+
+5. Use those refs to interact:
+\`\`\`bash
+playwright-cli click e23
+\`\`\`
+
+**REMEMBER:** 
+- \`screenshot\` = SEE the page visually (calendars, text, images, charts)
+- \`snapshot\` = GET element refs for clicking/filling forms
+- Use refs like "e23", "e45" - NOT CSS selectors like "[name='email']"
+
+### USE BROWSER AUTOMATION FOR WEB RESEARCH
+When you need to find information from the web (flights, hotels, products, prices, schedules, etc.):
+1. OPEN a relevant website (Google Flights, Kayak, Amazon, etc.)
+2. TAKE A SCREENSHOT to see it
+3. Use SNAPSHOT + FILL/CLICK to search
+4. SCREENSHOT to see results
+5. Extract and report the information
+
+**NEVER say "I don't have access to flight/hotel/product data"** - you have browser automation!
+Just open the website and search like a human would.`;
+}
+
+/**
+ * Check if Playwright is enabled
+ */
+function isPlaywrightEnabled() {
+  return playwrightEnabled;
+}
+
+/**
+ * Set Playwright enabled state
+ */
+function setPlaywrightEnabled(enabled) {
+  playwrightEnabled = enabled;
+}
+
+/**
+ * Set Playwright browser preference
+ */
+function setPlaywrightBrowser(browser) {
+  playwrightBrowser = browser;
+}
+
+/**
+ * Get current Playwright browser
+ */
+function getPlaywrightBrowser() {
+  return playwrightBrowser;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -311,6 +915,224 @@ const getWovlyDir = async () => {
 const getSettingsPath = async () => {
   const dir = await getWovlyDir();
   return path.join(dir, "settings.json");
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Secure Credential Storage System
+// Uses Electron's safeStorage API for OS-level encryption (Keychain/DPAPI/libsecret)
+// Credentials are NEVER sent to LLMs - only used locally for Playwright automation
+// ─────────────────────────────────────────────────────────────────────────────
+
+const getCredentialsPath = async () => {
+  const dir = await getWovlyDir();
+  return path.join(dir, "credentials.enc");
+};
+
+// In-memory cache of decrypted credentials
+let credentialsCache = null;
+
+/**
+ * Load and decrypt credentials from storage
+ * @returns {Object} Credentials object keyed by domain
+ */
+const loadCredentials = async () => {
+  // Return cached if available
+  if (credentialsCache !== null) {
+    return credentialsCache;
+  }
+
+  const credentialsPath = await getCredentialsPath();
+  
+  try {
+    // Check if safeStorage is available
+    if (!safeStorage.isEncryptionAvailable()) {
+      console.warn("[Credentials] Encryption not available on this system");
+      // Fall back to checking for unencrypted file (migration case)
+      try {
+        const plainPath = path.join(await getWovlyDir(), "credentials.json");
+        const data = await fs.readFile(plainPath, "utf8");
+        credentialsCache = JSON.parse(data);
+        // Migrate to encrypted storage
+        await saveCredentials(credentialsCache);
+        await fs.unlink(plainPath).catch(() => {}); // Delete plain file
+        console.log("[Credentials] Migrated from unencrypted to encrypted storage");
+        return credentialsCache;
+      } catch {
+        credentialsCache = {};
+        return credentialsCache;
+      }
+    }
+
+    // Read encrypted file
+    const encryptedBuffer = await fs.readFile(credentialsPath);
+    const decryptedString = safeStorage.decryptString(encryptedBuffer);
+    credentialsCache = JSON.parse(decryptedString);
+    console.log(`[Credentials] Loaded ${Object.keys(credentialsCache).length} credentials`);
+    return credentialsCache;
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      // File doesn't exist yet - start fresh
+      credentialsCache = {};
+      return credentialsCache;
+    }
+    console.error("[Credentials] Error loading credentials:", err.message);
+    credentialsCache = {};
+    return credentialsCache;
+  }
+};
+
+/**
+ * Encrypt and save credentials to storage
+ * @param {Object} credentials - Credentials object to save
+ */
+const saveCredentials = async (credentials) => {
+  const credentialsPath = await getCredentialsPath();
+  
+  try {
+    if (!safeStorage.isEncryptionAvailable()) {
+      console.warn("[Credentials] Encryption not available - storing with basic protection");
+      // Fallback: store as JSON but with restricted permissions
+      await fs.writeFile(credentialsPath + ".json", JSON.stringify(credentials, null, 2), {
+        mode: 0o600 // Owner read/write only
+      });
+      credentialsCache = credentials;
+      return;
+    }
+
+    const jsonString = JSON.stringify(credentials);
+    const encryptedBuffer = safeStorage.encryptString(jsonString);
+    await fs.writeFile(credentialsPath, encryptedBuffer);
+    credentialsCache = credentials;
+    console.log(`[Credentials] Saved ${Object.keys(credentials).length} credentials (encrypted)`);
+  } catch (err) {
+    console.error("[Credentials] Error saving credentials:", err.message);
+    throw err;
+  }
+};
+
+/**
+ * Get credential for a specific domain
+ * @param {string} domain - Domain to look up (e.g., "amazon.com")
+ * @returns {Object|null} Credential object or null if not found
+ */
+const getCredentialForDomain = async (domain) => {
+  const credentials = await loadCredentials();
+  
+  // Try exact match first
+  if (credentials[domain]) {
+    return credentials[domain];
+  }
+  
+  // Try without www prefix
+  const withoutWww = domain.replace(/^www\./, "");
+  if (credentials[withoutWww]) {
+    return credentials[withoutWww];
+  }
+  
+  // Try with www prefix
+  const withWww = "www." + withoutWww;
+  if (credentials[withWww]) {
+    return credentials[withWww];
+  }
+  
+  // Try partial match (e.g., "amazon.com" matches "signin.amazon.com")
+  for (const [key, value] of Object.entries(credentials)) {
+    if (domain.endsWith(key) || key.endsWith(domain.replace(/^www\./, ""))) {
+      return value;
+    }
+  }
+  
+  return null;
+};
+
+/**
+ * Resolve credential placeholders in tool input
+ * Pattern: {{credential:domain.com:field}} where field is "username" or "password"
+ * @param {any} input - Tool input (object, string, or array)
+ * @returns {Object} { resolved: any, usedCredentials: Array }
+ */
+const resolveCredentialPlaceholders = async (input) => {
+  const usedCredentials = [];
+  const placeholderPattern = /\{\{credential:([^:}]+):([^}]+)\}\}/g;
+  
+  const resolveString = async (str) => {
+    if (typeof str !== "string") return str;
+    
+    let result = str;
+    let match;
+    
+    // Reset regex state
+    placeholderPattern.lastIndex = 0;
+    
+    while ((match = placeholderPattern.exec(str)) !== null) {
+      const [fullMatch, domain, field] = match;
+      const credential = await getCredentialForDomain(domain);
+      
+      if (credential) {
+        const value = credential[field];
+        if (value !== undefined) {
+          result = result.replace(fullMatch, value);
+          usedCredentials.push({ domain, field });
+          console.log(`[Credentials] Resolved placeholder for ${domain}:${field}`);
+          // IMPORTANT: Never log the actual value!
+        } else {
+          console.warn(`[Credentials] Field "${field}" not found for domain "${domain}"`);
+        }
+      } else {
+        console.warn(`[Credentials] No credential found for domain "${domain}"`);
+      }
+    }
+    
+    return result;
+  };
+  
+  const resolveRecursive = async (obj) => {
+    if (typeof obj === "string") {
+      return await resolveString(obj);
+    }
+    
+    if (Array.isArray(obj)) {
+      const resolved = [];
+      for (const item of obj) {
+        resolved.push(await resolveRecursive(item));
+      }
+      return resolved;
+    }
+    
+    if (obj !== null && typeof obj === "object") {
+      const resolved = {};
+      for (const [key, value] of Object.entries(obj)) {
+        resolved[key] = await resolveRecursive(value);
+      }
+      return resolved;
+    }
+    
+    return obj;
+  };
+  
+  const resolved = await resolveRecursive(input);
+  return { resolved, usedCredentials };
+};
+
+/**
+ * Validate that text doesn't contain actual credential values
+ * Used to prevent credential leakage in LLM responses
+ * @param {string} text - Text to validate
+ * @param {Array} credentials - Array of credential objects to check against
+ * @returns {boolean} True if safe (no credentials found), false if credentials detected
+ */
+const validateNoCredentialLeakage = (text, credentials = []) => {
+  if (!text || typeof text !== "string") return true;
+  
+  // Check each stored credential's password and username
+  for (const cred of credentials) {
+    if (cred.password && cred.password.length > 4 && text.includes(cred.password)) {
+      console.error(`[Security] CREDENTIAL LEAKAGE DETECTED: Password for ${cred.domain} found in text`);
+      return false;
+    }
+  }
+  
+  return true;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -515,7 +1337,31 @@ const processOldMemoryFiles = async () => {
   console.log("[Memory] Finished processing old memory files");
 };
 
+// Token limits for conversation context (chars, ~4 chars per token)
+const CONTEXT_LIMITS = {
+  TODAY_MAX_CHARS: 6000,      // ~1500 tokens - most recent conversations today
+  YESTERDAY_MAX_CHARS: 3000,  // ~750 tokens - summary or recent from yesterday
+  SUMMARIES_MAX_CHARS: 2000,  // ~500 tokens - summaries from past 2 weeks
+  TOTAL_MAX_CHARS: 10000      // ~2500 tokens - hard cap on total context
+};
+
+// Truncate text to limit, keeping most recent content (from the end)
+const truncateToLimit = (text, maxChars, label = "content") => {
+  if (!text || text.length <= maxChars) return text;
+  
+  const truncated = text.slice(-maxChars);
+  // Try to start at a line break for cleaner output
+  const firstLineBreak = truncated.indexOf('\n');
+  const cleanStart = firstLineBreak > 0 && firstLineBreak < 200 
+    ? truncated.slice(firstLineBreak + 1) 
+    : truncated;
+  
+  console.log(`[Memory] Truncated ${label} from ${text.length} to ${cleanStart.length} chars`);
+  return `[...earlier ${label} truncated...]\n\n${cleanStart}`;
+};
+
 // Load conversation context for LLM - today, yesterday, and recent summaries
+// With token limits to prevent context explosion
 const loadConversationContext = async () => {
   const dailyDir = await getMemoryDailyDir();
   const longtermDir = await getMemoryLongtermDir();
@@ -526,35 +1372,38 @@ const loadConversationContext = async () => {
   let yesterdayMessages = "";
   let recentSummaries = "";
 
-  // Load today's messages
+  // Load today's messages (truncate to limit)
   try {
     const todayPath = path.join(dailyDir, `${today}.md`);
-    todayMessages = await fs.readFile(todayPath, "utf8");
+    const fullContent = await fs.readFile(todayPath, "utf8");
+    todayMessages = truncateToLimit(fullContent, CONTEXT_LIMITS.TODAY_MAX_CHARS, "today's messages");
   } catch {
     // No messages today yet
   }
 
-  // Load yesterday's messages
+  // Load yesterday's messages (truncate to limit)
   try {
     const yesterdayPath = path.join(dailyDir, `${yesterday}.md`);
-    yesterdayMessages = await fs.readFile(yesterdayPath, "utf8");
+    const fullContent = await fs.readFile(yesterdayPath, "utf8");
+    yesterdayMessages = truncateToLimit(fullContent, CONTEXT_LIMITS.YESTERDAY_MAX_CHARS, "yesterday's messages");
   } catch {
     // Try longterm (may have been moved)
     try {
       const yesterdayLongtermPath = path.join(longtermDir, `${yesterday}.md`);
       const content = await fs.readFile(yesterdayLongtermPath, "utf8");
-      // Extract just the summary if available, otherwise use full content
+      // Extract just the summary if available, otherwise use truncated full content
       const summary = extractSummaryFromMemory(content);
-      yesterdayMessages = summary || content;
+      yesterdayMessages = summary || truncateToLimit(content, CONTEXT_LIMITS.YESTERDAY_MAX_CHARS, "yesterday's messages");
     } catch {
       // No messages yesterday
     }
   }
 
-  // Load summaries from longterm (2-14 days ago)
+  // Load summaries from longterm (2-14 days ago) with limit
   try {
     const longtermFiles = await fs.readdir(longtermDir);
     const summaryParts = [];
+    let totalChars = 0;
 
     for (const file of longtermFiles.sort().reverse()) {
       if (!file.endsWith('.md')) continue;
@@ -573,7 +1422,13 @@ const loadConversationContext = async () => {
         const summary = extractSummaryFromMemory(content);
         
         if (summary) {
+          // Check if adding this summary would exceed limit
+          if (totalChars + summary.length > CONTEXT_LIMITS.SUMMARIES_MAX_CHARS) {
+            console.log(`[Memory] Skipping older summaries to stay within limit`);
+            break;
+          }
           summaryParts.push(`**${dateStr}:**\n${summary}`);
+          totalChars += summary.length;
         }
       } catch {
         // Skip unreadable files
@@ -585,6 +1440,19 @@ const loadConversationContext = async () => {
     // No longterm directory yet
   }
 
+  // Final safety check - ensure total doesn't exceed hard cap
+  const totalLength = todayMessages.length + yesterdayMessages.length + recentSummaries.length;
+  if (totalLength > CONTEXT_LIMITS.TOTAL_MAX_CHARS) {
+    console.log(`[Memory] Total context ${totalLength} exceeds limit ${CONTEXT_LIMITS.TOTAL_MAX_CHARS}, trimming further`);
+    // Prioritize today > yesterday > summaries
+    const remaining = CONTEXT_LIMITS.TOTAL_MAX_CHARS - todayMessages.length;
+    if (remaining < yesterdayMessages.length) {
+      yesterdayMessages = truncateToLimit(yesterdayMessages, Math.max(remaining / 2, 500), "yesterday");
+      recentSummaries = truncateToLimit(recentSummaries, Math.max(remaining / 2, 500), "summaries");
+    }
+  }
+
+  console.log(`[Memory] Loaded context: today=${todayMessages.length}, yesterday=${yesterdayMessages.length}, summaries=${recentSummaries.length} chars`);
   return { todayMessages, yesterdayMessages, recentSummaries };
 };
 
@@ -1005,6 +1873,7 @@ const parseTaskMarkdown = (markdown, taskId) => {
     lastUpdated: "",
     nextCheck: null,
     hidden: false,
+    autoSend: false, // Auto-send messages without requiring approval
     originalRequest: "",
     plan: [],
     currentStep: {
@@ -1014,17 +1883,24 @@ const parseTaskMarkdown = (markdown, taskId) => {
       pollInterval: null
     },
     executionLog: [],
-    contextMemory: {}
+    contextMemory: {},
+    pendingMessages: [] // Messages awaiting user approval
   };
 
   const lines = markdown.split("\n");
   let currentSection = null;
+  let currentPendingMessage = null;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
     // Detect section headers
     if (line.startsWith("## ")) {
+      // Save any pending message being parsed
+      if (currentPendingMessage && currentSection === "pending messages") {
+        task.pendingMessages.push(currentPendingMessage);
+        currentPendingMessage = null;
+      }
       currentSection = line.replace("## ", "").trim().toLowerCase();
       continue;
     }
@@ -1047,6 +1923,7 @@ const parseTaskMarkdown = (markdown, taskId) => {
           case "last updated": task.lastUpdated = value; break;
           case "next check": task.nextCheck = value ? new Date(value.split(" ")[0]).getTime() : null; break;
           case "hidden": task.hidden = value.toLowerCase() === "true"; break;
+          case "auto-send": task.autoSend = value.toLowerCase() === "true"; break;
         }
       }
     }
@@ -1098,6 +1975,51 @@ const parseTaskMarkdown = (markdown, taskId) => {
         task.contextMemory[contextMatch[1].trim()] = contextMatch[2].trim();
       }
     }
+
+    // Parse pending messages section
+    if (currentSection === "pending messages") {
+      // New message starts with ### Message
+      if (line.startsWith("### Message")) {
+        // Save previous message if exists
+        if (currentPendingMessage) {
+          task.pendingMessages.push(currentPendingMessage);
+        }
+        currentPendingMessage = {
+          id: "",
+          toolName: "",
+          platform: "",
+          recipient: "",
+          subject: "",
+          message: "",
+          created: ""
+        };
+      } else if (currentPendingMessage) {
+        // Parse message fields
+        const fieldMatch = line.match(/^\s*-\s*\*\*([^*]+)\*\*:\s*(.*)$/);
+        if (fieldMatch) {
+          const key = fieldMatch[1].trim().toLowerCase();
+          const value = fieldMatch[2].trim();
+          switch (key) {
+            case "id": currentPendingMessage.id = value; break;
+            case "tool": currentPendingMessage.toolName = value; break;
+            case "platform": currentPendingMessage.platform = value; break;
+            case "recipient": currentPendingMessage.recipient = value; break;
+            case "subject": currentPendingMessage.subject = value; break;
+            case "created": currentPendingMessage.created = value; break;
+          }
+        } else if (line.startsWith("```")) {
+          // Skip code fence markers
+        } else if (currentPendingMessage && !line.startsWith("-") && line.trim()) {
+          // This is message content
+          currentPendingMessage.message += (currentPendingMessage.message ? "\n" : "") + line;
+        }
+      }
+    }
+  }
+
+  // Don't forget the last pending message
+  if (currentPendingMessage && currentSection === "pending messages") {
+    task.pendingMessages.push(currentPendingMessage);
   }
 
   return task;
@@ -1113,6 +2035,7 @@ const serializeTask = (task) => {
 - **Last Updated**: ${task.lastUpdated || new Date().toISOString()}
 - **Next Check**: ${task.nextCheck ? new Date(task.nextCheck).toISOString() : ""}
 - **Hidden**: ${task.hidden ? "true" : "false"}
+- **Auto-Send**: ${task.autoSend ? "true" : "false"}
 
 ## Original Request
 ${task.originalRequest || ""}
@@ -1153,6 +2076,28 @@ Poll Interval: ${task.currentStep?.pollInterval || ""}
     for (const [key, value] of Object.entries(task.contextMemory)) {
       markdown += `- ${key}: ${value}\n`;
     }
+  }
+
+  // Add pending messages section
+  markdown += `
+## Pending Messages
+`;
+
+  if (task.pendingMessages && task.pendingMessages.length > 0) {
+    task.pendingMessages.forEach((msg, index) => {
+      markdown += `
+### Message ${index + 1}
+- **ID**: ${msg.id}
+- **Tool**: ${msg.toolName}
+- **Platform**: ${msg.platform}
+- **Recipient**: ${msg.recipient}
+${msg.subject ? `- **Subject**: ${msg.subject}\n` : ''}- **Created**: ${msg.created}
+
+\`\`\`
+${msg.message}
+\`\`\`
+`;
+    });
   }
 
   return markdown;
@@ -1376,6 +2321,12 @@ const listTasks = async () => {
 const listActiveTasks = async () => {
   const tasks = await listTasks();
   return tasks.filter(t => t.status === "active" || t.status === "waiting");
+};
+
+// Get tasks waiting for user input (for routing clarification responses)
+const getTasksWaitingForInput = async () => {
+  const tasks = await listTasks();
+  return tasks.filter(t => t.status === "waiting_for_input");
 };
 
 // Cancel a task
@@ -1960,15 +2911,29 @@ const fetchCalendarEvents = async (accessToken, startDate, endDate) => {
   calendarUrl.searchParams.set("singleEvents", "true");
   calendarUrl.searchParams.set("orderBy", "startTime");
 
+  console.log(`[Calendar] Fetching events from ${startDate.toISOString()} to ${endDate.toISOString()}`);
+  
   const response = await fetch(calendarUrl.toString(), {
     headers: { "Authorization": `Bearer ${accessToken}` }
   });
 
   if (!response.ok) {
-    throw new Error("Failed to fetch calendar events");
+    const errorText = await response.text();
+    console.error(`[Calendar] API Error (${response.status}):`, errorText);
+    
+    // Check for specific errors
+    if (response.status === 403) {
+      throw new Error("Calendar access denied. The Google Calendar API may not be enabled in your Google Cloud project, or you may need to reconnect Google to grant calendar permissions. Go to Integrations > Google and click 'Disconnect' then reconnect.");
+    } else if (response.status === 401) {
+      throw new Error("Calendar authentication expired. Please reconnect Google in Integrations.");
+    }
+    
+    throw new Error(`Calendar API error (${response.status}): ${errorText.substring(0, 200)}`);
   }
 
   const data = await response.json();
+  console.log(`[Calendar] Found ${data.items?.length || 0} events`);
+  
   return (data.items || []).map(event => ({
     id: event.id,
     title: event.summary || "(No title)",
@@ -2214,129 +3179,16 @@ const notifyWhatsAppStatus = () => {
   }
 };
 
-// Process incoming WhatsApp message with LLM
-const processWhatsAppMessage = async (text, senderId) => {
-  try {
-    const settingsPath = await getSettingsPath();
-    let apiKeys = {};
-    let models = {};
-    let activeProvider = "anthropic";
-    
-    try {
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      apiKeys = settings.apiKeys || {};
-      models = settings.models || {};
-      activeProvider = settings.activeProvider || "anthropic";
-    } catch {
-      return "Sorry, I'm not configured yet. Please set up an API key in the Wovly app.";
-    }
+// Process incoming WhatsApp message with LLM - uses SAME tools as main chat
+// This is a placeholder that will be replaced with full tool access in app.whenReady()
+let processWhatsAppMessage = async (text, senderId) => {
+  console.log("[WhatsApp] Placeholder processWhatsAppMessage called");
+  return "Sorry, the message processor is still initializing. Please try again in a moment.";
+};
 
-    if (!apiKeys.anthropic && !apiKeys.openai && !apiKeys.google) {
-      return "Sorry, no AI provider is configured. Please add an API key in Wovly settings.";
-    }
-
-    // Get user profile for context
-    let profile = null;
-    try {
-      const profilePath = await getUserProfilePath();
-      const markdown = await fs.readFile(profilePath, "utf8");
-      profile = parseUserProfile(markdown);
-    } catch {
-      // No profile
-    }
-
-    // Build system prompt for WhatsApp context
-    let systemPrompt = `You are Wovly, a helpful AI assistant responding via WhatsApp. Keep responses concise and conversational - WhatsApp messages should be brief and to the point.`;
-
-    if (profile) {
-      systemPrompt += `\n\nUser Profile:\n- Name: ${profile.firstName} ${profile.lastName}\n- Occupation: ${profile.occupation || "Not specified"}\n- City: ${profile.city || "Not specified"}`;
-    }
-
-    // Simple message handling for WhatsApp (no tools for now to keep it fast)
-    const messages = [{ role: "user", content: text }];
-
-    // Determine which provider to use
-    const useProvider = apiKeys[activeProvider] ? activeProvider : 
-                        apiKeys.anthropic ? "anthropic" : 
-                        apiKeys.openai ? "openai" : 
-                        apiKeys.google ? "google" : null;
-
-    if (!useProvider) {
-      return "Sorry, no AI provider available.";
-    }
-
-    if (useProvider === "anthropic" && apiKeys.anthropic) {
-      const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKeys.anthropic,
-          "anthropic-version": "2023-06-01"
-        },
-        body: JSON.stringify({
-          model: anthropicModel,
-          max_tokens: 500, // Keep WhatsApp responses short
-          system: systemPrompt,
-          messages
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        return data.content?.[0]?.text || "Sorry, I couldn't generate a response.";
-      }
-    }
-
-    if (useProvider === "openai" && apiKeys.openai) {
-      const openaiModel = models.openai || "gpt-4o";
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKeys.openai}`
-        },
-        body: JSON.stringify({
-          model: openaiModel,
-          max_tokens: 500,
-          messages: [
-            { role: "system", content: systemPrompt },
-            ...messages
-          ]
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        return data.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
-      }
-    }
-
-    if (useProvider === "google" && apiKeys.google) {
-      const geminiModel = models.google || "gemini-1.5-pro";
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKeys.google}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text }] }],
-            systemInstruction: { parts: [{ text: systemPrompt }] }
-          })
-        }
-      );
-
-      if (response.ok) {
-        const data = await response.json();
-        return data.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I couldn't generate a response.";
-      }
-    }
-
-    return "Sorry, I couldn't process your message. Please try again.";
-  } catch (err) {
-    console.error("WhatsApp message processing error:", err);
-    return "Sorry, something went wrong. Please try again.";
-  }
+// This will be called from app.whenReady() to inject the real implementation with full tool access
+const setWhatsAppMessageProcessor = (processor) => {
+  processWhatsAppMessage = processor;
 };
 
 function createWindow() {
@@ -2372,6 +3224,28 @@ app.whenReady().then(async () => {
   // Resume tasks and start scheduler
   await resumeTasksOnStartup();
   startTaskScheduler();
+  
+  // Auto-reconnect WhatsApp if previously connected
+  try {
+    const authDir = await getWhatsAppAuthDir();
+    const files = await fs.readdir(authDir);
+    const hasAuth = files.some(f => f.includes("creds"));
+    
+    if (hasAuth) {
+      console.log("[WhatsApp] Found saved auth state, auto-reconnecting...");
+      // Slight delay to let the window initialize
+      setTimeout(async () => {
+        try {
+          await connectWhatsApp();
+          console.log("[WhatsApp] Auto-reconnect initiated");
+        } catch (err) {
+          console.error("[WhatsApp] Auto-reconnect failed:", err.message);
+        }
+      }, 2000);
+    }
+  } catch (err) {
+    console.log("[WhatsApp] No saved auth state found");
+  }
 
   // Settings handlers
   ipcMain.handle("settings:get", async () => {
@@ -2442,6 +3316,73 @@ app.whenReady().then(async () => {
       return { ok: true, needsOnboarding, profile };
     } catch {
       return { ok: true, needsOnboarding: false };
+    }
+  });
+
+  // Add facts to profile (with conflict resolution)
+  ipcMain.handle("profile:addFacts", async (_event, { facts, conflictResolutions }) => {
+    try {
+      const profilePath = await getUserProfilePath();
+      const markdown = await fs.readFile(profilePath, "utf8");
+      const profile = parseUserProfile(markdown);
+      profile.notes = profile.notes || [];
+      
+      // Handle conflict resolutions (remove old notes that are being replaced)
+      if (conflictResolutions && conflictResolutions.length > 0) {
+        for (const resolution of conflictResolutions) {
+          if (resolution.keepNew) {
+            // Remove the old conflicting note
+            const existingIndex = profile.notes.findIndex(n => n === resolution.existingNote);
+            if (existingIndex > -1) {
+              console.log(`[Profile] Removing conflicting note: "${resolution.existingNote}"`);
+              profile.notes.splice(existingIndex, 1);
+            }
+          }
+        }
+      }
+      
+      // Add facts (skip those where user chose to keep existing)
+      for (const fact of facts) {
+        const conflictRes = conflictResolutions?.find(r => r.newFact === fact.summary);
+        if (conflictRes && !conflictRes.keepNew) {
+          console.log(`[Profile] Skipping fact (user kept existing): "${fact.summary}"`);
+          continue; // User chose to keep existing, don't add new
+        }
+        console.log(`[Profile] Adding fact: "${fact.summary}"`);
+        profile.notes.push(fact.summary);
+      }
+      
+      await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
+      console.log(`[Profile] Saved profile with ${profile.notes.length} notes`);
+      return { ok: true };
+    } catch (err) {
+      console.error("[Profile] Error adding facts:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Get raw profile markdown (for About Me page)
+  ipcMain.handle("profile:getMarkdown", async () => {
+    try {
+      const profilePath = await getUserProfilePath();
+      const markdown = await fs.readFile(profilePath, "utf8");
+      return { ok: true, markdown };
+    } catch (err) {
+      console.error("[Profile] Error reading markdown:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Save raw profile markdown (for About Me page editor)
+  ipcMain.handle("profile:saveMarkdown", async (_event, markdown) => {
+    try {
+      const profilePath = await getUserProfilePath();
+      await fs.writeFile(profilePath, markdown, "utf8");
+      console.log("[Profile] Saved profile markdown");
+      return { ok: true };
+    } catch (err) {
+      console.error("[Profile] Error saving markdown:", err.message);
+      return { ok: false, error: err.message };
     }
   });
 
@@ -2789,10 +3730,11 @@ Generate ONLY the welcome message, nothing else.`;
         return { ok: false, error: "Google not authorized" };
       }
 
-      const startDate = new Date(date);
-      startDate.setHours(0, 0, 0, 0);
-      const endDate = new Date(startDate);
-      endDate.setHours(23, 59, 59, 999);
+      // Parse date in local timezone (not UTC)
+      // "2026-01-31" should be midnight Jan 31 LOCAL time
+      const [year, month, day] = date.split('-').map(Number);
+      const startDate = new Date(year, month - 1, day, 0, 0, 0, 0);
+      const endDate = new Date(year, month - 1, day, 23, 59, 59, 999);
 
       const events = await fetchCalendarEvents(accessToken, startDate, endDate);
       return { ok: true, events };
@@ -2809,15 +3751,41 @@ Generate ONLY the welcome message, nothing else.`;
         return { ok: false, error: "Not authorized" };
       }
       
+      // Test basic connection
       const response = await fetch("https://www.googleapis.com/oauth2/v1/userinfo?alt=json", {
         headers: { "Authorization": `Bearer ${accessToken}` }
       });
       
-      if (response.ok) {
-        const userInfo = await response.json();
-        return { ok: true, message: `Connected as ${userInfo.email}` };
+      if (!response.ok) {
+        return { ok: false, error: "Failed to verify connection" };
       }
-      return { ok: false, error: "Failed to verify connection" };
+      
+      const userInfo = await response.json();
+      
+      // Also test calendar access specifically
+      const calendarTestUrl = new URL("https://www.googleapis.com/calendar/v3/calendars/primary");
+      const calendarResponse = await fetch(calendarTestUrl.toString(), {
+        headers: { "Authorization": `Bearer ${accessToken}` }
+      });
+      
+      if (!calendarResponse.ok) {
+        const errorText = await calendarResponse.text();
+        console.error("[Google] Calendar test failed:", errorText);
+        
+        if (calendarResponse.status === 403) {
+          return { 
+            ok: false, 
+            error: `Connected as ${userInfo.email}, but Calendar access denied. Please: 1) Enable Google Calendar API in your Google Cloud Console, 2) Disconnect and reconnect Google to grant calendar permissions.`
+          };
+        }
+        
+        return { 
+          ok: false, 
+          error: `Connected as ${userInfo.email}, but Calendar API error: ${calendarResponse.status}`
+        };
+      }
+      
+      return { ok: true, message: `Connected as ${userInfo.email} (Calendar: ✓)` };
     } catch (err) {
       return { ok: false, error: err.message };
     }
@@ -2896,18 +3864,18 @@ Generate ONLY the welcome message, nothing else.`;
       settings.playwrightEnabled = enabled;
       await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
       
-      // Start or stop Playwright MCP based on setting
-      if (enabled) {
-        const options = {
-          ...(settings.playwrightOptions || {}),
-          browser: settings.playwrightBrowser || "chrome"
-        };
-        await startPlaywrightMcp(options);
-      } else {
-        await stopPlaywrightMcp();
+      // Update internal state
+      setPlaywrightEnabled(enabled);
+      if (settings.playwrightBrowser) {
+        setPlaywrightBrowser(settings.playwrightBrowser);
       }
       
-      return { ok: true, running: isPlaywrightMcpRunning() };
+      // If enabling, ensure CLI is installed
+      if (enabled) {
+        await ensurePlaywrightCliInstalled();
+      }
+      
+      return { ok: true, enabled: isPlaywrightEnabled(), cliInstalled: checkPlaywrightCliInstalled() };
     } catch (err) {
       return { ok: false, error: err.message };
     }
@@ -2917,15 +3885,20 @@ Generate ONLY the welcome message, nothing else.`;
     try {
       const settingsPath = await getSettingsPath();
       const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      const enabled = settings.playwrightEnabled === true;
+      setPlaywrightEnabled(enabled);
+      // Default to "chromium" which doesn't conflict with running Chrome
+      const browserSetting = settings.playwrightBrowser || "chromium";
+      setPlaywrightBrowser(browserSetting);
+      console.log(`[Playwright] Settings loaded: enabled=${enabled}, browser=${browserSetting}`);
       return { 
         ok: true, 
-        enabled: settings.playwrightEnabled === true,
-        running: isPlaywrightMcpRunning(),
-        toolCount: getPlaywrightTools().length,
-        browser: settings.playwrightBrowser || "chromium"
+        enabled,
+        cliInstalled: checkPlaywrightCliInstalled(),
+        browser: browserSetting
       };
     } catch {
-      return { ok: true, enabled: false, running: false, toolCount: 0, browser: "chrome" };
+      return { ok: true, enabled: false, cliInstalled: false, browser: "chromium" };
     }
   });
 
@@ -3015,11 +3988,8 @@ Generate ONLY the welcome message, nothing else.`;
       settings.playwrightBrowser = browser;
       await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
       
-      // If Playwright is running, restart it with the new browser
-      if (isPlaywrightMcpRunning()) {
-        await stopPlaywrightMcp();
-        await startPlaywrightMcp({ browser });
-      }
+      // Update internal browser preference
+      setPlaywrightBrowser(browser);
       
       return { ok: true };
     } catch (err) {
@@ -3029,21 +3999,21 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("integrations:testPlaywright", async () => {
     try {
-      if (!isPlaywrightMcpRunning()) {
-        return { ok: false, error: "Playwright MCP is not running. Enable it first." };
+      // Ensure CLI is installed
+      const installed = await ensurePlaywrightCliInstalled();
+      if (!installed) {
+        return { ok: false, error: "Playwright CLI is not installed. Please check your npm installation." };
       }
 
-      // Test by navigating to a simple page
-      const result = await executePlaywrightTool("browser_navigate", {
-        url: "https://example.com"
-      });
+      // Test by navigating to a simple page using CLI
+      const result = await executePlaywrightCli("open https://example.com --headed");
 
       if (result.error) {
         return { ok: false, error: result.error };
       }
 
       // Get a snapshot to verify it worked
-      const snapshot = await executePlaywrightTool("browser_snapshot", {});
+      const snapshot = await executePlaywrightCli("snapshot");
       
       if (snapshot.error) {
         return { ok: false, error: snapshot.error };
@@ -3051,10 +4021,134 @@ Generate ONLY the welcome message, nothing else.`;
 
       return { 
         ok: true, 
-        message: "Browser automation is working! Navigated to example.com successfully.",
-        toolCount: getPlaywrightTools().length,
-        tools: getPlaywrightTools().map(t => t.name)
+        message: "Browser automation is working! Navigated to example.com successfully using Playwright CLI."
       };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+  
+  // Get Playwright CLI reference for skills
+  ipcMain.handle("integrations:getPlaywrightCliReference", async () => {
+    const availableCredentials = await getAvailableCredentialDomains();
+    return { ok: true, reference: getPlaywrightCliReference(availableCredentials) };
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Credential Storage IPC Handlers
+  // Secure, local-only credential management for website logins
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("credentials:list", async () => {
+    try {
+      const credentials = await loadCredentials();
+      // Return credentials with passwords masked for display
+      const masked = Object.entries(credentials).map(([domain, cred]) => ({
+        domain: cred.domain || domain,
+        displayName: cred.displayName || domain,
+        username: cred.username || "",
+        hasPassword: !!cred.password,
+        notes: cred.notes || "",
+        lastUsed: cred.lastUsed || null,
+        created: cred.created || null
+      }));
+      return { ok: true, credentials: masked };
+    } catch (err) {
+      console.error("[Credentials] List error:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("credentials:get", async (_event, { domain, includePassword = false }) => {
+    try {
+      const credential = await getCredentialForDomain(domain);
+      if (!credential) {
+        return { ok: false, error: "Credential not found" };
+      }
+      
+      // Only include password if explicitly requested (for edit modal)
+      const result = {
+        domain: credential.domain,
+        displayName: credential.displayName || credential.domain,
+        username: credential.username || "",
+        notes: credential.notes || "",
+        lastUsed: credential.lastUsed || null,
+        created: credential.created || null
+      };
+      
+      if (includePassword) {
+        result.password = credential.password || "";
+      }
+      
+      return { ok: true, credential: result };
+    } catch (err) {
+      console.error("[Credentials] Get error:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("credentials:save", async (_event, { domain, displayName, username, password, notes }) => {
+    try {
+      if (!domain || domain.trim() === "") {
+        return { ok: false, error: "Domain is required" };
+      }
+      
+      const credentials = await loadCredentials();
+      const normalizedDomain = domain.toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+      
+      const existingCred = credentials[normalizedDomain];
+      
+      credentials[normalizedDomain] = {
+        domain: normalizedDomain,
+        displayName: displayName || normalizedDomain,
+        username: username || "",
+        password: password || existingCred?.password || "", // Keep existing password if not provided
+        notes: notes || "",
+        lastUsed: existingCred?.lastUsed || null,
+        created: existingCred?.created || new Date().toISOString()
+      };
+      
+      await saveCredentials(credentials);
+      
+      console.log(`[Credentials] Saved credential for ${normalizedDomain}`);
+      return { ok: true, domain: normalizedDomain };
+    } catch (err) {
+      console.error("[Credentials] Save error:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("credentials:delete", async (_event, { domain }) => {
+    try {
+      const credentials = await loadCredentials();
+      const normalizedDomain = domain.toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+      
+      if (!credentials[normalizedDomain]) {
+        return { ok: false, error: "Credential not found" };
+      }
+      
+      delete credentials[normalizedDomain];
+      await saveCredentials(credentials);
+      
+      console.log(`[Credentials] Deleted credential for ${normalizedDomain}`);
+      return { ok: true };
+    } catch (err) {
+      console.error("[Credentials] Delete error:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("credentials:updateLastUsed", async (_event, { domain }) => {
+    try {
+      const credentials = await loadCredentials();
+      const normalizedDomain = domain.toLowerCase();
+      
+      if (credentials[normalizedDomain]) {
+        credentials[normalizedDomain].lastUsed = new Date().toISOString();
+        await saveCredentials(credentials);
+      }
+      
+      return { ok: true };
     } catch (err) {
       return { ok: false, error: err.message };
     }
@@ -3066,6 +4160,7 @@ Generate ONLY the welcome message, nothing else.`;
       const redirectUri = "http://localhost:18923/oauth/callback";
       const scopes = [
         "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/calendar.events",
         "https://www.googleapis.com/auth/gmail.readonly",
         "https://www.googleapis.com/auth/gmail.send",
         "https://www.googleapis.com/auth/gmail.compose",
@@ -3626,6 +4721,177 @@ Generate ONLY the welcome message, nothing else.`;
         return { ok: false, error: result.error };
       }
       return { ok: true, result };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Task Pending Message Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Approve and send a pending message from a task
+  ipcMain.handle("tasks:approvePendingMessage", async (_event, { taskId, messageId, editedMessage }) => {
+    try {
+      const task = await getTask(taskId);
+      if (!task) {
+        return { ok: false, error: "Task not found" };
+      }
+
+      // Find the pending message
+      const messageIndex = task.pendingMessages?.findIndex(m => m.id === messageId);
+      if (messageIndex === undefined || messageIndex < 0) {
+        return { ok: false, error: "Pending message not found" };
+      }
+
+      const pendingMsg = task.pendingMessages[messageIndex];
+      let toolInput;
+      
+      try {
+        toolInput = JSON.parse(pendingMsg.toolInput);
+      } catch {
+        return { ok: false, error: "Invalid message data" };
+      }
+
+      // If message was edited, update the content
+      if (editedMessage) {
+        switch (pendingMsg.toolName) {
+          case 'send_email':
+            toolInput.body = editedMessage;
+            break;
+          case 'send_imessage':
+            toolInput.message = editedMessage;
+            break;
+          case 'send_slack_message':
+            toolInput.message = editedMessage;
+            break;
+        }
+      }
+
+      // Execute the actual send (bypass confirmation since user just approved)
+      console.log(`[Tasks] Sending approved message: ${pendingMsg.toolName} to ${pendingMsg.recipient}`);
+      
+      const { executeTool } = await loadIntegrationsAndBuildTools();
+      
+      // Temporarily remove the tool from confirmation list to bypass the check
+      const toolIndex = TOOLS_REQUIRING_CONFIRMATION.indexOf(pendingMsg.toolName);
+      if (toolIndex > -1) {
+        TOOLS_REQUIRING_CONFIRMATION.splice(toolIndex, 1);
+      }
+      
+      let sendResult;
+      try {
+        sendResult = await executeTool(pendingMsg.toolName, toolInput);
+      } finally {
+        // Re-add the tool to confirmation list
+        if (toolIndex > -1 && !TOOLS_REQUIRING_CONFIRMATION.includes(pendingMsg.toolName)) {
+          TOOLS_REQUIRING_CONFIRMATION.push(pendingMsg.toolName);
+        }
+      }
+
+      // Remove the pending message from task
+      task.pendingMessages.splice(messageIndex, 1);
+      
+      // Update task status - if no more pending messages, resume task
+      if (task.pendingMessages.length === 0) {
+        task.status = "active"; // Resume task execution
+      }
+      task.lastUpdated = new Date().toISOString();
+      task.executionLog.push({
+        timestamp: new Date().toISOString(),
+        message: `Sent ${pendingMsg.platform} message to ${pendingMsg.recipient}`
+      });
+
+      // Save task
+      const tasksDir = await getTasksDir();
+      const taskPath = path.join(tasksDir, `${taskId}.md`);
+      await fs.writeFile(taskPath, serializeTask(task), "utf8");
+
+      // Notify UI
+      addTaskUpdate(taskId, `Message sent to ${pendingMsg.recipient}`);
+      
+      // If task is active, continue execution
+      if (task.status === "active") {
+        setTimeout(() => executeTaskStep(taskId), 100);
+      }
+
+      return { ok: true, sendResult };
+    } catch (err) {
+      console.error(`[Tasks] Error approving message:`, err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Reject/discard a pending message
+  ipcMain.handle("tasks:rejectPendingMessage", async (_event, { taskId, messageId }) => {
+    try {
+      const task = await getTask(taskId);
+      if (!task) {
+        return { ok: false, error: "Task not found" };
+      }
+
+      // Find and remove the pending message
+      const messageIndex = task.pendingMessages?.findIndex(m => m.id === messageId);
+      if (messageIndex === undefined || messageIndex < 0) {
+        return { ok: false, error: "Pending message not found" };
+      }
+
+      const pendingMsg = task.pendingMessages[messageIndex];
+      task.pendingMessages.splice(messageIndex, 1);
+      
+      // Update task status
+      if (task.pendingMessages.length === 0) {
+        task.status = "active"; // Resume but message was skipped
+      }
+      task.lastUpdated = new Date().toISOString();
+      task.executionLog.push({
+        timestamp: new Date().toISOString(),
+        message: `Discarded ${pendingMsg.platform} message to ${pendingMsg.recipient} (user rejected)`
+      });
+
+      // Save task
+      const tasksDir = await getTasksDir();
+      const taskPath = path.join(tasksDir, `${taskId}.md`);
+      await fs.writeFile(taskPath, serializeTask(task), "utf8");
+
+      // Notify UI
+      addTaskUpdate(taskId, `Message discarded (user rejected)`);
+      
+      // Continue task execution
+      if (task.status === "active") {
+        setTimeout(() => executeTaskStep(taskId), 100);
+      }
+
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Set auto-send preference for a task
+  ipcMain.handle("tasks:setAutoSend", async (_event, { taskId, autoSend }) => {
+    try {
+      const task = await getTask(taskId);
+      if (!task) {
+        return { ok: false, error: "Task not found" };
+      }
+
+      task.autoSend = autoSend;
+      task.lastUpdated = new Date().toISOString();
+      task.executionLog.push({
+        timestamp: new Date().toISOString(),
+        message: `Auto-send ${autoSend ? 'enabled' : 'disabled'}`
+      });
+
+      // Save task
+      const tasksDir = await getTasksDir();
+      const taskPath = path.join(tasksDir, `${taskId}.md`);
+      await fs.writeFile(taskPath, serializeTask(task), "utf8");
+
+      // Notify UI
+      addTaskUpdate(taskId, `Auto-send ${autoSend ? 'enabled' : 'disabled'}`);
+
+      return { ok: true };
     } catch (err) {
       return { ok: false, error: err.message };
     }
@@ -4739,13 +6005,18 @@ Generate ONLY the welcome message, nothing else.`;
     try {
       switch (toolName) {
         case "get_calendar_events": {
-          const date = toolInput.date || new Date().toISOString().split("T")[0];
+          // Get today's date in local timezone if not specified
+          const today = new Date();
+          const dateStr = toolInput.date || `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
           const days = toolInput.days || 1;
           
-          const startDate = new Date(date);
-          startDate.setHours(0, 0, 0, 0);
-          const endDate = new Date(startDate);
-          endDate.setDate(endDate.getDate() + days);
+          // Parse date in local timezone (not UTC)
+          // "2026-01-31" should be midnight Jan 31 LOCAL time, not UTC
+          const [year, month, day] = dateStr.split('-').map(Number);
+          const startDate = new Date(year, month - 1, day, 0, 0, 0, 0);
+          const endDate = new Date(year, month - 1, day + days, 0, 0, 0, 0);
+          
+          console.log(`[Calendar] Requested date: ${dateStr}, local start: ${startDate.toLocaleString()}, local end: ${endDate.toLocaleString()}`);
           
           return await fetchCalendarEvents(accessToken, startDate, endDate);
         }
@@ -5019,102 +6290,104 @@ Generate ONLY the welcome message, nothing else.`;
         const searchName = name.toLowerCase().replace(/'/g, "''");
         console.log(`[iMessage] Looking up contact: ${name}`);
         
-        // AppleScript that outputs JSON-like format - launches Contacts if needed
-        const appleScript = `
-          tell application "Contacts"
-            launch
-            delay 0.5
-            set matchedContacts to {}
-            repeat with aPerson in people
+        // Try using the 'contacts' CLI tool first (more reliable, less permissions issues)
+        // This uses Spotlight's metadata which doesn't require Automation permission
+        exec(`mdfind -onlyin ~/Library/Application\\ Support/AddressBook "kMDItemKind == 'Contact' && kMDItemDisplayName == '*${name}*'cd"`, { timeout: 5000 }, (mdError, mdStdout) => {
+          // If mdfind works and finds something, we still need AppleScript to get phone numbers
+          // So let's try a simpler AppleScript approach
+          
+          // Simpler AppleScript - searches by name property directly
+          const appleScript = `
+            set output to ""
+            tell application "Contacts"
               try
-                set firstName to first name of aPerson as string
-              on error
-                set firstName to ""
-              end try
-              try
-                set lastName to last name of aPerson as string
-              on error
-                set lastName to ""
-              end try
-              set fullName to firstName & " " & lastName
-              set lowerFullName to do shell script "echo " & quoted form of fullName & " | tr '[:upper:]' '[:lower:]'"
-              set lowerFirst to do shell script "echo " & quoted form of firstName & " | tr '[:upper:]' '[:lower:]'"
-              set lowerLast to do shell script "echo " & quoted form of lastName & " | tr '[:upper:]' '[:lower:]'"
-              
-              if lowerFullName contains "${searchName}" or lowerFirst contains "${searchName}" or lowerLast contains "${searchName}" then
-                set phoneList to {}
-                repeat with aPhone in phones of aPerson
-                  try
-                    set phoneLabel to label of aPhone as string
-                    set phoneValue to value of aPhone as string
-                    set end of phoneList to phoneLabel & ":" & phoneValue
-                  end try
+                set foundPeople to (every person whose name contains "${searchName}")
+                repeat with aPerson in foundPeople
+                  set personName to name of aPerson
+                  set phoneInfo to ""
+                  repeat with aPhone in phones of aPerson
+                    try
+                      set phoneInfo to phoneInfo & (label of aPhone) & ":" & (value of aPhone) & ","
+                    end try
+                  end repeat
+                  if phoneInfo is not "" then
+                    set output to output & personName & "|" & phoneInfo & ";"
+                  end if
                 end repeat
-                if (count of phoneList) > 0 then
-                  set end of matchedContacts to fullName & "|" & (phoneList as string)
-                end if
-              end if
-            end repeat
-            return matchedContacts
-          end tell
-        `;
-        
-        exec(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, { timeout: 15000 }, (error, stdout) => {
-          if (error) {
-            console.error(`[iMessage] Contact lookup error: ${error.message}`);
-            resolve([]);
-            return;
-          }
+              end try
+            end tell
+            return output
+          `;
           
-          const output = stdout.trim();
-          console.log(`[iMessage] Contact lookup raw output: ${output}`);
-          
-          if (!output || output === "{}") {
-            resolve([]);
-            return;
-          }
-          
-          // Parse the output - format: "Name|phone:number, phone:number, Name2|phone:number"
-          const contacts = [];
-          // Split by comma that's followed by a name (not part of a phone number)
-          const entries = output.split(/,\s*(?=[A-Za-z])/);
-          
-          for (const entry of entries) {
-            const parts = entry.trim().split("|");
-            if (parts.length >= 2) {
-              const name = parts[0].trim();
-              const phonesStr = parts.slice(1).join("|");
+          exec(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, { timeout: 10000 }, (error, stdout, stderr) => {
+            if (error) {
+              // Check for specific permission errors
+              const errorMsg = error.message || stderr || "";
+              console.error(`[iMessage] Contact lookup error: ${errorMsg}`);
               
-              // Extract phone numbers
-              const phones = [];
-              const phoneMatches = phonesStr.match(/([^:,]+):([^,]+)/g) || [];
-              for (const pm of phoneMatches) {
-                const [label, number] = pm.split(":");
-                if (number) {
-                  phones.push({
-                    label: label?.trim() || "phone",
-                    number: number.trim()
-                  });
-                }
+              if (errorMsg.includes("not allowed") || errorMsg.includes("permission") || errorMsg.includes("(-1743)")) {
+                console.error(`[iMessage] Permission denied. Grant Automation permission for Contacts in System Settings > Privacy & Security > Automation`);
               }
               
-              // Also try to extract any remaining phone numbers
-              const extraPhones = phonesStr.match(/\+?\d[\d\s()-]{6,}/g) || [];
-              for (const phone of extraPhones) {
-                const cleanPhone = phone.replace(/[\s()-]/g, "");
-                if (!phones.some(p => p.number.replace(/[\s()-]/g, "") === cleanPhone)) {
-                  phones.push({ label: "phone", number: cleanPhone });
+              resolve([]);
+              return;
+            }
+          
+            const output = stdout.trim();
+            console.log(`[iMessage] Contact lookup raw output: ${output}`);
+            
+            if (!output || output === "" || output === "{}") {
+              console.log(`[iMessage] No contacts found for "${name}"`);
+              resolve([]);
+              return;
+            }
+            
+            // Parse the output - new format: "Name|label:number,label:number,;Name2|label:number,;"
+            const contacts = [];
+            // Split by semicolon to get individual contacts
+            const entries = output.split(";").filter(e => e.trim());
+            
+            for (const entry of entries) {
+              const parts = entry.trim().split("|");
+              if (parts.length >= 2) {
+                const contactName = parts[0].trim();
+                const phonesStr = parts.slice(1).join("|");
+                
+                // Extract phone numbers - format: "label:number,"
+                const phones = [];
+                const phoneMatches = phonesStr.match(/([^:,]+):([^,]+)/g) || [];
+                for (const pm of phoneMatches) {
+                  const colonIdx = pm.indexOf(":");
+                  if (colonIdx > -1) {
+                    const label = pm.substring(0, colonIdx).trim();
+                    const number = pm.substring(colonIdx + 1).trim();
+                    if (number) {
+                      phones.push({
+                        label: label || "phone",
+                        number: number
+                      });
+                    }
+                  }
                 }
-              }
-              
-              if (phones.length > 0) {
-                contacts.push({ name, phones });
+                
+                // Also try to extract any remaining phone numbers
+                const extraPhones = phonesStr.match(/\+?\d[\d\s()-]{6,}/g) || [];
+                for (const phone of extraPhones) {
+                  const cleanPhone = phone.replace(/[\s()-]/g, "");
+                  if (!phones.some(p => p.number.replace(/[\s()-]/g, "") === cleanPhone)) {
+                    phones.push({ label: "phone", number: cleanPhone });
+                  }
+                }
+                
+                if (phones.length > 0) {
+                  contacts.push({ name: contactName, phones });
+                }
               }
             }
-          }
-          
-          console.log(`[iMessage] Found ${contacts.length} contacts:`, JSON.stringify(contacts));
-          resolve(contacts);
+            
+            console.log(`[iMessage] Found ${contacts.length} contacts:`, JSON.stringify(contacts));
+            resolve(contacts);
+          });
         });
       });
     };
@@ -5423,13 +6696,15 @@ Generate ONLY the welcome message, nothing else.`;
           logMessage: { type: "string", description: "What happened during this execution (be specific)" },
           nextStatus: { 
             type: "string", 
-            enum: ["active", "waiting", "completed", "failed"],
-            description: "active=continue to next step now, waiting=wait for external event (set pollIntervalMs), completed=all done, failed=error" 
+            enum: ["active", "waiting", "waiting_for_input", "completed", "failed"],
+            description: "active=continue to next step now, waiting=wait for external event (set pollIntervalMs), waiting_for_input=need user clarification (ask in logMessage), completed=all done, failed=error" 
           },
           nextStep: { type: "number", description: "The next step number (current step + 1 if advancing)" },
           pollIntervalMs: { type: "number", description: "If waiting, milliseconds until next check. Use 3600000 for 1 hour, 86400000 for 1 day" },
           contextUpdates: { type: "object", description: "Key-value pairs to remember for future steps" },
-          notifyUser: { type: "string", description: "Message to show the user in chat (optional)" }
+          notifyUser: { type: "string", description: "Message to show the user in chat (optional)" },
+          clarificationQuestion: { type: "string", description: "If waiting_for_input, the specific question to ask the user" },
+          modifyPlan: { type: "array", items: { type: "string" }, description: "Optional: New steps to replace the remaining plan based on new information" }
         },
         required: ["logMessage", "nextStatus"]
       }
@@ -5573,15 +6848,59 @@ CRITICAL - User Notifications:
    - The final step should verify the success criteria before marking complete
    `}
 
+8. CREDENTIAL SECURITY (CRITICAL):
+   - NEVER include actual passwords or credentials in logMessage or any output
+   - When using browser automation to log into websites, use secure placeholders:
+     * Username: {{credential:domain.com:username}}
+     * Password: {{credential:domain.com:password}}
+   - The actual credentials are injected locally and NEVER pass through this task log
+   - If login fails, inform user to check their credentials in the Credentials page
+   - NEVER ask users for their password or store passwords in task context
+
+9. MID-TASK CLARIFICATION:
+   - If a step cannot be completed without user input, use nextStatus: "waiting_for_input"
+   - Set clarificationQuestion to the SPECIFIC question you need answered
+   - Examples: "Which Igor do you mean? I found: Igor Petrov (work), Igor Santos (personal)", "Which messaging platform should I use: iMessage, Slack, or email?"
+   - The user will respond in chat, and the task will resume with their answer
+   - After receiving user input, you may need to MODIFY the remaining plan using modifyPlan
+
+10. DYNAMIC PLAN MODIFICATION:
+   - If information learned during execution changes what needs to be done, use modifyPlan
+   - modifyPlan replaces ALL remaining steps from the current step onwards
+   - Example: If step 1 discovers the contact is only on Slack (not iMessage), update remaining steps accordingly
+   - Include clear, actionable step descriptions just like the original plan
+
 IMPORTANT: You MUST call update_task_state before finishing. Always advance to the next step after completing the current one.`;
 
-    // Build user message - make it clear if a reply was received
+    // Build user message - make it clear if a reply was received or user provided input
     const replyDetected = task.contextMemory?.new_reply_detected;
     const waitingVia = task.contextMemory?.waiting_via;
     const waitingFor = task.contextMemory?.waiting_for_contact;
+    const userResponse = task.contextMemory?.userResponse;
     
     let userPrompt;
-    if (replyDetected && waitingVia && waitingFor) {
+    
+    // Case 1: User just responded to a clarification question
+    if (userResponse) {
+      userPrompt = `📝 USER PROVIDED INPUT IN RESPONSE TO YOUR QUESTION!
+
+The user responded: "${userResponse}"
+
+Your current step is ${task.currentStep.step}: "${task.plan[task.currentStep.step - 1]}"
+
+ACTION REQUIRED:
+1. Use the user's response to continue with the current step
+2. If the response changes what needs to be done, use modifyPlan to update remaining steps
+3. Execute the action(s) needed for this step using the new information
+4. Call update_task_state with:
+   - logMessage describing what you did with the user's input
+   - contextUpdates.userResponse = null (clear the response after using it)
+   - Set nextStatus and nextStep appropriately
+
+IMPORTANT: The user took the time to respond, so make good use of their input!`;
+    }
+    // Case 2: External reply detected (email, slack, etc.)
+    else if (replyDetected && waitingVia && waitingFor) {
       userPrompt = `🔔 A REPLY HAS BEEN RECEIVED from ${waitingFor} via ${waitingVia}!
 
 Your current step is ${task.currentStep.step}: "${task.plan[task.currentStep.step - 1]}"
@@ -5602,7 +6921,9 @@ ACTION REQUIRED:
    - contextUpdates.new_reply_detected = false
 
 IMPORTANT: Only advance if the step's condition is truly met. A reply alone doesn't mean success.`;
-    } else {
+    } 
+    // Case 3: Normal step execution
+    else {
       userPrompt = `Execute step ${task.currentStep.step}: "${task.plan[task.currentStep.step - 1]}"\n\nDo the action required for this step, then call update_task_state with the results.`;
     }
     
@@ -5689,6 +7010,24 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
               updates.contextMemory = { ...task.contextMemory, ...input.contextUpdates };
             }
 
+            // Handle plan modification if provided
+            if (input.modifyPlan && Array.isArray(input.modifyPlan) && input.modifyPlan.length > 0) {
+              // Keep steps before current step, replace the rest with new plan
+              const currentStepIndex = task.currentStep.step - 1;
+              const existingSteps = task.plan.slice(0, currentStepIndex);
+              updates.plan = [...existingSteps, ...input.modifyPlan];
+              console.log(`[Tasks] Plan modified: ${existingSteps.length} existing steps + ${input.modifyPlan.length} new steps`);
+            }
+
+            // Handle clarification question
+            if (input.clarificationQuestion && input.nextStatus === "waiting_for_input") {
+              updates.contextMemory = {
+                ...(updates.contextMemory || task.contextMemory),
+                pendingClarification: input.clarificationQuestion,
+                clarificationTimestamp: new Date().toISOString()
+              };
+            }
+
             await updateTask(taskId, updates);
 
             // PROACTIVE NOTIFICATIONS - Always notify user of important task events
@@ -5713,6 +7052,12 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
                 notificationEmoji = "📝";
                 const nextStepDesc = task.plan[input.nextStep - 1] || "";
                 notificationMessage = `Step ${task.currentStep.step} complete: ${input.logMessage}\n\nMoving to step ${input.nextStep}: ${nextStepDesc}`;
+              }
+              // Waiting for user input/clarification
+              else if (input.nextStatus === "waiting_for_input") {
+                notificationEmoji = "❓";
+                const question = input.clarificationQuestion || "I need more information to continue.";
+                notificationMessage = `${input.logMessage}\n\n**Question:** ${question}\n\nPlease reply in the chat to continue the task.`;
               }
               // Waiting for reply - brief update  
               else if (input.nextStatus === "waiting") {
@@ -5766,7 +7111,15 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
             
           } else {
             // Use shared tool executor for all other tools
-            toolResult = await executeTool(toolUse.name, toolUse.input);
+            // Pass task context so message confirmations can be stored in the task
+            const taskContext = { taskId, autoSend: task.autoSend || false };
+            toolResult = await executeTool(toolUse.name, toolUse.input, taskContext);
+            
+            // If a message is pending approval, update task status and return
+            if (toolResult && toolResult.pending) {
+              console.log(`[Tasks] Message pending approval in task ${taskId}`);
+              return { success: true, pendingMessage: true, message: toolResult.message };
+            }
           }
 
           toolResults.push({
@@ -5809,6 +7162,634 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
     google: "gemini-1.5-flash"
   };
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Input Type Detection - Classify input as query/command/information
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Detects if user input is a query, command, or informational statement
+   * @param {string} input - User's message
+   * @param {Object} apiKeys - Available API keys
+   * @param {string} activeProvider - The active LLM provider
+   * @returns {Object} { type: "query"|"command"|"information", confidence: number, reason: string }
+   */
+  async function detectInputType(input, apiKeys, activeProvider) {
+    const prompt = `Classify this user input into one of three types:
+"${input}"
+
+Types:
+- "query": User is asking a question or requesting information (e.g., "What's the weather?", "What's on my calendar?")
+- "command": User wants to perform an action or task (e.g., "Send email to John", "Schedule a meeting", "Find flights to London")
+- "information": User is sharing personal facts, relationships, or context they want remembered for future conversations
+
+Examples of "information" (statements of fact to remember):
+- "Igor is my contractor working on the house" → contact/relationship info
+- "Connie is my mother. Daddee is my father" → family relationships
+- "Curly is the name of my children's school" → place info
+- "My wife's birthday is March 15" → date/personal info
+- "Brightwheel is the app for my daughter's daycare" → context info
+- "I'm allergic to peanuts" → preference/health info
+- "The house renovation is currently on hold due to permits" → situation update
+
+Key indicators of "information":
+- Declarative statements (not questions)
+- Defines relationships ("X is my...")
+- Shares personal facts, dates, preferences
+- Provides context about people, places, or situations
+- Does NOT ask for action or information
+
+Respond with ONLY JSON (no markdown):
+{
+  "type": "query" | "command" | "information",
+  "confidence": 0.0-1.0,
+  "reason": "brief explanation"
+}`;
+
+    try {
+      if (apiKeys.anthropic) {
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKeys.anthropic,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.anthropic,
+            max_tokens: 256,
+            messages: [{ role: "user", content: prompt }]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.content?.[0]?.text || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[InputType] Classified as: ${result.type} (confidence: ${result.confidence})`);
+            return result;
+          }
+        }
+      }
+
+      if (apiKeys.openai) {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKeys.openai}`
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.openai,
+            max_tokens: 256,
+            messages: [
+              { role: "system", content: "You classify user input. Respond with only JSON." },
+              { role: "user", content: prompt }
+            ]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.choices?.[0]?.message?.content || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[InputType] Classified as: ${result.type} (confidence: ${result.confidence})`);
+            return result;
+          }
+        }
+      }
+
+      // Default to command if classification fails
+      return { type: "command", confidence: 0.5, reason: "Classification failed, defaulting to command" };
+    } catch (err) {
+      console.error("[InputType] Error:", err.message);
+      return { type: "command", confidence: 0.5, reason: "Error during classification" };
+    }
+  }
+
+  /**
+   * Extracts structured facts from an informational statement
+   * @param {string} input - User's informational statement
+   * @param {Object} apiKeys - Available API keys
+   * @param {string} activeProvider - The active LLM provider
+   * @returns {Object} { facts: [{ category, summary, entities, subject }] }
+   */
+  async function extractFacts(input, apiKeys, activeProvider) {
+    const prompt = `Extract facts from this statement to save to a user profile:
+"${input}"
+
+Categories:
+- contact_info: Info about a person (name, role, relationship to user)
+- place_info: Info about locations, schools, workplaces, businesses
+- date_info: Birthdays, anniversaries, important dates
+- preference_info: Likes, dislikes, allergies, preferences
+- context_info: Project status, ongoing situations, current events in user's life
+
+For each fact, provide:
+- category: One of the above
+- summary: A clear one-line note suitable for a profile (e.g., "Igor is my contractor working on house renovation")
+- entities: Key entities extracted (name, relationship, date, etc.)
+- subject: The main subject this fact is about (for conflict detection)
+
+Respond with ONLY JSON (no markdown):
+{
+  "facts": [
+    {
+      "category": "contact_info",
+      "summary": "Igor is my contractor working on the house renovation",
+      "entities": { "name": "Igor", "role": "contractor", "project": "house renovation" },
+      "subject": "Igor"
+    }
+  ]
+}`;
+
+    try {
+      if (apiKeys.anthropic) {
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKeys.anthropic,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.anthropic,
+            max_tokens: 1024,
+            messages: [{ role: "user", content: prompt }]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.content?.[0]?.text || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[ExtractFacts] Extracted ${result.facts?.length || 0} facts`);
+            return result;
+          }
+        }
+      }
+
+      if (apiKeys.openai) {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKeys.openai}`
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.openai,
+            max_tokens: 1024,
+            messages: [
+              { role: "system", content: "You extract facts from statements. Respond with only JSON." },
+              { role: "user", content: prompt }
+            ]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.choices?.[0]?.message?.content || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[ExtractFacts] Extracted ${result.facts?.length || 0} facts`);
+            return result;
+          }
+        }
+      }
+
+      return { facts: [] };
+    } catch (err) {
+      console.error("[ExtractFacts] Error:", err.message);
+      return { facts: [] };
+    }
+  }
+
+  /**
+   * Detects conflicts between new facts and existing profile notes
+   * @param {Array} newFacts - Array of new facts to save
+   * @param {Array} existingNotes - Array of existing profile notes
+   * @param {Object} apiKeys - Available API keys
+   * @param {string} activeProvider - The active LLM provider
+   * @returns {Object} { conflicts: [...], nonConflictingFactIndexes: [...] }
+   */
+  async function detectFactConflicts(newFacts, existingNotes, apiKeys, activeProvider) {
+    if (!existingNotes || existingNotes.length === 0) {
+      return { 
+        conflicts: [], 
+        nonConflictingFactIndexes: newFacts.map((_, i) => i) 
+      };
+    }
+
+    if (!newFacts || newFacts.length === 0) {
+      return { conflicts: [], nonConflictingFactIndexes: [] };
+    }
+
+    const prompt = `Compare these NEW facts against EXISTING profile notes and identify conflicts.
+
+NEW FACTS:
+${newFacts.map((f, i) => `${i + 1}. ${f.summary}`).join('\n')}
+
+EXISTING PROFILE NOTES:
+${existingNotes.map((n, i) => `${i + 1}. ${n}`).join('\n')}
+
+A CONFLICT exists when:
+- Same subject (person, place, thing) has CONTRADICTORY information
+- Example CONFLICT: "Wife's birthday is March 3rd" vs "Wife's birthday is April 10th" (different dates for same event)
+- Example CONFLICT: "Igor is my contractor" vs "Igor is my neighbor" (different relationships)
+- Example CONFLICT: "Connie is my mother" vs "Connie is my aunt" (different relationships)
+
+NOT a conflict (complementary info):
+- "Igor is my contractor" and "Igor is working on the house renovation" (adds detail, doesn't contradict)
+- "Wife's birthday is March 3rd" and "Wife's name is Sarah" (different attributes)
+
+Respond with ONLY JSON (no markdown):
+{
+  "conflicts": [
+    {
+      "newFactIndex": 0,
+      "existingNoteIndex": 2,
+      "newFact": "the new fact text",
+      "existingNote": "the existing note text",
+      "subject": "what/who the conflict is about",
+      "conflictDescription": "You previously said X, but now you're saying Y. Which is correct?"
+    }
+  ],
+  "nonConflictingFactIndexes": [1, 3]
+}
+
+If no conflicts found, return empty conflicts array and all fact indexes in nonConflictingFactIndexes.`;
+
+    try {
+      if (apiKeys.anthropic) {
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKeys.anthropic,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.anthropic,
+            max_tokens: 1024,
+            messages: [{ role: "user", content: prompt }]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.content?.[0]?.text || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[ConflictDetect] Found ${result.conflicts?.length || 0} conflicts`);
+            return result;
+          }
+        }
+      }
+
+      if (apiKeys.openai) {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKeys.openai}`
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.openai,
+            max_tokens: 1024,
+            messages: [
+              { role: "system", content: "You detect conflicts in user profile information. Respond with only JSON." },
+              { role: "user", content: prompt }
+            ]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.choices?.[0]?.message?.content || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[ConflictDetect] Found ${result.conflicts?.length || 0} conflicts`);
+            return result;
+          }
+        }
+      }
+
+      // Default: no conflicts
+      return { 
+        conflicts: [], 
+        nonConflictingFactIndexes: newFacts.map((_, i) => i) 
+      };
+    } catch (err) {
+      console.error("[ConflictDetect] Error:", err.message);
+      return { 
+        conflicts: [], 
+        nonConflictingFactIndexes: newFacts.map((_, i) => i) 
+      };
+    }
+  }
+
+  /**
+   * Intelligent Query Understanding - Pre-decomposition phase
+   * Extracts entities, resolves ambiguities using context, and enriches the query
+   * 
+   * @param {string} query - The raw user query
+   * @param {Object} context - Context for understanding
+   * @param {Object} context.profile - User profile (city, name, preferences)
+   * @param {Object} context.conversationContext - Recent conversation history
+   * @param {Array} context.calendarEvents - Today's calendar events
+   * @param {Date} context.currentDate - Current date/time
+   * @param {Object} apiKeys - Available API keys
+   * @param {string} activeProvider - The active LLM provider
+   * @returns {Object} Understanding result with enriched query and extracted entities
+   */
+  async function understandQuery(query, context, apiKeys, activeProvider) {
+    const { profile, conversationContext, calendarEvents, currentDate, sessionMessages } = context;
+    
+    // Format current date for the prompt
+    const dateStr = currentDate.toLocaleDateString('en-US', { 
+      weekday: 'long', 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric' 
+    });
+    
+    // Format calendar events for context
+    let calendarStr = "No events today";
+    if (calendarEvents && calendarEvents.length > 0) {
+      calendarStr = calendarEvents.map(e => {
+        const startTime = e.start ? new Date(e.start).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : 'All day';
+        return `- ${startTime}: ${e.title}${e.location ? ` at ${e.location}` : ''}`;
+      }).join("\n");
+    }
+    
+    // Format profile notes/preferences
+    let preferencesStr = "";
+    if (profile?.notes && profile.notes.length > 0) {
+      preferencesStr = profile.notes.map(n => `- ${n}`).join("\n");
+    }
+    
+    // Format immediate context from current session (last 2-3 exchanges)
+    // This is critical for resolving follow-up questions and references like "those", "that", etc.
+    let immediateContext = "";
+    if (sessionMessages && sessionMessages.length > 0) {
+      // Get the last 6 messages (up to 3 user-assistant pairs) excluding the current query
+      const previousMessages = sessionMessages.slice(-7, -1); // Exclude the current message
+      if (previousMessages.length > 0) {
+        immediateContext = previousMessages.map(m => {
+          const role = m.role === 'assistant' ? 'Assistant' : 'User';
+          // Truncate very long messages but keep enough context
+          const content = m.content.length > 1500 ? m.content.slice(0, 1500) + '...[truncated]' : m.content;
+          return `${role}: ${content}`;
+        }).join("\n\n");
+      }
+    }
+    
+    // Format recent conversation for additional context (from memory files)
+    let recentConversation = "";
+    if (conversationContext?.todayMessages) {
+      // Get last 500 chars of today's messages for context
+      const messages = conversationContext.todayMessages;
+      recentConversation = messages.length > 500 ? messages.slice(-500) : messages;
+    }
+
+    const understandingPrompt = `You are a query understanding system. Your job is to extract entities, resolve ambiguities, and enrich the user's query using available context.
+
+## Current Context
+Today is ${dateStr}.
+Current time: ${currentDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}.
+
+## User Profile
+- Name: ${profile?.firstName || 'Unknown'} ${profile?.lastName || ''}
+- Location/City: ${profile?.city || 'Unknown'}
+- Occupation: ${profile?.occupation || 'Unknown'}
+${preferencesStr ? `\nUser Preferences/Notes:\n${preferencesStr}` : ''}
+
+## Today's Calendar
+${calendarStr}
+
+## Immediate Conversation Context (MOST IMPORTANT FOR FOLLOW-UPS)
+${immediateContext || 'This is the first message in this conversation'}
+
+**CRITICAL: Use this context to resolve ANY references in the user's query:**
+- "those messages" / "these messages" → messages the assistant just mentioned
+- "that" / "those" / "these" / "it" → items/entities from assistant's last response
+- "the dates" / "the times" → dates/times of items just discussed
+- "him" / "her" / "them" → people mentioned in recent exchange
+- "that person" / "the person" → the person just mentioned
+
+## Earlier Conversation (for additional context)
+${recentConversation || 'No earlier messages'}
+
+## User Query
+"${query}"
+
+## Your Task
+Analyze the query and extract/resolve the following:
+
+1. **DATES**: Any date/time references
+   - Relative dates ("Monday", "tomorrow", "next week") → exact dates
+   - Relative times ("after my meeting", "in 2 hours") → exact times
+   - Calculate based on today being ${dateStr}
+
+2. **LOCATIONS**: Any location references
+   - If travel query and no origin specified → use user's city as default origin
+   - Resolve vague references ("home", "work", "there")
+   - Include airport codes when relevant for travel
+
+3. **PEOPLE**: Any person references
+   - Resolve pronouns ("him", "her", "them") using conversation context
+   - Identify names mentioned
+
+4. **QUANTITIES**: Numbers and amounts
+   - Number of travelers (default to 1 if not specified for travel)
+   - Number of items, tickets, etc.
+
+5. **MISSING PARAMETERS**: What's needed but not provided
+   - For travel: return date (suggest default if one-way not explicit)
+   - For meetings: duration, attendees
+   - For messages: recipients
+
+6. **REFERENCES** (CRITICAL for follow-up questions):
+   - "those", "these", "that", "it", "the [noun]" → resolve to specific entities from immediate conversation
+   - "those messages" → identify which specific messages were just discussed by the assistant
+   - "that person" / "him" / "her" → identify who was just mentioned
+   - "the dates" / "the times" → dates/times of items the assistant just mentioned
+   - If the assistant just mentioned specific items/messages/people/data, assume demonstrative references point to those
+   - This is the MOST IMPORTANT resolution for follow-up questions
+
+7. **ENRICHED QUERY**: Rewrite the query with all ambiguities resolved, especially references
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{
+  "original_query": "the original query",
+  "enriched_query": "fully resolved query with specific dates, locations, references resolved, etc.",
+  "entities": {
+    "dates": [
+      { "raw": "original text", "resolved": "YYYY-MM-DD", "type": "departure|return|meeting|deadline", "reasoning": "how you resolved it" }
+    ],
+    "times": [
+      { "raw": "original text", "resolved": "HH:MM", "type": "start|end", "reasoning": "how you resolved it" }
+    ],
+    "locations": {
+      "origin": { "raw": "original or null", "resolved": "city name", "code": "airport code if travel", "source": "query|profile|context" },
+      "destination": { "raw": "original", "resolved": "city name", "code": "airport code if travel" }
+    },
+    "people": [
+      { "raw": "original reference", "resolved": "full name", "source": "query|context" }
+    ],
+    "quantities": [
+      { "type": "travelers|items|etc", "value": number, "inferred": true/false }
+    ],
+    "references": [
+      { "raw": "those messages", "resolved": "the 3 messages from Igor about house access", "type": "messages|items|data", "source": "immediate_context" }
+    ]
+  },
+  "ambiguities_resolved": [
+    { "type": "date|location|person|quantity|reference", "raw": "original", "resolved": "resolved value", "reasoning": "explanation" }
+  ],
+  "missing_parameters": [
+    { "param": "parameter name", "handling": "default_value|ask_user", "suggested_value": "value if defaulting", "question": "question if asking user" }
+  ],
+  "context_applied": [
+    "description of context used"
+  ],
+  "clarification_needed": false,
+  "clarification_questions": []
+}
+
+IMPORTANT RULES:
+
+## ACTION-FIRST PRINCIPLE (CRITICAL)
+- DEFAULT TO ACTION, NOT CLARIFICATION. If you can make a reasonable assumption, MAKE IT and proceed.
+- Only set clarification_needed=true when execution is IMPOSSIBLE without user input.
+- NEVER ask generic questions like "what specific details are you looking for?" - be specific or don't ask at all.
+
+## When to NOT ask for clarification:
+- Message retrieval queries (e.g., "messages from Igor") → proceed with available platforms
+- Contact lookups → just look up the contact
+- Calendar queries → just fetch the calendar
+- Search queries → just search
+- Any query where you can take meaningful action → TAKE ACTION
+
+## When clarification IS appropriate (rare):
+- Multiple people with same name AND it affects results significantly
+- Travel queries where origin is truly unknown AND not inferable from profile
+- Ambiguous time references that could mean very different things
+
+## Specific Query Type Guidance:
+- "messages from [person]" → enrich to: "Retrieve latest messages from [person] across available messaging platforms (iMessage, Slack, WhatsApp)"
+- "what did [person] say about X" → enrich to: "Search messages from [person] for content about X"
+- "[person]'s contact" → enrich to: "Look up contact information for [person]"
+
+## Reference Resolution:
+- FOLLOW-UP QUESTIONS: If the query uses "those", "these", "that", "it", ALWAYS check the Immediate Conversation Context to resolve the reference. Do NOT ask for clarification.
+- Example: If assistant just listed "3 messages from Igor about house access" and user asks "what were the dates of those messages?", resolve to "What are the dates of the 3 messages from Igor about house access that were just discussed?"
+
+## Other Rules:
+- For travel queries without return date, default to round-trip with 1-week return unless "one-way" is mentioned
+- Always resolve relative dates to exact dates based on today's date
+- Be specific in the enriched_query - include dates, times, and all resolved entities`;
+
+    try {
+      // Use Anthropic if available (preferred)
+      if (apiKeys.anthropic) {
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKeys.anthropic,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.anthropic,
+            max_tokens: 2048,
+            messages: [{ role: "user", content: understandingPrompt }]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.content?.[0]?.text || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[QueryUnderstanding] Enriched query: "${result.enriched_query}"`);
+            console.log(`[QueryUnderstanding] Entities:`, JSON.stringify(result.entities, null, 2));
+            console.log(`[QueryUnderstanding] Context applied:`, result.context_applied);
+            if (result.clarification_needed) {
+              console.log(`[QueryUnderstanding] Clarification needed:`, result.clarification_questions);
+            }
+            return result;
+          }
+        }
+      }
+      
+      // Fallback to OpenAI
+      if (apiKeys.openai) {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKeys.openai}`
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.openai,
+            max_tokens: 2048,
+            messages: [
+              { role: "system", content: "You are a query understanding assistant. Respond with only JSON." },
+              { role: "user", content: understandingPrompt }
+            ]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.choices?.[0]?.message?.content || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[QueryUnderstanding] Enriched query: "${result.enriched_query}"`);
+            return result;
+          }
+        }
+      }
+
+      // Default passthrough if understanding fails
+      console.log("[QueryUnderstanding] Understanding failed, using original query");
+      return {
+        original_query: query,
+        enriched_query: query,
+        entities: { dates: [], times: [], locations: {}, people: [], quantities: [] },
+        ambiguities_resolved: [],
+        missing_parameters: [],
+        context_applied: [],
+        clarification_needed: false,
+        clarification_questions: []
+      };
+
+    } catch (err) {
+      console.error("[QueryUnderstanding] Error:", err.message);
+      return {
+        original_query: query,
+        enriched_query: query,
+        entities: { dates: [], times: [], locations: {}, people: [], quantities: [] },
+        ambiguities_resolved: [],
+        missing_parameters: [],
+        context_applied: [],
+        clarification_needed: false,
+        clarification_questions: []
+      };
+    }
+  }
+
   /**
    * Classifies query complexity using a fast LLM call
    * @param {string} query - The user's query
@@ -5829,11 +7810,24 @@ Respond with ONLY a JSON object (no markdown, no explanation):
 }
 
 Classification rules:
-- "simple": Single action, question, or 1-2 tool calls. Examples: "what's the weather?", "send an email to Bob", "what's on my calendar?"
-- "multi_step": Multiple sequential actions that can run immediately, 3-6 tool calls. Examples: "find Chris's message in Slack and reply to it", "check my calendar and email the team about the meeting"
-- "complex_async": Requires waiting for external events, human responses, or very long operations (7+ steps). Examples: "email John to schedule a meeting and wait for his reply", "monitor Slack for messages"
+- "simple": ONLY truly single actions with NO data dependencies. Examples: "what's the weather?", "what time is it?", "what's on my calendar today?"
+- "multi_step": ANY query that involves:
+  * Looking up a contact AND then doing something with that contact (messages, email, etc.)
+  * Searching/retrieving data AND then filtering or analyzing it
+  * Multiple sequential actions where output of one step informs the next
+  * Message retrieval from a person (requires: lookup contact → search messages → filter results)
+  * Examples: "messages from Igor", "find Chris's email and reply", "what did John say about the project?"
+- "complex_async": Requires waiting for external events, human responses, or monitoring. Examples: "wait for John's reply", "monitor Slack for messages"
 
-Set requires_waiting=true ONLY if the task needs to wait for: email replies, message responses, external API callbacks, or human input.`;
+IMPORTANT - These are ALWAYS multi_step:
+- "messages from [person]" - requires contact lookup + message search + filtering
+- "what did [person] say about X" - requires contact lookup + message search + content analysis
+- "[person]'s latest messages" - requires contact lookup + message retrieval
+- "find [something] and [do action with it]" - two dependent steps
+
+Set requires_waiting=true ONLY if the task needs to wait for: email replies, message responses, external API callbacks, or human input between steps.
+
+IMPORTANT: Browser automation (page loads, clicking buttons, form submissions) is NOT waiting. These are immediate automated actions.`;
 
     try {
       // Use Anthropic if available (preferred)
@@ -5953,9 +7947,34 @@ CRITICAL Rules:
 1. Each step should be atomic - one clear action
 2. Steps should be in logical execution order
 3. Set depends_on_previous=true if step needs data from previous step
-4. Set may_require_waiting=true ONLY for steps waiting for external responses (email replies, etc.)
-5. Set requires_task=true if ANY step has may_require_waiting=true OR if there are 7+ steps OR if task_type is "continuous"
+4. Set may_require_waiting=true ONLY for steps waiting for HUMAN responses (email replies, chat messages from others, etc.)
+   - Browser automation (page loads, form submissions, clicking) is IMMEDIATE - NOT waiting
+   - API calls are IMMEDIATE - NOT waiting  
+   - Only set true when waiting for another PERSON to respond
+5. Set requires_task=true if ANY step has may_require_waiting=true OR if there are 10+ steps OR if task_type is "continuous"
 6. Be specific about which tool to use in each step
+
+DYNAMIC STEP ADJUSTMENT:
+- Steps can be adjusted based on information learned during execution
+- If a step discovers something unexpected, subsequent steps may need to change
+- If user provides additional context mid-task, steps should adapt
+- Example: If step 1 "lookup contact" fails, add a step to "ask user for contact details" and continue
+
+BROWSER AUTOMATION - IMPORTANT:
+7. If a task requires finding information from the web (flights, hotels, products, prices, news, etc.) and no specific tool exists, USE browser_automation!
+8. When browser automation is needed, create EXPLICIT steps:
+   - Step 1: "Open [specific website URL]" using browser_automation
+   - Step 2: "Take screenshot to see page content" using browser_automation
+   - Step 3: "Fill search form with [specific details]" using browser_automation
+   - Step 4: "Click search button" using browser_automation
+   - Step 5: "Take screenshot to see results" using browser_automation
+   - Step 6: "Extract relevant information from results" using browser_automation
+9. ALWAYS pick a specific website. Common choices:
+   - Flights: https://www.google.com/travel/flights OR https://www.kayak.com OR https://www.expedia.com
+   - Hotels: https://www.booking.com OR https://www.hotels.com
+   - Products/Shopping: https://www.amazon.com OR https://www.google.com/shopping
+   - General search: https://www.google.com
+10. NEVER say "I don't have access to X" - if browser_automation is available, USE IT to browse websites!
 
 FOR DISCRETE TASKS (task_type: "discrete"):
 7. Set success_criteria to describe what defines completion
@@ -6381,19 +8400,50 @@ ${formatDecomposedSteps(steps)}
     if (weatherEnabled) tools.push(...weatherTools);
     if (slackAccessToken) tools.push(...slackTools);
     
-    // Add Playwright browser automation tools if enabled
-    if (playwrightEnabled) {
-      const pwTools = getPlaywrightTools();
-      if (pwTools.length > 0) {
-        tools.push(...pwTools);
-        console.log(`[Tools] Added ${pwTools.length} Playwright browser tools`);
-      }
-    }
+    // Note: Playwright CLI commands are NOT added as tools
+    // Instead, the LLM generates CLI commands inline which are detected and executed
+    // This is more token-efficient than loading tool schemas
     
     if (additionalTools.length > 0) tools.push(...additionalTools);
 
     // Tool execution router
-    const executeTool = async (toolName, toolInput) => {
+    // taskContext is optional - if provided, message confirmations will use task-based approval
+    const executeTool = async (toolName, toolInput, taskContext = null) => {
+      // ─────────────────────────────────────────────────────────────────────
+      // MESSAGE CONFIRMATION SAFEGUARD
+      // All message-sending tools require explicit user approval
+      // ─────────────────────────────────────────────────────────────────────
+      if (TOOLS_REQUIRING_CONFIRMATION.includes(toolName)) {
+        try {
+          console.log(`[Confirmation] Tool ${toolName} requires user confirmation${taskContext ? ` (task: ${taskContext.taskId})` : ''}`);
+          const result = await requestMessageConfirmation(toolName, toolInput, taskContext);
+          
+          // Check if message was stored as pending in a task
+          if (result && typeof result === 'object' && result.pendingInTask) {
+            return { 
+              pending: true,
+              message: `Message queued for approval in task. Check the Tasks panel to review and send.`,
+              taskId: result.taskId,
+              messageId: result.messageId
+            };
+          }
+          
+          if (!result) {
+            return { 
+              error: 'Message not sent - user did not approve',
+              cancelled: true
+            };
+          }
+          console.log(`[Confirmation] User approved ${toolName}, proceeding with send`);
+        } catch (err) {
+          console.log(`[Confirmation] Message cancelled: ${err.message}`);
+          return { 
+            error: `Message not sent: ${err.message}`,
+            cancelled: true
+          };
+        }
+      }
+      
       // Profile tools
       if (profileTools.find(t => t.name === toolName)) {
         return await executeProfileTool(toolName, toolInput);
@@ -6422,10 +8472,9 @@ ${formatDecomposedSteps(steps)}
       if (slackAccessToken && slackTools.find(t => t.name === toolName)) {
         return await executeSlackTool(toolName, toolInput, slackAccessToken);
       }
-      // Playwright browser tools
-      if (playwrightEnabled && getPlaywrightTools().find(t => t.name === toolName)) {
-        return await executePlaywrightTool(toolName, toolInput);
-      }
+      
+      // Note: Playwright commands are NOT handled as tools
+      // They are detected and executed inline from LLM response text
       
       return { error: `Tool ${toolName} not available` };
     };
@@ -6482,12 +8531,11 @@ ${formatDecomposedSteps(steps)}
     try {
       const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
       if (settings.playwrightEnabled === true) {
-        // Start Playwright MCP if not already running
-        if (!isPlaywrightMcpRunning()) {
-          const options = settings.playwrightOptions || {};
-          await startPlaywrightMcp(options);
+        playwrightIsEnabled = true;
+        setPlaywrightEnabled(true);
+        if (settings.playwrightBrowser) {
+          setPlaywrightBrowser(settings.playwrightBrowser);
         }
-        playwrightIsEnabled = isPlaywrightMcpRunning();
       }
     } catch {
       // Default disabled
@@ -6614,6 +8662,38 @@ ${formatDecomposedSteps(steps)}
   async function processChatQuery(messages, options = {}) {
     const { skipDecomposition = false, stepContext = null } = options;
     
+    // Check if there's a task waiting for user input
+    // If so, route the user's message to that task
+    const userMessage = messages[messages.length - 1]?.content || "";
+    const waitingTasks = await getTasksWaitingForInput();
+    if (waitingTasks.length > 0 && userMessage.trim()) {
+      const task = waitingTasks[0]; // Handle most recent task waiting for input
+      console.log(`[Tasks] Routing user message to task ${task.id} waiting for input`);
+      
+      // Store user response in task context and resume
+      const clarificationQuestion = task.contextMemory?.pendingClarification || "";
+      await updateTask(task.id, {
+        status: "active",
+        contextMemory: {
+          ...task.contextMemory,
+          userResponse: userMessage,
+          respondedAt: new Date().toISOString(),
+          pendingClarification: null // Clear the pending question
+        },
+        logEntry: `User responded: "${userMessage.slice(0, 100)}${userMessage.length > 100 ? '...' : ''}"`
+      });
+      
+      // Resume task execution
+      setTimeout(() => executeTaskStep(task.id), 100);
+      
+      return {
+        ok: true,
+        response: `Got it! I'll continue with the task "${task.title}" using your input.`,
+        routedToTask: true,
+        taskId: task.id
+      };
+    }
+    
     const settingsPath = await getSettingsPath();
     let apiKeys = {};
     let models = {};
@@ -6631,16 +8711,158 @@ ${formatDecomposedSteps(steps)}
       return { ok: false, error: "No API keys configured. Go to Settings to add your API key." };
     }
     
-    const userMessage = messages[messages.length - 1]?.content || "";
+    // userMessage already declared at the top of this function
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Pre-load Context (needed for Query Understanding and Chat)
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    // Get user profile for context
+    let profile = null;
+    try {
+      const profilePath = await getUserProfilePath();
+      const markdown = await fs.readFile(profilePath, "utf8");
+      profile = parseUserProfile(markdown);
+    } catch {
+      // No profile
+    }
+
+    // Load conversation context (historical memory)
+    let conversationContext = { todayMessages: "", yesterdayMessages: "", recentSummaries: "" };
+    try {
+      conversationContext = await loadConversationContext();
+    } catch (err) {
+      console.error("[Memory] Error loading conversation context:", err.message);
+    }
+
+    // Get calendar events for today (if Google is connected) - helps with time references
+    let todayCalendarEvents = [];
+    try {
+      const accessToken = await getGoogleAccessToken();
+      if (accessToken) {
+        const today = new Date();
+        const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0, 0);
+        const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999);
+        todayCalendarEvents = await fetchCalendarEvents(accessToken, startOfDay, endOfDay);
+      }
+    } catch (err) {
+      console.log("[Calendar] Unable to fetch calendar for context:", err.message);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Input Type Detection - Check if this is an informational statement
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    if (!skipDecomposition && userMessage.length > 10) {
+      try {
+        console.log("[InputType] Detecting input type...");
+        const inputType = await detectInputType(userMessage, apiKeys, activeProvider);
+        
+        if (inputType.type === "information" && inputType.confidence > 0.7) {
+          console.log("[InputType] Detected informational statement, extracting facts...");
+          
+          // Extract facts from the statement
+          const factsResult = await extractFacts(userMessage, apiKeys, activeProvider);
+          
+          if (factsResult.facts && factsResult.facts.length > 0) {
+            // Load existing profile notes for conflict detection
+            let existingNotes = [];
+            try {
+              const profilePath = await getUserProfilePath();
+              const markdown = await fs.readFile(profilePath, "utf8");
+              const existingProfile = parseUserProfile(markdown);
+              existingNotes = existingProfile.notes || [];
+            } catch { /* No profile yet */ }
+            
+            // Check for conflicts with existing notes
+            const conflictResult = await detectFactConflicts(
+              factsResult.facts, existingNotes, apiKeys, activeProvider
+            );
+            
+            // Format response message
+            let responseMessage = "I noticed you're sharing some important information. Would you like me to save this to your profile?\n\n";
+            responseMessage += "**Facts to save:**\n";
+            factsResult.facts.forEach((fact, i) => {
+              responseMessage += `• ${fact.summary}\n`;
+            });
+            
+            if (conflictResult.conflicts && conflictResult.conflicts.length > 0) {
+              responseMessage += "\n**⚠️ Conflicts detected:**\n";
+              conflictResult.conflicts.forEach(conflict => {
+                responseMessage += `\n• ${conflict.conflictDescription}\n`;
+                responseMessage += `  - Previously: "${conflict.existingNote}"\n`;
+                responseMessage += `  - Now: "${conflict.newFact}"\n`;
+              });
+            }
+            
+            // Return with confirmation prompt
+            return {
+              ok: true,
+              response: responseMessage,
+              informationType: true,
+              facts: factsResult.facts,
+              conflicts: conflictResult.conflicts || [],
+              nonConflictingIndexes: conflictResult.nonConflictingFactIndexes || [],
+              originalInput: userMessage
+            };
+          }
+        }
+      } catch (err) {
+        console.error("[InputType] Error in detection:", err.message);
+        // Continue with normal processing on error
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Query Understanding - Extract entities, resolve ambiguities, enrich query
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    let queryUnderstanding = null;
+    let enrichedQuery = userMessage; // Default to original if understanding fails/skipped
+    
+    if (!skipDecomposition && userMessage.length > 20) {
+      try {
+        console.log("[QueryUnderstanding] Analyzing query...");
+        queryUnderstanding = await understandQuery(userMessage, {
+          profile,
+          conversationContext,
+          calendarEvents: todayCalendarEvents,
+          currentDate: new Date(),
+          sessionMessages: messages // Pass current session messages for immediate context
+        }, apiKeys, activeProvider);
+        
+        // Check if clarification is needed
+        if (queryUnderstanding.clarification_needed && queryUnderstanding.clarification_questions?.length > 0) {
+          console.log("[QueryUnderstanding] Clarification needed, returning to user");
+          return {
+            ok: true,
+            response: `Before I proceed, I need to clarify a few things:\n\n${queryUnderstanding.clarification_questions.map((q, i) => `${i + 1}. ${q.question || q}`).join('\n')}\n\nPlease provide these details so I can help you better.`,
+            clarification_needed: true,
+            clarification_questions: queryUnderstanding.clarification_questions,
+            original_query: userMessage
+          };
+        }
+        
+        // Use enriched query for subsequent processing
+        if (queryUnderstanding.enriched_query && queryUnderstanding.enriched_query !== userMessage) {
+          enrichedQuery = queryUnderstanding.enriched_query;
+          console.log(`[QueryUnderstanding] Using enriched query: "${enrichedQuery}"`);
+        }
+        
+      } catch (err) {
+        console.error("[QueryUnderstanding] Error:", err.message);
+        // Continue with original query
+      }
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Query Decomposition (skipped for inline step execution)
     // ─────────────────────────────────────────────────────────────────────────
     
-    if (!skipDecomposition && userMessage.length > 30) {
+    if (!skipDecomposition && enrichedQuery.length > 30) {
       try {
         console.log("[QueryDecomposition] Classifying query complexity...");
-        const queryClassification = await classifyQueryComplexity(userMessage, apiKeys, activeProvider);
+        const queryClassification = await classifyQueryComplexity(enrichedQuery, apiKeys, activeProvider);
         
         // If classified as multi_step or complex_async, decompose the query
         if (queryClassification.complexity !== "simple") {
@@ -6652,26 +8874,39 @@ ${formatDecomposedSteps(steps)}
           const hasPlaywright = await (async () => {
             try {
               const s = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-              return s.playwrightEnabled === true && isPlaywrightMcpRunning();
+              return s.playwrightEnabled === true;
             } catch { return false; }
           })();
           
+          // Note: Playwright CLI commands are not included as tools
+          // The LLM will generate CLI commands inline instead
           const toolsForDecomposition = [
             ...profileTools, ...taskTools, ...memoryTools,
             ...(accessToken ? googleWorkspaceTools : []),
             ...(process.platform === "darwin" ? iMessageTools : []),
             ...weatherTools,
-            ...(slackToken ? slackTools : []),
-            ...(hasPlaywright ? getPlaywrightTools() : [])
+            ...(slackToken ? slackTools : [])
           ];
           
-          const queryDecomposition = await decomposeQuery(userMessage, toolsForDecomposition, apiKeys, activeProvider);
+          // Add a pseudo-tool to indicate browser automation is available
+          if (hasPlaywright) {
+            toolsForDecomposition.push({
+              name: "browser_automation",
+              description: "Browser automation via playwright-cli. Can navigate, click, fill forms, take screenshots. Use CLI commands like: playwright-cli open <url>, playwright-cli snapshot, playwright-cli click <ref>",
+              input_schema: { type: "object", properties: {} }
+            });
+          }
+          
+          const queryDecomposition = await decomposeQuery(enrichedQuery, toolsForDecomposition, apiKeys, activeProvider);
           
           // Check if we should suggest creating a task or execute inline
           if (queryDecomposition && queryDecomposition.steps && queryDecomposition.steps.length > 0) {
             const hasWaitingSteps = queryDecomposition.steps.some(s => s.may_require_waiting);
-            const tooManySteps = queryDecomposition.steps.length > 6;
+            const tooManySteps = queryDecomposition.steps.length > 10; // Increased from 6 - browser automation can have many steps
             const shouldSuggestTask = queryDecomposition.requires_task || hasWaitingSteps || tooManySteps || queryClassification.requires_waiting;
+            
+            console.log(`[QueryDecomposition] Task decision: requires_task=${queryDecomposition.requires_task}, hasWaitingSteps=${hasWaitingSteps}, tooManySteps=${tooManySteps}, classification.requires_waiting=${queryClassification.requires_waiting}`);
+            console.log(`[QueryDecomposition] Steps with waiting: ${queryDecomposition.steps.filter(s => s.may_require_waiting).map(s => s.action).join(', ') || 'none'}`);
             
             if (shouldSuggestTask) {
               const stepsDisplay = formatDecomposedSteps(queryDecomposition.steps);
@@ -6701,28 +8936,12 @@ ${formatDecomposedSteps(steps)}
     // Normal Chat Flow (full pipeline with profile, memory, skills, tools)
     // ─────────────────────────────────────────────────────────────────────────
 
-    // Get user profile for context
-    let profile = null;
-    try {
-      const profilePath = await getUserProfilePath();
-      const markdown = await fs.readFile(profilePath, "utf8");
-      profile = parseUserProfile(markdown);
-    } catch {
-      // No profile
-    }
-
-    // Check Google auth
+    // Profile and conversation context already loaded above (for Query Understanding)
+    
+    // Check Google auth (may have been checked for calendar, but need fresh token)
     const accessToken = await getGoogleAccessToken();
     const hasGoogleTools = !!accessToken;
     const hasIMessageTools = process.platform === "darwin";
-
-    // Load conversation context (historical memory)
-    let conversationContext = { todayMessages: "", yesterdayMessages: "", recentSummaries: "" };
-    try {
-      conversationContext = await loadConversationContext();
-    } catch (err) {
-      console.error("[Memory] Error loading conversation context:", err.message);
-    }
 
     // Load skills and find best match for user's message
     let matchedSkill = null;
@@ -6736,7 +8955,32 @@ ${formatDecomposedSteps(steps)}
     }
 
     // Build system prompt
-    let systemPrompt = `You are Wovly, a warm and helpful AI assistant. You have a friendly, supportive personality.`;
+    let systemPrompt = `You are Wovly, a warm and helpful AI assistant. You have a friendly, supportive personality.
+
+## CRITICAL BEHAVIOR RULES
+1. **RESOLVE PRONOUNS FROM CONVERSATION** - When user says "him", "her", "them", "they", "that person", "the email", etc., ALWAYS check the previous messages in this conversation to identify who/what they're referring to. If you just mentioned "jeff@wovly.ai", and user says "send an email to him", YOU KNOW "him" is jeff@wovly.ai. NEVER ask who "him" is when you just mentioned them.
+2. **DO NOT over-interpret requests** - If user asks to "find" something, don't assume they want to "book" or "purchase". Just find it.
+3. **DO NOT refuse tasks you CAN do** - If you have browser automation, USE IT to search the web. Never say "I cannot access flight/hotel/product information" when you have Playwright available.
+4. **Take action, don't just offer options** - When user asks you to find something, actually go find it. Don't just offer to help or list what you could do.
+5. **Web research is a CORE capability** - Finding flights, hotels, products, prices, news, schedules online is something you DO. Use browser automation.
+6. **Ask for clarification only when necessary - If you can infer information from the conversation with reasonable confidence, don't ask for clarification.  But if confidence is low you should ask for clarification.
+7. **Message retrieval is straightforward** - When asked for messages from someone: (1) look up their contact, (2) search messages across available platforms (iMessage, Slack, WhatsApp), (3) return the results. No clarification needed.
+8. **Search first, filter later** - When asked about messages on a specific topic, get the messages FIRST, then filter/search within them.
+9. **USE CONVERSATION CONTEXT** - The messages in this chat ARE your context. If you mentioned something 2 messages ago, USE that information. Don't pretend you don't know what the user is talking about.
+
+## CRITICAL SECURITY RULES - CREDENTIALS
+- NEVER include actual passwords, API keys, or login credentials in your responses
+- NEVER ask users to share their passwords or sensitive credentials in chat
+- If a user shares a password in chat, politely remind them to use the Credentials page instead for security
+- When filling login forms with Playwright, use the secure placeholder syntax: {{credential:domain.com:username}} and {{credential:domain.com:password}}
+- The actual credentials are injected locally by the system and NEVER pass through this conversation
+- NEVER log, store, or repeat credential values - only use the placeholder syntax
+
+## LOGIN FAILURE HANDLING
+- If a Playwright tool returns error: "login_failed", inform the user clearly:
+  "I wasn't able to log in to [domain]. The credentials may be incorrect or outdated. Please check your saved credentials in the Credentials page and try again."
+- Do NOT retry with different credentials or ask the user for their password
+- Do NOT attempt to guess or reset passwords`;
 
     if (profile) {
       systemPrompt += `\n\nUser Profile:\n- Name: ${profile.firstName} ${profile.lastName}\n- Occupation: ${profile.occupation || "Not specified"}\n- City: ${profile.city || "Not specified"}\n- Home Life: ${profile.homeLife || "Not specified"}`;
@@ -6812,6 +9056,245 @@ When sending messages: You can pass a contact name directly to send_imessage - i
     };
   }
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Message Confirmation IPC Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+  
+  // User approves sending a message
+  ipcMain.handle("message:confirmationApprove", async (_event, { confirmationId }) => {
+    console.log(`[Confirmation] User APPROVED message: ${confirmationId}`);
+    const pending = pendingConfirmations.get(confirmationId);
+    if (pending) {
+      pending.resolve(true);
+      return { ok: true };
+    }
+    return { ok: false, error: 'Confirmation not found or expired' };
+  });
+  
+  // User rejects sending a message
+  ipcMain.handle("message:confirmationReject", async (_event, { confirmationId, reason }) => {
+    console.log(`[Confirmation] User REJECTED message: ${confirmationId}, reason: ${reason || 'none'}`);
+    const pending = pendingConfirmations.get(confirmationId);
+    if (pending) {
+      pending.reject(new Error(reason || 'User cancelled sending the message'));
+      return { ok: true };
+    }
+    return { ok: false, error: 'Confirmation not found or expired' };
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // WhatsApp Message Processor - Same tools as main chat
+  // ─────────────────────────────────────────────────────────────────────────────
+  
+  setWhatsAppMessageProcessor(async (text, senderId) => {
+    console.log(`[WhatsApp] Processing message with full tool access: "${text.substring(0, 50)}..."`);
+    
+    try {
+      const settingsPath = await getSettingsPath();
+      let apiKeys = {};
+      let models = {};
+      let activeProvider = "anthropic";
+      
+      try {
+        const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+        apiKeys = settings.apiKeys || {};
+        models = settings.models || {};
+        activeProvider = settings.activeProvider || "anthropic";
+      } catch {
+        return "Sorry, I'm not configured yet. Please set up an API key in the Wovly app.";
+      }
+
+      if (!apiKeys.anthropic && !apiKeys.openai && !apiKeys.google) {
+        return "Sorry, no AI provider is configured. Please add an API key in Wovly settings.";
+      }
+
+      // Get user profile for context
+      let profile = null;
+      try {
+        const profilePath = await getUserProfilePath();
+        const markdown = await fs.readFile(profilePath, "utf8");
+        profile = parseUserProfile(markdown);
+      } catch {
+        // No profile
+      }
+
+      // Load all integrations and tools - SAME as main chat
+      const { tools, executeTool, googleAccessToken, slackAccessToken, weatherEnabled, iMessageEnabled } = 
+        await loadIntegrationsAndBuildTools({
+          includeProfileTools: true,
+          includeTaskTools: false, // Don't create tasks from WhatsApp
+          includeMemoryTools: true
+        });
+
+      // Build system prompt for WhatsApp context
+      let systemPrompt = `You are Wovly, a helpful AI assistant responding via WhatsApp. 
+Keep responses concise and conversational - WhatsApp messages should be brief and to the point.
+You have FULL access to the user's tools including calendar, email, contacts, etc.`;
+
+      if (profile) {
+        systemPrompt += `\n\nUser Profile:\n- Name: ${profile.firstName} ${profile.lastName}\n- Occupation: ${profile.occupation || "Not specified"}\n- City: ${profile.city || "Not specified"}`;
+      }
+
+      if (googleAccessToken) {
+        systemPrompt += `\n\nYou have access to Google Workspace (Calendar, Gmail, Drive). Use these tools to help the user.`;
+      }
+
+      if (iMessageEnabled) {
+        systemPrompt += `\n\nYou have access to iMessage for sending texts.`;
+      }
+
+      if (slackAccessToken) {
+        systemPrompt += `\n\nYou have access to Slack.`;
+      }
+
+      if (weatherEnabled) {
+        systemPrompt += `\n\nYou have access to weather information.`;
+      }
+
+      const messages = [{ role: "user", content: text }];
+
+      // Determine which provider to use
+      const useProvider = apiKeys[activeProvider] ? activeProvider : 
+                          apiKeys.anthropic ? "anthropic" : 
+                          apiKeys.openai ? "openai" : null;
+
+      if (!useProvider) {
+        return "Sorry, no AI provider available.";
+      }
+
+      // Convert tools to the appropriate format
+      const anthropicTools = tools.map(t => ({
+        name: t.name,
+        description: t.description,
+        input_schema: t.input_schema
+      }));
+
+      const openaiTools = tools.map(t => ({
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.input_schema
+        }
+      }));
+
+      // Process with tool calls (up to 5 iterations)
+      if (useProvider === "anthropic" && apiKeys.anthropic) {
+        const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
+        let currentMessages = [...messages];
+        
+        for (let iteration = 0; iteration < 5; iteration++) {
+          const response = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": apiKeys.anthropic,
+              "anthropic-version": "2023-06-01"
+            },
+            body: JSON.stringify({
+              model: anthropicModel,
+              max_tokens: 1024,
+              system: systemPrompt,
+              tools: anthropicTools,
+              messages: currentMessages
+            })
+          });
+
+          if (!response.ok) {
+            console.error("[WhatsApp] Anthropic API error:", await response.text());
+            return "Sorry, I had trouble processing that. Please try again.";
+          }
+
+          const data = await response.json();
+          
+          // Check for end of conversation
+          if (data.stop_reason === "end_turn" || !data.content.some(b => b.type === "tool_use")) {
+            const textBlock = data.content.find(b => b.type === "text");
+            return textBlock?.text || "I'm not sure how to respond to that.";
+          }
+
+          // Handle tool calls
+          const toolUseBlocks = data.content.filter(b => b.type === "tool_use");
+          const toolResults = [];
+
+          for (const toolUse of toolUseBlocks) {
+            console.log(`[WhatsApp] Executing tool: ${toolUse.name}`);
+            const result = await executeTool(toolUse.name, toolUse.input);
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: toolUse.id,
+              content: typeof result === 'string' ? result : JSON.stringify(result)
+            });
+          }
+
+          currentMessages.push({ role: "assistant", content: data.content });
+          currentMessages.push({ role: "user", content: toolResults });
+        }
+        
+        return "I've completed the request but ran into some complexity. Please check the Wovly app for details.";
+      }
+
+      if (useProvider === "openai" && apiKeys.openai) {
+        const openaiModel = models.openai || "gpt-4o";
+        let currentMessages = [
+          { role: "system", content: systemPrompt },
+          ...messages
+        ];
+        
+        for (let iteration = 0; iteration < 5; iteration++) {
+          const response = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${apiKeys.openai}`
+            },
+            body: JSON.stringify({
+              model: openaiModel,
+              max_tokens: 1024,
+              messages: currentMessages,
+              tools: openaiTools
+            })
+          });
+
+          if (!response.ok) {
+            console.error("[WhatsApp] OpenAI API error:", await response.text());
+            return "Sorry, I had trouble processing that. Please try again.";
+          }
+
+          const data = await response.json();
+          const choice = data.choices[0];
+
+          // Check for end of conversation
+          if (choice.finish_reason === "stop" || !choice.message.tool_calls) {
+            return choice.message.content || "I'm not sure how to respond to that.";
+          }
+
+          currentMessages.push(choice.message);
+
+          // Handle tool calls
+          for (const toolCall of choice.message.tool_calls) {
+            const toolInput = JSON.parse(toolCall.function.arguments);
+            console.log(`[WhatsApp] Executing tool: ${toolCall.function.name}`);
+            const result = await executeTool(toolCall.function.name, toolInput);
+
+            currentMessages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: typeof result === 'string' ? result : JSON.stringify(result)
+            });
+          }
+        }
+        
+        return "I've completed the request but ran into some complexity. Please check the Wovly app for details.";
+      }
+
+      return "Sorry, I couldn't process your message. Please try again.";
+    } catch (err) {
+      console.error("[WhatsApp] Message processing error:", err);
+      return "Sorry, something went wrong. Please try again.";
+    }
+  });
+
   // Chat handler with agentic workflow
   ipcMain.handle("chat:send", async (_event, { messages, skipDecomposition = false, stepContext = null }) => {
     try {
@@ -6874,29 +9357,45 @@ When sending messages: You can pass a contact name directly to send_imessage - i
       let hasPlaywrightTools = false;
       try {
         const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-        if (settings.playwrightEnabled === true && isPlaywrightMcpRunning()) {
+        if (settings.playwrightEnabled === true) {
           hasPlaywrightTools = true;
+          setPlaywrightEnabled(true);
+          if (settings.playwrightBrowser) {
+            setPlaywrightBrowser(settings.playwrightBrowser);
+          }
         }
       } catch {
         // Default disabled
       }
 
-      // Add Playwright system prompt if enabled
+      // Add Playwright CLI system prompt if enabled (with available credentials)
       if (hasPlaywrightTools) {
-        systemPrompt += `\n\nYou have access to browser automation tools (Playwright). You can:
-- browser_navigate: Navigate to any URL
-- browser_snapshot: Get the structured content of a web page (accessibility tree)
-- browser_click: Click elements on the page
-- browser_type: Type text into input fields
-- browser_fill_form: Fill out form fields
-- browser_select_option: Select from dropdowns
-- browser_take_screenshot: Capture screenshots
-- browser_press_key: Press keyboard keys
-- browser_wait_for: Wait for text or elements to appear
-- browser_tabs: Manage browser tabs
-- browser_close: Close the browser
+        const availableCredentials = await getAvailableCredentialDomains();
+        systemPrompt += `\n\n## WEB RESEARCH CAPABILITY - YOU CAN BROWSE THE INTERNET
+You have FULL browser automation capability. This means:
+- Finding flights → GO TO Google Flights/Kayak and search
+- Finding hotels → GO TO Booking.com/Hotels.com and search  
+- Finding products/prices → GO TO Amazon and search
+- Finding information → GO TO the website and read it
 
-Use browser_snapshot to understand page content before clicking elements. The snapshot returns an accessibility tree with element references you can use with browser_click.`;
+**DO NOT SAY "I cannot access" or "I don't have access to" when asked to find information online.**
+**JUST GO TO THE WEBSITE AND LOOK.** You are capable of browsing like a human.
+
+### HANDLING CAPTCHA/BOT DETECTION
+Some websites may show captcha, bot detection, or access denied pages. If you encounter:
+- **Captcha/CAPTCHA**: Take a screenshot and inform the user. They may need to solve it manually or try a different site.
+- **"Access Denied"/"Forbidden"**: Try an alternative website (e.g., if Zillow blocks, try Redfin or Realtor.com)
+- **"Please verify you're human"**: Same as captcha - inform user and try alternatives
+- **Rate limiting**: Wait a moment and try again, or use a different site
+
+**ALTERNATIVES FOR COMMON SEARCHES:**
+- Real estate: Zillow → Redfin → Realtor.com → Homes.com
+- Flights: Google Flights → Kayak → Skyscanner → Expedia
+- Hotels: Google Hotels → Booking.com → Hotels.com → Expedia
+- Products: Amazon → Walmart → Target → Best Buy
+- General info: Google → Bing → DuckDuckGo
+
+${getPlaywrightCliReference(availableCredentials)}`;
       }
 
       // Add task system prompt
@@ -6953,7 +9452,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
       if (hasIMessageTools) allTools.push(...iMessageTools);
       if (weatherEnabled) allTools.push(...weatherTools);
       if (hasSlackTools) allTools.push(...slackTools);
-      if (hasPlaywrightTools) allTools.push(...getPlaywrightTools());
+      // Note: Playwright CLI commands are NOT added as tools - they're executed inline from LLM response
 
       // Determine which provider to use
       const useProvider = apiKeys[activeProvider] ? activeProvider : 
@@ -6996,7 +9495,64 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
 
           if (data.stop_reason === "end_turn" || !data.content.some(b => b.type === "tool_use")) {
             const textBlock = data.content.find(b => b.type === "text");
-            return { ok: true, response: textBlock?.text || "" };
+            let responseText = textBlock?.text || "";
+            
+            // ─────────────────────────────────────────────────────────────────
+            // PLAYWRIGHT CLI COMMAND DETECTION & EXECUTION
+            // If response contains CLI commands, execute them and continue
+            // ─────────────────────────────────────────────────────────────────
+            if (hasPlaywrightTools && responseText) {
+              const cliResult = await executePlaywrightCommandsInText(responseText);
+              
+              if (cliResult.hasCommands && cliResult.commands.length > 0) {
+                console.log(`[Chat] Detected ${cliResult.commands.length} Playwright CLI command(s), executing...`);
+                
+                // Build result summary and collect screenshots
+                let cliResultSummary = "\n\n---\n**CLI Execution Results:**\n";
+                let screenshots = [];
+                
+                for (const { command, result } of cliResult.commands) {
+                  const cmdShort = command.replace(/^playwright-cli\s*/, '');
+                  if (result.error) {
+                    cliResultSummary += `\n\`${cmdShort}\`: ERROR - ${result.error}`;
+                    if (result.loginFailed) {
+                      cliResultSummary += `\n⚠️ Login failed for ${result.domain}. ${result.suggestion}`;
+                    }
+                  } else {
+                    // Truncate long outputs
+                    const output = result.output || "";
+                    const truncated = output.length > 4000 ? output.slice(0, 4000) + "\n... (truncated)" : output;
+                    cliResultSummary += `\n\`${cmdShort}\`:\n\`\`\`\n${truncated}\n\`\`\``;
+                    
+                    // Collect screenshots to send to LLM
+                    if (result.screenshotPath) {
+                      screenshots.push(result.screenshotPath);
+                    }
+                  }
+                }
+                
+                // Send screenshots to UI for display (as base64 data URLs)
+                if (screenshots.length > 0 && win && win.webContents) {
+                  for (const screenshotPath of screenshots) {
+                    const dataUrl = await screenshotToDataUrl(screenshotPath);
+                    if (dataUrl) {
+                      win.webContents.send("chat:screenshot", { dataUrl });
+                    }
+                  }
+                }
+                
+                // Continue conversation with CLI results (include screenshots for LLM to see)
+                currentMessages.push({ role: "assistant", content: data.content });
+                const resultText = `The CLI commands in your response have been executed. Here are the results:\n${cliResultSummary}\n\n${screenshots.length > 0 ? "A screenshot is attached showing the current page state. Analyze it carefully." : ""}\n\nPlease analyze these results and continue with the task. If you need to execute more commands, include them in code blocks.`;
+                const userMessage = await buildMessageWithScreenshots(resultText, screenshots, "anthropic");
+                currentMessages.push(userMessage);
+                
+                // Continue the iteration loop
+                continue;
+              }
+            }
+            
+            return { ok: true, response: responseText };
           }
 
           // Handle tool calls
@@ -7066,7 +9622,58 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
           const choice = data.choices[0];
 
           if (choice.finish_reason === "stop" || !choice.message.tool_calls) {
-            return { ok: true, response: choice.message.content || "" };
+            let responseText = choice.message.content || "";
+            
+            // ─────────────────────────────────────────────────────────────────
+            // PLAYWRIGHT CLI COMMAND DETECTION & EXECUTION
+            // ─────────────────────────────────────────────────────────────────
+            if (hasPlaywrightTools && responseText) {
+              const cliResult = await executePlaywrightCommandsInText(responseText);
+              
+              if (cliResult.hasCommands && cliResult.commands.length > 0) {
+                console.log(`[Chat] Detected ${cliResult.commands.length} Playwright CLI command(s), executing...`);
+                
+                let cliResultSummary = "\n\n---\n**CLI Execution Results:**\n";
+                let screenshots = [];
+                
+                for (const { command, result } of cliResult.commands) {
+                  const cmdShort = command.replace(/^playwright-cli\s*/, '');
+                  if (result.error) {
+                    cliResultSummary += `\n\`${cmdShort}\`: ERROR - ${result.error}`;
+                    if (result.loginFailed) {
+                      cliResultSummary += `\n⚠️ Login failed for ${result.domain}. ${result.suggestion}`;
+                    }
+                  } else {
+                    const output = result.output || "";
+                    const truncated = output.length > 4000 ? output.slice(0, 4000) + "\n... (truncated)" : output;
+                    cliResultSummary += `\n\`${cmdShort}\`:\n\`\`\`\n${truncated}\n\`\`\``;
+                    
+                    // Collect screenshots
+                    if (result.screenshotPath) {
+                      screenshots.push(result.screenshotPath);
+                    }
+                  }
+                }
+                
+                // Send screenshots to UI for display (as base64 data URLs)
+                if (screenshots.length > 0 && win && win.webContents) {
+                  for (const screenshotPath of screenshots) {
+                    const dataUrl = await screenshotToDataUrl(screenshotPath);
+                    if (dataUrl) {
+                      win.webContents.send("chat:screenshot", { dataUrl });
+                    }
+                  }
+                }
+                
+                currentMessages.push({ role: "assistant", content: responseText });
+                const resultText = `The CLI commands in your response have been executed. Here are the results:\n${cliResultSummary}\n\n${screenshots.length > 0 ? "A screenshot is attached showing the current page state. Analyze it carefully." : ""}\n\nPlease analyze these results and continue with the task.`;
+                const userMessage = await buildMessageWithScreenshots(resultText, screenshots, "openai");
+                currentMessages.push(userMessage);
+                continue;
+              }
+            }
+            
+            return { ok: true, response: responseText };
           }
 
           currentMessages.push(choice.message);
@@ -7145,47 +9752,97 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
       const { steps, title } = decomposition;
       const stepResults = [];
       let accumulatedContext = {};
+      let goalAchieved = false;
       
-      // Send initial progress message
+      // Token budget tracking - rough estimate
+      const MAX_CONTEXT_CHARS = 15000; // ~3750 tokens, leave room for system prompt
+      
+      // Helper to truncate/summarize large results (especially browser snapshots)
+      const truncateResult = (result, maxChars = 3000) => {
+        const str = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+        if (str.length <= maxChars) return str;
+        
+        // For browser snapshots, try to extract just the meaningful content
+        if (str.includes('accessibility tree') || str.includes('browser_snapshot')) {
+          // Extract key info and truncate
+          return str.substring(0, maxChars) + `\n\n[... truncated ${str.length - maxChars} chars for token efficiency ...]`;
+        }
+        return str.substring(0, maxChars) + `\n\n[... truncated ...]`;
+      };
+      
+      // Helper to compress accumulated context if too large
+      const compressContext = (ctx) => {
+        const compressed = {};
+        let totalChars = 0;
+        
+        // Prioritize recent results, truncate old ones more aggressively
+        const entries = Object.entries(ctx).reverse(); // Most recent first
+        
+        for (const [key, value] of entries) {
+          const valueStr = truncateResult(value, 2000);
+          if (totalChars + valueStr.length > MAX_CONTEXT_CHARS) {
+            // Skip or heavily truncate old results
+            const shortened = valueStr.substring(0, 500) + '... [truncated for efficiency]';
+            compressed[key] = shortened;
+            totalChars += shortened.length;
+          } else {
+            compressed[key] = valueStr;
+            totalChars += valueStr.length;
+          }
+        }
+        
+        return compressed;
+      };
+      
+      // Send initial progress message - don't promise to walk through all steps
       if (win && win.webContents) {
         win.webContents.send("chat:newMessage", {
           role: "assistant",
-          content: `🚀 **Starting: ${title}**\n\nI'll work through each step using the full system...`,
+          content: `🚀 **Working on: ${title}**\n\nLet me handle this for you...`,
           source: "decomposed"
         });
       }
       
       // Execute each step through the FULL chat processing pipeline
       for (let i = 0; i < steps.length; i++) {
+        // Check if goal was already achieved
+        if (goalAchieved) {
+          console.log(`[Chat] Goal achieved in previous step, skipping remaining steps`);
+          break;
+        }
+        
         const step = steps[i];
         const stepNum = i + 1;
         
         console.log(`[Chat] Executing step ${stepNum}/${steps.length}: ${step.action}`);
         
-        // Send "executing" progress message
-        if (win && win.webContents) {
-          win.webContents.send("chat:newMessage", {
-            role: "assistant",
-            content: `⏳ **Step ${stepNum}/${steps.length}**: ${step.action}`,
-            source: "decomposed"
-          });
+        // Don't send individual step progress - just work on it silently
+        // Only send progress for first step or long-running tasks
+        if (stepNum === 1) {
+          if (win && win.webContents) {
+            win.webContents.send("chat:newMessage", {
+              role: "assistant",
+              content: `⏳ Working on it...`,
+              source: "decomposed"
+            });
+          }
         }
         
-        // Build the step message with context from previous steps
-        // Format context in a more readable way
+        // Compress accumulated context to stay within token budget
+        const compressedContext = compressContext(accumulatedContext);
+        
+        // Build the step message with COMPRESSED context
         let contextSummary = "";
-        if (Object.keys(accumulatedContext).length > 0) {
-          const contextEntries = Object.entries(accumulatedContext);
-          contextSummary = "\n\n## DATA FROM PREVIOUS STEPS (USE THIS!):\n";
+        if (Object.keys(compressedContext).length > 0) {
+          const contextEntries = Object.entries(compressedContext);
+          contextSummary = "\n\n## DATA FROM PREVIOUS STEPS:\n";
           for (const [key, value] of contextEntries) {
-            const valueStr = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-            // Truncate very long values but keep URLs intact
-            const displayValue = valueStr.length > 2000 ? valueStr.substring(0, 2000) + "..." : valueStr;
-            contextSummary += `\n### ${key}:\n${displayValue}\n`;
+            const valueStr = typeof value === 'string' ? value : JSON.stringify(value);
+            contextSummary += `\n### ${key}:\n${valueStr}\n`;
           }
           
           // Also extract and highlight any URLs
-          const allText = JSON.stringify(accumulatedContext);
+          const allText = JSON.stringify(compressedContext);
           const urls = allText.match(/https?:\/\/[^\s"',\]\\]+/g) || [];
           if (urls.length > 0) {
             contextSummary += `\n### IMPORTANT URLS FOUND:\n${[...new Set(urls)].map(u => `- ${u}`).join('\n')}\n`;
@@ -7196,11 +9853,16 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
         const stepMessages = [
           { role: "user", content: `Original request: "${originalMessage}"
 
-I'm currently on step ${stepNum} of ${steps.length}: "${step.action}"
+Current step ${stepNum}/${steps.length}: "${step.action}"
 ${contextSummary}
-INSTRUCTION: Execute this step using the tools available. If this step requires opening a URL or link from a previous step, use the browser_navigate tool to open it, then browser_snapshot to read the page content.
+INSTRUCTIONS:
+1. Execute this step using available tools
+2. If you can FULLY ANSWER the original request with information you already have or will retrieve, DO IT NOW
+3. At the end of your response, add one of these tags:
+   - [GOAL_ACHIEVED] if the user's original request has been fully answered
+   - [CONTINUE] if more steps are needed
 
-Please execute this step now.` }
+Be concise. Execute the step and provide the answer.` }
         ];
         
         try {
@@ -7232,27 +9894,26 @@ Please execute this step now.` }
             const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
             weatherEnabled = settings.weatherEnabled !== false;
             
-            // Start Playwright MCP if enabled but not running (same as chat:send)
+            // Check if Playwright CLI is enabled
             if (settings.playwrightEnabled === true) {
-              if (!isPlaywrightMcpRunning()) {
-                console.log(`[Chat] Step ${stepNum}: Starting Playwright MCP...`);
-                const options = settings.playwrightOptions || {};
-                await startPlaywrightMcp(options);
+              hasPlaywrightTools = true;
+              setPlaywrightEnabled(true);
+              if (settings.playwrightBrowser) {
+                setPlaywrightBrowser(settings.playwrightBrowser);
               }
-              hasPlaywrightTools = isPlaywrightMcpRunning();
-              console.log(`[Chat] Step ${stepNum}: Playwright enabled=${hasPlaywrightTools}`);
+              console.log(`[Chat] Step ${stepNum}: Playwright CLI enabled`);
             }
           } catch (err) {
             console.error(`[Chat] Step ${stepNum}: Error loading settings:`, err.message);
           }
           
-          // Build tool executor with all tools
+          // Build tool executor with all tools (Playwright CLI not included - handled separately)
           const { executeTool, tools: allTools } = buildToolsAndExecutor({
             googleAccessToken: accessToken,
             slackAccessToken,
             weatherEnabled,
             iMessageEnabled: process.platform === "darwin",
-            playwrightEnabled: hasPlaywrightTools
+            playwrightEnabled: false // CLI commands handled separately
           });
           
           console.log(`[Chat] Step ${stepNum} tools available: ${allTools.length}`, allTools.map(t => t.name));
@@ -7276,19 +9937,32 @@ When getting DMs from a specific person, use get_slack_messages with their name 
             fullSystemPrompt += `\n\nYou have access to weather tools. You can look up weather forecasts, current conditions, and find location coordinates.`;
           }
           
-          // Add Playwright system prompt
+          // Add Playwright CLI system prompt (with available credentials)
           if (hasPlaywrightTools) {
-            fullSystemPrompt += `\n\nYou have access to browser automation tools (Playwright). You can:
-- browser_navigate: Navigate to a URL
-- browser_click: Click an element on the page
-- browser_type: Type text into an input
-- browser_fill: Clear and fill an input field
-- browser_snapshot: Get structured page content
-- browser_take_screenshot: Capture a screenshot
-- browser_wait: Wait for specified time
-- browser_tabs: Manage browser tabs
+            const availableCredentials = await getAvailableCredentialDomains();
+            const cliRef = getPlaywrightCliReference(availableCredentials);
+            fullSystemPrompt += `\n\n## WEB RESEARCH CAPABILITY - YOU CAN BROWSE THE INTERNET
+You have FULL browser automation capability. This means:
+- Finding flights → GO TO Google Flights/Kayak and search
+- Finding hotels → GO TO Booking.com/Hotels.com and search  
+- Finding products/prices → GO TO Amazon and search
+- Finding information → GO TO the website and read it
 
-Use these tools to interact with web pages, fill forms, and extract information.`;
+**DO NOT SAY "I cannot access" or "I don't have access to" when asked to find information online.**
+**JUST GO TO THE WEBSITE AND LOOK.** You are capable of browsing like a human.
+
+### HANDLING CAPTCHA/BOT DETECTION
+If you encounter captcha, bot detection, or access denied:
+- Take a screenshot and inform the user
+- Try alternative websites (e.g., Zillow blocked → try Redfin)
+- Real estate: Zillow → Redfin → Realtor.com
+- Flights: Google Flights → Kayak → Skyscanner
+- Hotels: Google Hotels → Booking.com → Expedia
+
+${cliRef}`;
+            console.log(`[Chat] Step ${stepNum}: Added Playwright CLI reference to prompt (${cliRef.length} chars), available creds: ${availableCredentials.join(', ') || 'none'}`);
+          } else {
+            console.log(`[Chat] Step ${stepNum}: Playwright NOT enabled (hasPlaywrightTools=${hasPlaywrightTools})`);
           }
           
           // Add Google tools system prompt
@@ -7301,36 +9975,33 @@ Use these tools to interact with web pages, fill forms, and extract information.
             fullSystemPrompt += `\n\nYou have access to iMessage/SMS tools for sending and reading text messages.`;
           }
           
-          // Enhanced system prompt for this specific step
-          // Extract any URLs from the accumulated context to highlight them
-          const contextStr = JSON.stringify(accumulatedContext);
+          // Enhanced system prompt for this specific step - focused on EFFICIENCY
+          const contextStr = JSON.stringify(compressedContext);
           const urlMatches = contextStr.match(/https?:\/\/[^\s"',\]]+/g) || [];
           const uniqueUrls = [...new Set(urlMatches)];
           
           const stepSystemPrompt = `${fullSystemPrompt}
 
-## Current Task: ${title}
-You are executing step ${stepNum} of ${steps.length}: "${step.action}"
+## Task: ${title}
 
-## CRITICAL INSTRUCTIONS FOR MULTI-STEP EXECUTION:
+## EFFICIENCY RULES:
+1. **ANSWER THE USER'S QUESTION AS SOON AS POSSIBLE** - If you have enough information to fully answer the original request, do it NOW. Don't wait for more steps.
+2. **Be concise** - Provide the answer directly, no need for step-by-step narration.
+3. **Use tools only when needed** - If you already have the data, don't make redundant tool calls.
+4. **Use data from previous steps** - Don't re-fetch what's already available in context.
 
-1. **USE DATA FROM PREVIOUS STEPS**: The context below contains results from prior steps. You MUST use this data - especially any URLs, links, names, IDs, or values that were retrieved. DO NOT make up or guess values that were already found.
+## BROWSER AUTOMATION REMINDER:
+- If you open a website and need to SEE what's on the page (read text, view calendars, see images), **USE \`playwright-cli screenshot\`**
+- The \`snapshot\` command only gives element refs for clicking - it does NOT let you see the page
+- ALWAYS take a screenshot after opening a page if you need to analyze its visual content
 
-2. **OPENING URLS/LINKS**: When a step requires opening, visiting, or navigating to a URL:
-   - Use the Playwright browser tools (browser_navigate, browser_snapshot, browser_click, etc.)
-   - First call browser_navigate with the URL
-   - Then call browser_snapshot to see the page content
-   - Extract the relevant information from the snapshot
-
-3. **DO NOT SKIP TOOL CALLS**: Actually execute the tools. Don't just describe what you would do - use the tools and report the actual results.
-
-${uniqueUrls.length > 0 ? `## URLs FOUND IN PREVIOUS STEPS (use these!):
-${uniqueUrls.map(url => `- ${url}`).join('\n')}
+${uniqueUrls.length > 0 ? `## URLs available:
+${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
 ` : ''}
-## Tools Available:
-You have access to Slack, Google Calendar, Email, Browser automation (Playwright), Weather, and other tools. Use them!
-
-Execute this step and report what you found or did. Be concise but thorough.`;
+## Response format:
+- Give a direct, helpful answer
+- End with [GOAL_ACHIEVED] if user's original request is now fully answered
+- End with [CONTINUE] if more steps are genuinely needed`;
 
           // Execute LLM call for this step
           let stepResponse = null;
@@ -7339,7 +10010,7 @@ Execute this step and report what you found or did. Be concise but thorough.`;
             const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
             let iterationMessages = stepMessages.map(m => ({ role: m.role, content: m.content }));
             
-            for (let iteration = 0; iteration < 5; iteration++) {
+            for (let iteration = 0; iteration < 15; iteration++) { // Increased from 5 for browser automation
               const response = await fetch("https://api.anthropic.com/v1/messages", {
                 method: "POST",
                 headers: {
@@ -7363,12 +10034,65 @@ Execute this step and report what you found or did. Be concise but thorough.`;
 
               const data = await response.json();
               
-              console.log(`[Chat] Step ${stepNum} iteration ${iteration}: stop_reason=${data.stop_reason}, content types=${data.content?.map(b => b.type).join(',')}`);
+              console.log(`[Chat] Step ${stepNum} iteration ${iteration}/15: stop_reason=${data.stop_reason}, content types=${data.content?.map(b => b.type).join(',')}`);
 
               if (data.stop_reason === "end_turn" || !data.content.some(b => b.type === "tool_use")) {
                 const textBlock = data.content.find(b => b.type === "text");
                 stepResponse = textBlock?.text || "";
                 console.log(`[Chat] Step ${stepNum} completed without tool use, response length: ${stepResponse.length}`);
+                
+                // ─────────────────────────────────────────────────────────────
+                // PLAYWRIGHT CLI COMMAND DETECTION & EXECUTION (inline mode)
+                // ─────────────────────────────────────────────────────────────
+                console.log(`[Chat] Step ${stepNum}: Checking for CLI commands. hasPlaywrightTools=${hasPlaywrightTools}, responseLength=${stepResponse.length}`);
+                console.log(`[Chat] Step ${stepNum}: Response preview: ${stepResponse.substring(0, 500)}`);
+                
+                if (hasPlaywrightTools && stepResponse) {
+                  const cliResult = await executePlaywrightCommandsInText(stepResponse);
+                  console.log(`[Chat] Step ${stepNum}: CLI detection result: hasCommands=${cliResult.hasCommands}, count=${cliResult.commands?.length || 0}`);
+                  
+                  if (cliResult.hasCommands && cliResult.commands.length > 0) {
+                    console.log(`[Chat] Step ${stepNum} detected ${cliResult.commands.length} CLI command(s), executing...`);
+                    
+                    let cliResultSummary = "";
+                    let screenshots = [];
+                    
+                    for (const { command, result } of cliResult.commands) {
+                      const cmdShort = command.replace(/^playwright-cli\s*/, '');
+                      if (result.error) {
+                        cliResultSummary += `\n${cmdShort}: ERROR - ${result.error}`;
+                      } else {
+                        const output = result.output || "";
+                        const truncated = output.length > 4000 ? output.slice(0, 4000) + "...(truncated)" : output;
+                        cliResultSummary += `\n${cmdShort}:\n${truncated}`;
+                        
+                        // Collect screenshots to display in chat
+                        if (result.screenshotPath) {
+                          screenshots.push(result.screenshotPath);
+                        }
+                      }
+                    }
+                    
+                    // Send screenshots to UI for display (as base64 data URLs)
+                    if (screenshots.length > 0 && win && win.webContents) {
+                      for (const screenshotPath of screenshots) {
+                        const dataUrl = await screenshotToDataUrl(screenshotPath);
+                        if (dataUrl) {
+                          win.webContents.send("chat:screenshot", { dataUrl });
+                        }
+                      }
+                    }
+                    
+                    // Add results to context and continue conversation (include screenshots for LLM)
+                    accumulatedContext[`step${stepNum}_cli_results`] = cliResultSummary.slice(0, 3000);
+                    iterationMessages.push({ role: "assistant", content: data.content });
+                    const resultText = `CLI commands executed. Results:\n${cliResultSummary}\n\n${screenshots.length > 0 ? "A screenshot is attached showing the current page state. Analyze it carefully to see what's on screen." : ""}\n\nAnalyze these results and continue.`;
+                    const userMessage = await buildMessageWithScreenshots(resultText, screenshots, "anthropic");
+                    iterationMessages.push(userMessage);
+                    continue; // Continue iteration to let LLM process results
+                  }
+                }
+                
                 break;
               }
 
@@ -7382,12 +10106,15 @@ Execute this step and report what you found or did. Be concise but thorough.`;
                 console.log(`[Chat] Step ${stepNum} executing tool: ${toolUse.name} with input:`, JSON.stringify(toolUse.input).substring(0, 200));
                 const result = await executeTool(toolUse.name, toolUse.input);
                 console.log(`[Chat] Step ${stepNum} tool ${toolUse.name} result:`, JSON.stringify(result).substring(0, 300));
-                accumulatedContext[`step${stepNum}_${toolUse.name}`] = result;
+                
+                // Truncate large results (especially browser_snapshot) to save tokens
+                const truncatedResult = truncateResult(result, toolUse.name.includes('snapshot') ? 4000 : 3000);
+                accumulatedContext[`step${stepNum}_${toolUse.name}`] = truncatedResult;
                 
                 toolResults.push({
                   type: "tool_result",
                   tool_use_id: toolUse.id,
-                  content: JSON.stringify(result)
+                  content: typeof result === 'string' ? result : JSON.stringify(result)
                 });
               }
 
@@ -7407,7 +10134,7 @@ Execute this step and report what you found or did. Be concise but thorough.`;
               ...stepMessages.map(m => ({ role: m.role, content: m.content }))
             ];
 
-            for (let iteration = 0; iteration < 5; iteration++) {
+            for (let iteration = 0; iteration < 15; iteration++) { // Increased from 5 for browser automation
               const response = await fetch("https://api.openai.com/v1/chat/completions", {
                 method: "POST",
                 headers: {
@@ -7431,6 +10158,52 @@ Execute this step and report what you found or did. Be concise but thorough.`;
 
               if (choice.finish_reason === "stop" || !choice.message.tool_calls) {
                 stepResponse = choice.message.content || "";
+                
+                // PLAYWRIGHT CLI COMMAND DETECTION & EXECUTION (OpenAI inline)
+                if (hasPlaywrightTools && stepResponse) {
+                  const cliResult = await executePlaywrightCommandsInText(stepResponse);
+                  
+                  if (cliResult.hasCommands && cliResult.commands.length > 0) {
+                    console.log(`[Chat] Step ${stepNum} detected ${cliResult.commands.length} CLI command(s)`);
+                    
+                    let cliResultSummary = "";
+                    let screenshots = [];
+                    
+                    for (const { command, result } of cliResult.commands) {
+                      const cmdShort = command.replace(/^playwright-cli\s*/, '');
+                      if (result.error) {
+                        cliResultSummary += `\n${cmdShort}: ERROR - ${result.error}`;
+                      } else {
+                        const output = result.output || "";
+                        const truncated = output.length > 4000 ? output.slice(0, 4000) + "...(truncated)" : output;
+                        cliResultSummary += `\n${cmdShort}:\n${truncated}`;
+                        
+                        // Collect screenshots
+                        if (result.screenshotPath) {
+                          screenshots.push(result.screenshotPath);
+                        }
+                      }
+                    }
+                    
+                    // Send screenshots to UI for display (as base64 data URLs)
+                    if (screenshots.length > 0 && win && win.webContents) {
+                      for (const screenshotPath of screenshots) {
+                        const dataUrl = await screenshotToDataUrl(screenshotPath);
+                        if (dataUrl) {
+                          win.webContents.send("chat:screenshot", { dataUrl });
+                        }
+                      }
+                    }
+                    
+                    accumulatedContext[`step${stepNum}_cli_results`] = cliResultSummary.slice(0, 3000);
+                    iterationMessages.push({ role: "assistant", content: stepResponse });
+                    const resultText = `CLI commands executed. Results:\n${cliResultSummary}\n\n${screenshots.length > 0 ? "A screenshot is attached showing the current page state. Analyze it carefully." : ""}\n\nAnalyze and continue.`;
+                    const userMessage = await buildMessageWithScreenshots(resultText, screenshots, "openai");
+                    iterationMessages.push(userMessage);
+                    continue;
+                  }
+                }
+                
                 break;
               }
 
@@ -7440,12 +10213,15 @@ Execute this step and report what you found or did. Be concise but thorough.`;
                 const toolInput = JSON.parse(toolCall.function.arguments);
                 console.log(`[Chat] Step ${stepNum} tool: ${toolCall.function.name}`);
                 const result = await executeTool(toolCall.function.name, toolInput);
-                accumulatedContext[`step${stepNum}_${toolCall.function.name}`] = result;
+                
+                // Truncate large results to save tokens
+                const truncatedResult = truncateResult(result, toolCall.function.name.includes('snapshot') ? 4000 : 3000);
+                accumulatedContext[`step${stepNum}_${toolCall.function.name}`] = truncatedResult;
 
                 iterationMessages.push({
                   role: "tool",
                   tool_call_id: toolCall.id,
-                  content: JSON.stringify(result)
+                  content: typeof result === 'string' ? result : JSON.stringify(result)
                 });
               }
             }
@@ -7455,22 +10231,45 @@ Execute this step and report what you found or did. Be concise but thorough.`;
           
           // Store result
           if (stepResponse) {
-            accumulatedContext[`step${stepNum}_result`] = stepResponse;
+            // Check for goal achievement markers
+            const responseHasGoal = stepResponse.includes('[GOAL_ACHIEVED]');
+            const cleanResponse = stepResponse
+              .replace(/\[GOAL_ACHIEVED\]/g, '')
+              .replace(/\[CONTINUE\]/g, '')
+              .trim();
+            
+            accumulatedContext[`step${stepNum}_result`] = truncateResult(cleanResponse, 2000);
             
             stepResults.push({
               step: stepNum,
               action: step.action,
-              response: stepResponse,
+              response: cleanResponse,
               success: true
             });
             
-            // Send "completed" progress message with full response (no truncation)
+            // Send the result to the user
             if (win && win.webContents) {
-              win.webContents.send("chat:newMessage", {
-                role: "assistant",
-                content: `✅ **Step ${stepNum} complete**: ${step.action}\n\n${stepResponse}`,
-                source: "decomposed"
-              });
+              // If goal achieved or this is the last step, just show the answer
+              if (responseHasGoal || stepNum === steps.length) {
+                win.webContents.send("chat:newMessage", {
+                  role: "assistant",
+                  content: cleanResponse,
+                  source: "decomposed"
+                });
+              } else {
+                // For intermediate steps, show progress
+                win.webContents.send("chat:newMessage", {
+                  role: "assistant",
+                  content: `✅ **Step ${stepNum} complete**: ${step.action}\n\n${cleanResponse}`,
+                  source: "decomposed"
+                });
+              }
+            }
+            
+            // Check if goal was achieved
+            if (responseHasGoal) {
+              console.log(`[Chat] Goal achieved at step ${stepNum}, stopping execution`);
+              goalAchieved = true;
             }
           } else {
             throw new Error("No response from LLM");
@@ -7495,28 +10294,24 @@ Execute this step and report what you found or did. Be concise but thorough.`;
         }
       }
       
-      // Generate final summary
+      // Generate final summary - only if not already sent via goal achievement
       const successfulSteps = stepResults.filter(r => r.success).length;
       const lastResult = stepResults[stepResults.length - 1];
       
-      let finalResponse = `## Task Complete: ${title}\n\n`;
-      finalResponse += `Completed ${successfulSteps}/${steps.length} steps.\n\n`;
-      
-      if (lastResult?.response) {
-        finalResponse += `**Final Result:**\n${lastResult.response}`;
+      // Don't send another summary if goal was achieved (already sent the answer)
+      let finalResponse = "";
+      if (!goalAchieved && lastResult?.response) {
+        finalResponse = lastResult.response;
+      } else if (goalAchieved) {
+        finalResponse = lastResult?.response || "Task completed.";
       }
       
-      const inlineResult = {
+      return {
         ok: true,
         response: finalResponse,
-        stepResults
-      };
-
-      return {
-        ok: inlineResult.ok,
-        response: inlineResult.response,
         executedInline: true,
-        stepResults: inlineResult.stepResults
+        stepResults,
+        goalAchievedEarly: goalAchieved && successfulSteps < steps.length
       };
     } catch (err) {
       console.error("[Chat] Inline execution error:", err);

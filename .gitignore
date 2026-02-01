@@ -32,3 +32,4 @@ settings.json
 
 # Electron
 *.asar
+.playwright-cli/

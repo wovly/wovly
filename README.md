@@ -8,6 +8,7 @@ A powerful, privacy-focused personal AI assistant that runs locally on your desk
 - **Privacy-First** - All data stays on your machine. No cloud sync, no telemetry.
 - **Truly Autonomous** - Tasks run in the background, monitor for events, and complete multi-step workflows without constant oversight.
 - **Works With Your Tools** - Deep integrations with Google Workspace, Slack, iMessage, web browsers, and more.
+- **Learns About You** - Automatically detects when you share personal information and offers to save it to your profile for more personalized assistance.
 
 ## Features
 
@@ -37,6 +38,17 @@ A powerful, privacy-focused personal AI assistant that runs locally on your desk
 **Multi-Step Workflows**
 - "Research [topic], compile findings into a summary, and email it to my team" → Wovly searches, synthesizes, and delivers
 - "Get the agenda from tomorrow's meeting invite, prepare talking points, and Slack them to me before 9am" → Wovly pulls calendar context, drafts points, and schedules delivery
+
+**Personal Information & Context**
+- "Igor is my contractor working on the house renovation" → Wovly detects this as personal info and offers to save it
+- "My wife's birthday is March 15th" → Saved to profile for future reference (like reminders)
+- "Connie is my mother, Daddee is my father" → Wovly remembers your relationships
+- "Send an email to him about next week" → Wovly knows who "him" is from your previous conversation
+
+**Real Estate & Property**
+- "Search for homes under $800k in Palo Alto with 3+ bedrooms" → Wovly browses Redfin/Zillow and reports options
+- "Find rental properties in Austin near downtown" → Wovly searches multiple listing sites
+- "What's the Zestimate for [address]?" → Wovly looks up property valuations
 
 ### Multi-LLM Support
 - **Anthropic Claude** (Sonnet 4, Haiku, Opus)
@@ -74,6 +86,17 @@ A powerful, privacy-focused personal AI assistant that runs locally on your desk
 - Daily conversation logs stored as markdown
 - Automatic summarization of older conversations
 - Long-term memory for context retention across sessions
+
+### Personal Profile ("About Me")
+- **Smart Fact Detection** - Wovly automatically detects when you share personal information ("Igor is my contractor", "My wife's birthday is March 15th") and offers to save it to your profile
+- **Conflict Resolution** - If new information conflicts with existing facts, Wovly asks which version to keep
+- **Profile Editor** - View and edit your profile directly in the "About Me" page
+- **Better Context** - Your profile helps Wovly understand your relationships, preferences, and context for more personalized responses
+
+### Intelligent Conversation Context
+- **Pronoun Resolution** - When you say "send an email to him", Wovly understands who "him" refers to from the conversation
+- **Follow-up Questions** - Ask "what were the dates of those messages?" and Wovly knows which messages you mean
+- **Contextual Understanding** - References like "that", "those", "them" are automatically resolved from recent conversation
 
 ## Getting Started
 
@@ -138,8 +161,8 @@ Go to **Settings** in the app and add your API keys:
 1. Go to **Integrations** → **Playwright - Browser Automation**
 2. Click **Enable** to start the browser automation service
 3. Select your preferred browser:
-   - **Chrome** (recommended) - Uses your existing Chrome with saved logins
-   - **Chromium** - Isolated browser for sandboxed automation
+   - **Chromium** (recommended) - Reliable automation browser, auto-installs if needed
+   - **Chrome** - Uses your existing Chrome (may have profile conflicts)
    - **Firefox** / **Edge** / **WebKit** - Alternative browser engines
 
 Playwright allows Wovly to:
@@ -148,6 +171,12 @@ Playwright allows Wovly to:
 - Click buttons and interact with web pages
 - Take screenshots for visual reference
 - Automate multi-step web workflows
+
+**Anti-Detection Features:**
+- Automatic browser fallback if the selected browser fails
+- Anti-detection browser flags to reduce bot detection
+- Graceful captcha handling with suggestions for alternative sites
+- Session persistence for maintaining login state
 
 ## Usage
 
@@ -200,7 +229,7 @@ wovly/
 │   │   └── preload.js    # IPC bridge to renderer
 │   └── ui/               # React frontend
 │       └── src/
-│           ├── App.tsx   # Main UI components
+│           ├── App.tsx   # Main UI components (Chat, Tasks, Skills, About Me, etc.)
 │           └── styles.css
 ├── packages/             # Shared modules (future use)
 │   ├── memory/
@@ -208,6 +237,7 @@ wovly/
 │   └── ...
 └── ~/.wovly-assistant/   # User data (outside repo)
     ├── settings.json     # API keys, tokens (local only)
+    ├── profile.md        # Personal profile (About Me data)
     ├── memory/           # Conversation logs
     ├── tasks/            # Task state files
     └── skills/           # Skill markdown files

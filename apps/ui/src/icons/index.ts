@@ -29,8 +29,10 @@ export {
   SkillsIcon,
   SchedulerIcon,
   ProfileIcon,
+  AboutMeIcon,
   IntegrationsIcon,
   InterfacesIcon,
   SettingsIcon,
   AgentSoulIcon,
+  CredentialsIcon,
 } from "./navigation";

@@ -287,6 +287,12 @@ input {
   border-left: 3px solid #5c6bc0;
 }
 
+.chat-bubble.clarification {
+  position: relative;
+  border-left: 3px solid #ff9800;
+  background: linear-gradient(to right, rgba(255, 152, 0, 0.05), transparent);
+}
+
 .source-badge {
   font-size: 0.75rem;
   margin-right: 6px;
@@ -312,6 +318,28 @@ input {
   color: white;
   align-self: flex-end;
   border-bottom-right-radius: 6px;
+}
+
+/* Browser automation screenshots */
+.chat-images {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-screenshot {
+  max-width: 100%;
+  max-height: 400px;
+  border-radius: 8px;
+  border: 1px solid #e0e0e0;
+  cursor: pointer;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.chat-screenshot:hover {
+  transform: scale(1.02);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
 }
 
 .attachment-row {
@@ -2647,6 +2675,28 @@ input {
   flex: 1;
 }
 
+.quick-remove-btn {
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: #f5f5f5;
+  color: #888;
+  border-radius: 50%;
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+  margin-left: 8px;
+}
+
+.quick-remove-btn:hover {
+  background: #ffebee;
+  color: #c62828;
+}
+
 .task-meta {
   margin-top: 4px;
   padding-left: 24px;
@@ -2692,6 +2742,171 @@ input {
 .status-badge.status-cancelled {
   background: #fafafa;
   color: #9e9e9e;
+}
+
+.status-badge.status-approval {
+  background: #fff3e0;
+  color: #e65100;
+  animation: pulse-attention 2s ease-in-out infinite;
+}
+
+.status-badge.status-input {
+  background: #e3f2fd;
+  color: #1565c0;
+  animation: pulse-attention 2s ease-in-out infinite;
+}
+
+@keyframes pulse-attention {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+/* Task with pending messages */
+.task-card.has-pending {
+  border-color: #ff9800;
+  border-width: 2px;
+}
+
+.task-card.has-pending .task-header {
+  background: linear-gradient(to right, rgba(255, 152, 0, 0.08), transparent);
+}
+
+.pending-count {
+  color: #e65100;
+  font-weight: 500;
+}
+
+/* Pending Messages Section */
+.pending-messages-section {
+  background: #fff8e1;
+  padding: 16px;
+  border-radius: 8px;
+  border: 1px solid #ffe082;
+}
+
+.pending-messages-section h4 {
+  color: #e65100;
+}
+
+.pending-messages-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.pending-message-card {
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.pending-message-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.platform-badge {
+  background: #e3f2fd;
+  color: #1565c0;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.pending-message-header .recipient {
+  color: #666;
+  font-size: 0.9rem;
+}
+
+.pending-message-subject {
+  margin-bottom: 8px;
+  font-size: 0.9rem;
+}
+
+.pending-message-content {
+  margin-bottom: 12px;
+}
+
+.message-preview {
+  background: #f5f5f5;
+  padding: 12px;
+  border-radius: 6px;
+  margin: 0;
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.message-editor {
+  width: 100%;
+  padding: 12px;
+  border: 2px solid #5c6bc0;
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 100px;
+}
+
+.message-editor:focus {
+  outline: none;
+  border-color: #3f51b5;
+}
+
+.pending-message-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.pending-message-actions button.primary {
+  background: #4caf50;
+  color: white;
+}
+
+.pending-message-actions button.primary:hover:not(:disabled) {
+  background: #43a047;
+}
+
+/* Auto-send Toggle */
+.auto-send-section {
+  padding: 12px;
+  background: #f5f5f5;
+  border-radius: 8px;
+}
+
+.auto-send-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.auto-send-toggle input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
+
+.toggle-label {
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.toggle-hint {
+  display: block;
+  font-size: 0.8rem;
+  color: #888;
+  font-weight: normal;
+  margin-top: 2px;
 }
 
 /* Task Details (expanded) */
@@ -3161,4 +3376,580 @@ input {
 
 .setup-instructions li {
   margin-bottom: 8px;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Credentials Page - Secure website login storage
+   ───────────────────────────────────────────────────────────────────────────── */
+
+.credentials-page {
+  padding: 24px;
+  max-width: 900px;
+}
+
+.credentials-page .page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 24px;
+}
+
+.credentials-page .page-header h1 {
+  margin: 0 0 4px 0;
+  font-size: 1.5rem;
+  color: #191932;
+}
+
+.credentials-page .page-subtitle {
+  margin: 0;
+  color: #7a7a8c;
+  font-size: 0.9rem;
+}
+
+.credentials-error {
+  background: #fef2f2;
+  color: #dc2626;
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  font-size: 0.9rem;
+}
+
+.credentials-loading {
+  text-align: center;
+  padding: 48px 24px;
+  color: #7a7a8c;
+}
+
+.credentials-empty {
+  text-align: center;
+  padding: 48px 24px;
+  background: #f8f9fa;
+  border-radius: 12px;
+}
+
+.credentials-empty .empty-icon {
+  font-size: 3rem;
+  margin-bottom: 16px;
+}
+
+.credentials-empty h3 {
+  margin: 0 0 8px 0;
+  color: #191932;
+}
+
+.credentials-empty p {
+  margin: 0 0 20px 0;
+  color: #7a7a8c;
+}
+
+.credentials-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.credential-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 16px;
+  background: white;
+  border: 1px solid #e5e5ed;
+  border-radius: 12px;
+  transition: box-shadow 0.2s ease;
+}
+
+.credential-row:hover {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.credential-icon {
+  font-size: 1.5rem;
+  min-width: 40px;
+  text-align: center;
+}
+
+.credential-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.credential-domain {
+  font-weight: 600;
+  color: #191932;
+  margin-bottom: 4px;
+}
+
+.credential-username {
+  color: #555;
+  font-size: 0.9rem;
+}
+
+.credential-password {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 0.85rem;
+  color: #7a7a8c;
+}
+
+.show-password-btn {
+  background: none;
+  border: none;
+  color: #5a4bff;
+  font-size: 0.8rem;
+  cursor: pointer;
+  padding: 0;
+}
+
+.show-password-btn:hover {
+  text-decoration: underline;
+}
+
+.credential-notes {
+  margin-top: 6px;
+  font-size: 0.85rem;
+  color: #9c9cad;
+  font-style: italic;
+}
+
+.credential-last-used {
+  margin-top: 6px;
+  font-size: 0.8rem;
+  color: #b0b0b8;
+}
+
+.credential-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.credentials-help {
+  margin-top: 32px;
+  padding: 16px;
+  background: #f0f4ff;
+  border-radius: 8px;
+  border: 1px solid #c7d7fe;
+}
+
+.credentials-help h4 {
+  margin: 0 0 8px 0;
+  color: #5a4bff;
+  font-size: 0.95rem;
+}
+
+.credentials-help p {
+  margin: 0;
+  color: #555;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.credentials-help code {
+  background: #e8f0fe;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  color: #5a4bff;
+}
+
+/* Credential Modal */
+.credential-modal {
+  max-width: 500px;
+}
+
+.credential-modal .form-group {
+  margin-bottom: 16px;
+}
+
+.credential-modal .form-group label {
+  display: block;
+  margin-bottom: 6px;
+  font-weight: 500;
+  color: #333;
+}
+
+.credential-modal .form-group input,
+.credential-modal .form-group textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  font-size: 0.95rem;
+  transition: border-color 0.2s ease;
+}
+
+.credential-modal .form-group input:focus,
+.credential-modal .form-group textarea:focus {
+  outline: none;
+  border-color: #5a4bff;
+  box-shadow: 0 0 0 2px rgba(90, 75, 255, 0.1);
+}
+
+.credential-modal .form-group input:disabled {
+  background: #f5f5f5;
+  color: #888;
+}
+
+.credential-modal .form-hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.8rem;
+  color: #9c9cad;
+}
+
+.credential-modal .form-error {
+  background: #fef2f2;
+  color: #dc2626;
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  margin-top: 12px;
+}
+
+.password-input-wrapper {
+  display: flex;
+  gap: 8px;
+}
+
+.password-input-wrapper input {
+  flex: 1;
+}
+
+.password-toggle {
+  padding: 10px 14px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  background: #f8f9fa;
+  color: #555;
+  cursor: pointer;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.password-toggle:hover {
+  background: #e5e5ed;
+}
+
+/* Danger button for delete */
+button.danger {
+  background: #fef2f2;
+  color: #dc2626;
+  border: 1px solid #fecaca;
+}
+
+button.danger:hover {
+  background: #fee2e2;
+  border-color: #f87171;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   About Me Page
+   ───────────────────────────────────────────────────────────────────────────── */
+
+.about-me-page {
+  padding: 24px;
+  max-width: 800px;
+  margin: 0 auto;
+  height: 100%;
+  overflow-y: auto;
+}
+
+.about-me-header h1 {
+  margin-bottom: 16px;
+  font-size: 1.75rem;
+}
+
+.about-me-description {
+  background: #f0f7ff;
+  border-left: 4px solid #2196f3;
+  padding: 16px;
+  margin-bottom: 24px;
+  border-radius: 0 8px 8px 0;
+}
+
+.about-me-description p {
+  margin: 8px 0;
+  line-height: 1.5;
+}
+
+.about-me-description .important-note {
+  font-size: 0.9em;
+  color: #666;
+  margin-top: 12px;
+}
+
+.about-me-actions {
+  margin-bottom: 16px;
+  display: flex;
+  gap: 8px;
+}
+
+.about-me-actions button {
+  padding: 10px 20px;
+  border-radius: 8px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.about-me-actions .btn-primary {
+  background: #6366f1;
+  color: white;
+  border: none;
+}
+
+.about-me-actions .btn-primary:hover {
+  background: #4f46e5;
+}
+
+.about-me-actions .btn-primary:disabled {
+  background: #c7d2fe;
+  cursor: not-allowed;
+}
+
+.about-me-actions .btn-secondary {
+  background: #f3f4f6;
+  color: #374151;
+  border: 1px solid #d1d5db;
+}
+
+.about-me-actions .btn-secondary:hover {
+  background: #e5e7eb;
+}
+
+.about-me-content {
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.profile-editor {
+  width: 100%;
+  min-height: 500px;
+  font-family: 'SF Mono', 'Monaco', 'Menlo', monospace;
+  font-size: 0.9rem;
+  padding: 16px;
+  border: none;
+  resize: vertical;
+  line-height: 1.6;
+}
+
+.profile-editor:focus {
+  outline: none;
+}
+
+.profile-viewer {
+  padding: 16px;
+  background: #fafafa;
+  min-height: 200px;
+}
+
+.profile-viewer pre {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-family: 'SF Mono', 'Monaco', 'Menlo', monospace;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  margin: 0;
+  color: #374151;
+}
+
+.error-banner {
+  background: #fef2f2;
+  color: #dc2626;
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  border: 1px solid #fecaca;
+}
+
+.loading-state {
+  padding: 40px;
+  text-align: center;
+  color: #6b7280;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Fact Confirmation Panel (for informational statements)
+   ───────────────────────────────────────────────────────────────────────────── */
+
+.fact-confirmation-panel {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 16px;
+  margin: 16px 0;
+}
+
+.fact-confirmation-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.fact-confirmation-header h4 {
+  margin: 0;
+  font-size: 1rem;
+  color: #1e293b;
+}
+
+.fact-confirmation-close {
+  background: none;
+  border: none;
+  font-size: 1.5rem;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+}
+
+.fact-confirmation-close:hover {
+  color: #64748b;
+}
+
+.fact-conflicts-section {
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 16px;
+}
+
+.conflict-warning {
+  font-weight: 600;
+  color: #92400e;
+  margin-bottom: 12px;
+}
+
+.fact-conflict-item {
+  background: white;
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 8px;
+}
+
+.fact-conflict-item:last-child {
+  margin-bottom: 0;
+}
+
+.conflict-description {
+  font-size: 0.9rem;
+  color: #78350f;
+  margin: 0 0 10px 0;
+  font-weight: 500;
+}
+
+.conflict-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.conflict-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+
+.conflict-option:hover {
+  background: #fef9e7;
+}
+
+.conflict-option input[type="radio"] {
+  margin-top: 3px;
+}
+
+.conflict-option span {
+  font-size: 0.85rem;
+  color: #44403c;
+}
+
+.facts-to-save {
+  margin-bottom: 16px;
+}
+
+.facts-label {
+  font-size: 0.85rem;
+  color: #64748b;
+  margin-bottom: 8px;
+}
+
+.fact-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  margin-bottom: 4px;
+  font-size: 0.9rem;
+}
+
+.fact-item.will-save {
+  background: #ecfdf5;
+  color: #065f46;
+}
+
+.fact-item.will-skip {
+  background: #f3f4f6;
+  color: #9ca3af;
+}
+
+.fact-icon {
+  font-size: 1rem;
+}
+
+.fact-text {
+  flex: 1;
+}
+
+.fact-status {
+  font-size: 0.75rem;
+  color: #9ca3af;
+  font-style: italic;
+}
+
+.fact-confirmation-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.fact-confirmation-actions button {
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  border: none;
+}
+
+.fact-confirmation-actions button.primary {
+  background: #6366f1;
+  color: white;
+}
+
+.fact-confirmation-actions button.primary:hover {
+  background: #4f46e5;
+}
+
+.fact-confirmation-actions button.primary:disabled {
+  background: #c7d2fe;
+  cursor: not-allowed;
+}
+
+.fact-confirmation-actions button.secondary {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.fact-confirmation-actions button.secondary:hover {
+  background: #e2e8f0;
 }

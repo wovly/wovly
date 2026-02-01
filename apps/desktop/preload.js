@@ -13,6 +13,23 @@ contextBridge.exposeInMainWorld("wovly", {
       const handler = (_event, data) => callback(data);
       ipcRenderer.on("chat:newMessage", handler);
       return () => ipcRenderer.removeListener("chat:newMessage", handler);
+    },
+    // Subscribe to screenshots from browser automation
+    onScreenshot: (callback) => {
+      const handler = (_event, data) => callback(data);
+      ipcRenderer.on("chat:screenshot", handler);
+      return () => ipcRenderer.removeListener("chat:screenshot", handler);
+    }
+  },
+  // Message Confirmation - requires user approval before sending any message
+  messageConfirmation: {
+    approve: (confirmationId) => ipcRenderer.invoke("message:confirmationApprove", { confirmationId }),
+    reject: (confirmationId, reason) => ipcRenderer.invoke("message:confirmationReject", { confirmationId, reason }),
+    // Subscribe to confirmation requests
+    onConfirmationRequired: (callback) => {
+      const handler = (_event, data) => callback(data);
+      ipcRenderer.on("message:confirmationRequired", handler);
+      return () => ipcRenderer.removeListener("message:confirmationRequired", handler);
     }
   },
   calendar: {
@@ -34,17 +51,24 @@ contextBridge.exposeInMainWorld("wovly", {
     disconnectSlack: () => ipcRenderer.invoke("integrations:disconnectSlack"),
     setWeatherEnabled: (enabled) => ipcRenderer.invoke("integrations:setWeatherEnabled", { enabled }),
     getWeatherEnabled: () => ipcRenderer.invoke("integrations:getWeatherEnabled"),
-    // Playwright Browser Automation
+    // Playwright CLI - Browser Automation
     setPlaywrightEnabled: (enabled) => ipcRenderer.invoke("integrations:setPlaywrightEnabled", { enabled }),
     getPlaywrightEnabled: () => ipcRenderer.invoke("integrations:getPlaywrightEnabled"),
     testPlaywright: () => ipcRenderer.invoke("integrations:testPlaywright"),
     getAvailableBrowsers: () => ipcRenderer.invoke("integrations:getAvailableBrowsers"),
-    setPlaywrightBrowser: (browser) => ipcRenderer.invoke("integrations:setPlaywrightBrowser", { browser })
+    setPlaywrightBrowser: (browser) => ipcRenderer.invoke("integrations:setPlaywrightBrowser", { browser }),
+    getPlaywrightCliReference: () => ipcRenderer.invoke("integrations:getPlaywrightCliReference")
   },
   profile: {
     get: () => ipcRenderer.invoke("profile:get"),
     update: (updates) => ipcRenderer.invoke("profile:update", { updates }),
-    needsOnboarding: () => ipcRenderer.invoke("profile:needsOnboarding")
+    needsOnboarding: () => ipcRenderer.invoke("profile:needsOnboarding"),
+    // Facts management (for informational statements)
+    addFacts: (facts, conflictResolutions) => 
+      ipcRenderer.invoke("profile:addFacts", { facts, conflictResolutions }),
+    // Raw markdown access (for About Me page)
+    getMarkdown: () => ipcRenderer.invoke("profile:getMarkdown"),
+    saveMarkdown: (markdown) => ipcRenderer.invoke("profile:saveMarkdown", markdown)
   },
   welcome: {
     generate: () => ipcRenderer.invoke("welcome:generate")
@@ -82,6 +106,19 @@ contextBridge.exposeInMainWorld("wovly", {
       const handler = (_event, data) => callback(data);
       ipcRenderer.on("task:update", handler);
       return () => ipcRenderer.removeListener("task:update", handler);
+    },
+    // Pending message operations
+    approvePendingMessage: (taskId, messageId, editedMessage) => 
+      ipcRenderer.invoke("tasks:approvePendingMessage", { taskId, messageId, editedMessage }),
+    rejectPendingMessage: (taskId, messageId) => 
+      ipcRenderer.invoke("tasks:rejectPendingMessage", { taskId, messageId }),
+    setAutoSend: (taskId, autoSend) => 
+      ipcRenderer.invoke("tasks:setAutoSend", { taskId, autoSend }),
+    // Subscribe to pending message events
+    onPendingMessage: (callback) => {
+      const handler = (_event, data) => callback(data);
+      ipcRenderer.on("task:pendingMessage", handler);
+      return () => ipcRenderer.removeListener("task:pendingMessage", handler);
     }
   },
   // Skills - procedural knowledge library
@@ -91,5 +128,12 @@ contextBridge.exposeInMainWorld("wovly", {
     save: (skillId, content) => ipcRenderer.invoke("skills:save", { skillId, content }),
     delete: (skillId) => ipcRenderer.invoke("skills:delete", { skillId }),
     getTemplate: () => ipcRenderer.invoke("skills:getTemplate")
+  },
+  // Credentials - secure local storage for website logins
+  credentials: {
+    list: () => ipcRenderer.invoke("credentials:list"),
+    get: (domain, includePassword = false) => ipcRenderer.invoke("credentials:get", { domain, includePassword }),
+    save: (credential) => ipcRenderer.invoke("credentials:save", credential),
+    delete: (domain) => ipcRenderer.invoke("credentials:delete", { domain })
   }
 });

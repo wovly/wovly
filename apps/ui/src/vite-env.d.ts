@@ -54,11 +54,81 @@ type WhatsAppStatusData = {
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
-  source?: "app" | "whatsapp" | "task";
+  source?: "app" | "whatsapp" | "task" | "decomposed" | "clarification";
   timestamp?: number;
 };
 
-type TaskStatus = "pending" | "active" | "waiting" | "completed" | "failed" | "cancelled";
+type ClarificationQuestion = {
+  param: string;
+  question: string;
+  suggested_value?: string;
+};
+
+// Types for fact extraction from informational statements
+type ExtractedFactType = {
+  category: string;
+  summary: string;
+  entities: Record<string, string>;
+  subject: string;
+};
+
+type FactConflictType = {
+  newFactIndex: number;
+  existingNoteIndex: number;
+  newFact: string;
+  existingNote: string;
+  subject: string;
+  conflictDescription: string;
+};
+
+type ChatResponse = {
+  ok: boolean;
+  response?: string;
+  error?: string;
+  suggestTask?: boolean;
+  decomposition?: object;
+  executedInline?: boolean;
+  clarification_needed?: boolean;
+  clarification_questions?: ClarificationQuestion[];
+  original_query?: string;
+  // Fact confirmation (informational statements)
+  informationType?: boolean;
+  facts?: ExtractedFactType[];
+  conflicts?: FactConflictType[];
+  originalInput?: string;
+  nonConflictingIndexes?: number[];
+};
+
+// Credential types for secure website login storage
+type CredentialListItem = {
+  domain: string;
+  displayName: string;
+  username: string;
+  hasPassword: boolean;
+  notes: string;
+  lastUsed: string | null;
+  created: string | null;
+};
+
+type WovlyCredential = {
+  domain: string;
+  displayName: string;
+  username: string;
+  password?: string; // Only included when explicitly requested
+  notes: string;
+  lastUsed: string | null;
+  created: string | null;
+};
+
+type CredentialInput = {
+  domain: string;
+  displayName?: string;
+  username?: string;
+  password?: string;
+  notes?: string;
+};
+
+type TaskStatus = "pending" | "active" | "waiting" | "waiting_approval" | "waiting_for_input" | "completed" | "failed" | "cancelled";
 
 type TaskCurrentStep = {
   step: number;
@@ -72,6 +142,16 @@ type TaskLogEntry = {
   message: string;
 };
 
+type PendingMessage = {
+  id: string;
+  toolName: string;
+  platform: string;
+  recipient: string;
+  subject?: string;
+  message: string;
+  created: string;
+};
+
 type Task = {
   id: string;
   title: string;
@@ -80,11 +160,13 @@ type Task = {
   lastUpdated: string;
   nextCheck: number | null;
   hidden?: boolean;
+  autoSend?: boolean; // Auto-send messages without approval
   originalRequest: string;
   plan: string[];
   currentStep: TaskCurrentStep;
   executionLog: TaskLogEntry[];
   contextMemory: Record<string, string>;
+  pendingMessages?: PendingMessage[]; // Messages awaiting approval
 };
 
 type TaskUpdate = {
@@ -113,6 +195,16 @@ type WovlyIpcApi = {
       ok: boolean;
       response?: string;
       error?: string;
+      // Query understanding - clarification fields
+      clarification_needed?: boolean;
+      clarification_questions?: ClarificationQuestion[];
+      original_query?: string;
+      // Fact confirmation (informational statements)
+      informationType?: boolean;
+      facts?: ExtractedFactType[];
+      conflicts?: FactConflictType[];
+      originalInput?: string;
+      nonConflictingIndexes?: number[];
       // Query decomposition fields
       suggestTask?: boolean;
       executedInline?: boolean;
@@ -172,6 +264,23 @@ type WovlyIpcApi = {
       }>;
     }>;
     onNewMessage: (callback: (message: ChatMessage) => void) => () => void;
+    onScreenshot?: (callback: (data: { dataUrl: string }) => void) => () => void;
+  };
+  messageConfirmation: {
+    approve: (confirmationId: string) => Promise<{ ok: boolean; error?: string }>;
+    reject: (confirmationId: string, reason?: string) => Promise<{ ok: boolean; error?: string }>;
+    onConfirmationRequired: (callback: (data: {
+      confirmationId: string;
+      toolName: string;
+      preview: {
+        type: string;
+        platform: string;
+        recipient: string;
+        subject?: string;
+        message: string;
+        cc?: string;
+      };
+    }) => void) => () => void;
   };
   calendar: {
     getEvents: (date: string) => Promise<{
@@ -207,12 +316,13 @@ type WovlyIpcApi = {
     disconnectSlack: () => Promise<{ ok: boolean; error?: string }>;
     setWeatherEnabled: (enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
     getWeatherEnabled: () => Promise<{ ok: boolean; enabled: boolean }>;
-    // Playwright Browser Automation
-    setPlaywrightEnabled: (enabled: boolean) => Promise<{ ok: boolean; running?: boolean; error?: string }>;
-    getPlaywrightEnabled: () => Promise<{ ok: boolean; enabled: boolean; running: boolean; toolCount: number; browser?: string }>;
-    testPlaywright: () => Promise<{ ok: boolean; message?: string; toolCount?: number; tools?: string[]; error?: string }>;
+    // Playwright CLI - Browser Automation
+    setPlaywrightEnabled: (enabled: boolean) => Promise<{ ok: boolean; enabled?: boolean; cliInstalled?: boolean; error?: string }>;
+    getPlaywrightEnabled: () => Promise<{ ok: boolean; enabled: boolean; cliInstalled: boolean; browser?: string }>;
+    testPlaywright: () => Promise<{ ok: boolean; message?: string; error?: string }>;
     getAvailableBrowsers: () => Promise<{ ok: boolean; browsers: Array<{ id: string; name: string; installed: boolean }> }>;
     setPlaywrightBrowser: (browser: string) => Promise<{ ok: boolean; error?: string }>;
+    getPlaywrightCliReference: () => Promise<{ ok: boolean; reference?: string }>;
   };
   profile: {
     get: () => Promise<{
@@ -229,6 +339,28 @@ type WovlyIpcApi = {
       ok: boolean;
       needsOnboarding?: boolean;
       profile?: WovlyFullProfile;
+    }>;
+    // Facts management (for informational statements)
+    addFacts: (
+      facts: ExtractedFactType[],
+      conflictResolutions?: Array<{
+        newFact: string;
+        existingNote: string;
+        keepNew: boolean;
+      }>
+    ) => Promise<{
+      ok: boolean;
+      error?: string;
+    }>;
+    // Raw markdown access (for About Me page)
+    getMarkdown: () => Promise<{
+      ok: boolean;
+      markdown?: string;
+      error?: string;
+    }>;
+    saveMarkdown: (markdown: string) => Promise<{
+      ok: boolean;
+      error?: string;
     }>;
   };
   welcome: {
@@ -280,6 +412,10 @@ type WovlyIpcApi = {
       originalRequest: string;
       plan: string[];
       context?: Record<string, string>;
+      taskType?: "discrete" | "continuous";
+      successCriteria?: string | null;
+      monitoringCondition?: string | null;
+      triggerAction?: string | null;
     }) => Promise<{ ok: boolean; task?: Task; error?: string }>;
     list: () => Promise<{ ok: boolean; tasks?: Task[]; error?: string }>;
     get: (taskId: string) => Promise<{ ok: boolean; task?: Task; error?: string }>;
@@ -291,6 +427,11 @@ type WovlyIpcApi = {
     saveRawMarkdown: (taskId: string, markdown: string) => Promise<{ ok: boolean; error?: string }>;
     execute: (taskId: string) => Promise<{ ok: boolean; result?: unknown; error?: string }>;
     onUpdate: (callback: (data: TaskUpdate) => void) => () => void;
+    // Pending message operations
+    approvePendingMessage: (taskId: string, messageId: string, editedMessage?: string) => Promise<{ ok: boolean; error?: string }>;
+    rejectPendingMessage: (taskId: string, messageId: string) => Promise<{ ok: boolean; error?: string }>;
+    setAutoSend: (taskId: string, autoSend: boolean) => Promise<{ ok: boolean; error?: string }>;
+    onPendingMessage: (callback: (data: { taskId: string; message: PendingMessage }) => void) => () => void;
   };
   // Skills - procedural knowledge library
   skills: {
@@ -299,6 +440,28 @@ type WovlyIpcApi = {
     save: (skillId: string, content: string) => Promise<{ ok: boolean; skill?: Skill; error?: string }>;
     delete: (skillId: string) => Promise<{ ok: boolean; error?: string }>;
     getTemplate: () => Promise<{ ok: boolean; template?: string; error?: string }>;
+  };
+  // Credentials - secure local storage for website logins
+  credentials: {
+    list: () => Promise<{ 
+      ok: boolean; 
+      credentials?: CredentialListItem[];
+      error?: string;
+    }>;
+    get: (domain: string, includePassword?: boolean) => Promise<{ 
+      ok: boolean; 
+      credential?: WovlyCredential;
+      error?: string;
+    }>;
+    save: (credential: CredentialInput) => Promise<{ 
+      ok: boolean;
+      domain?: string;
+      error?: string;
+    }>;
+    delete: (domain: string) => Promise<{ 
+      ok: boolean;
+      error?: string;
+    }>;
   };
 };
 
