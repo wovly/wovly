@@ -100,6 +100,44 @@ input {
   cursor: not-allowed;
 }
 
+/* Navigation icon wrapper for badge positioning */
+.nav-icon-wrapper {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Notification badge on nav icons */
+.nav-badge {
+  position: absolute;
+  top: -6px;
+  right: -8px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  background: #ef4444;
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 1px 3px rgba(239, 68, 68, 0.4);
+  animation: badge-pulse 2s ease-in-out infinite;
+}
+
+@keyframes badge-pulse {
+  0%, 100% { 
+    transform: scale(1);
+    box-shadow: 0 1px 3px rgba(239, 68, 68, 0.4);
+  }
+  50% { 
+    transform: scale(1.1);
+    box-shadow: 0 2px 6px rgba(239, 68, 68, 0.6);
+  }
+}
+
 .nav-btn.disabled:hover,
 .nav-btn:disabled:hover {
   background: transparent;

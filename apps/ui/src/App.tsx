@@ -3873,6 +3873,52 @@ export default function App() {
   // Message confirmation state
   const [pendingConfirmation, setPendingConfirmation] = useState<MessageConfirmation | null>(null);
   
+  // Pending task approvals count (for notification badge)
+  const [pendingApprovalsCount, setPendingApprovalsCount] = useState(0);
+  
+  // Load pending approvals count
+  const loadPendingApprovalsCount = async () => {
+    if (!window.wovly) return;
+    try {
+      const result = await window.wovly.tasks.list();
+      if (result.ok && result.tasks) {
+        // Count all pending messages across all tasks + tasks with waiting_approval status
+        let count = 0;
+        for (const task of result.tasks) {
+          if (task.pendingMessages && task.pendingMessages.length > 0) {
+            count += task.pendingMessages.length;
+          }
+          if (task.status === "waiting_approval") {
+            count += 1;
+          }
+        }
+        setPendingApprovalsCount(count);
+      }
+    } catch (err) {
+      console.error('[UI] Error loading pending approvals:', err);
+    }
+  };
+  
+  // Load pending count on mount and subscribe to updates
+  useEffect(() => {
+    loadPendingApprovalsCount();
+    
+    // Subscribe to task updates to refresh count
+    const unsubscribeTask = window.wovly?.tasks?.onUpdate?.(() => {
+      loadPendingApprovalsCount();
+    });
+    
+    // Subscribe to pending message events
+    const unsubscribePending = window.wovly?.tasks?.onPendingMessage?.(() => {
+      loadPendingApprovalsCount();
+    });
+    
+    return () => {
+      unsubscribeTask?.();
+      unsubscribePending?.();
+    };
+  }, []);
+  
   // Subscribe to message confirmation requests
   useEffect(() => {
     const unsubscribe = window.wovly.messageConfirmation?.onConfirmationRequired((data) => {
@@ -3918,7 +3964,13 @@ export default function App() {
               className={`nav-btn ${navItem === "tasks" ? "active" : ""}`}
               onClick={() => setNavItem("tasks")}
             >
-              <TasksIcon size={18} /> Tasks
+              <span className="nav-icon-wrapper">
+                <TasksIcon size={18} />
+                {pendingApprovalsCount > 0 && (
+                  <span className="nav-badge">{pendingApprovalsCount > 9 ? '9+' : pendingApprovalsCount}</span>
+                )}
+              </span>
+              Tasks
             </button>
           </li>
           <li>
