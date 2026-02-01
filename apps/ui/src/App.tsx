@@ -3882,14 +3882,12 @@ export default function App() {
     try {
       const result = await window.wovly.tasks.list();
       if (result.ok && result.tasks) {
-        // Count all pending messages across all tasks + tasks with waiting_approval status
+        // Count all pending messages across all tasks
+        // Note: tasks with waiting_approval status already have pendingMessages, so we only count messages
         let count = 0;
         for (const task of result.tasks) {
           if (task.pendingMessages && task.pendingMessages.length > 0) {
             count += task.pendingMessages.length;
-          }
-          if (task.status === "waiting_approval") {
-            count += 1;
           }
         }
         setPendingApprovalsCount(count);
