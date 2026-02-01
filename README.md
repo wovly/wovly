@@ -50,6 +50,11 @@ A powerful, privacy-focused personal AI assistant that runs locally on your desk
 - "Find rental properties in Austin near downtown" → Wovly searches multiple listing sites
 - "What's the Zestimate for [address]?" → Wovly looks up property valuations
 
+**Local Services & Outreach**
+- "I need a contractor to fix my sink - find the top 10 nearby plumbers and email them asking for a quote" → Wovly searches for local plumbers, gathers contact info, and sends personalized quote requests
+- "Find 5 highly-rated electricians in my area and ask about availability next week" → Wovly researches, compiles options, and handles outreach
+- "Research local caterers for a 50-person event and get pricing" → Wovly finds vendors and initiates contact
+
 ### Multi-LLM Support
 - **Anthropic Claude** (Sonnet 4, Haiku, Opus)
 - **OpenAI GPT** (GPT-4o, GPT-4 Turbo)
