@@ -919,6 +919,8 @@ input {
 /* Task suggestion from query decomposition */
 .task-suggestion-actions {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 12px;
   padding: 16px;
   padding-right: 48px; /* Make room for close button */
@@ -2969,6 +2971,79 @@ input {
   color: #888;
   font-weight: normal;
   margin-top: 2px;
+}
+
+/* Poll Frequency Selector - Task Cards */
+.poll-frequency-section {
+  padding: 12px;
+  background: #f8f9fa;
+  border-radius: 8px;
+}
+
+.poll-frequency-label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.poll-frequency-select {
+  padding: 6px 12px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  background: white;
+  cursor: pointer;
+  min-width: 160px;
+}
+
+.poll-frequency-select:hover {
+  border-color: #6366f1;
+}
+
+.poll-frequency-select:focus {
+  outline: none;
+  border-color: #6366f1;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.15);
+}
+
+.poll-frequency-hint {
+  display: block;
+  font-size: 0.8rem;
+  color: #666;
+  margin-top: 8px;
+  font-style: italic;
+}
+
+/* Poll Frequency Selector - Task Creation */
+.poll-frequency-selector {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #f8f9fa;
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+
+.poll-frequency-selector label {
+  color: #555;
+  white-space: nowrap;
+}
+
+.poll-frequency-selector select {
+  padding: 6px 10px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  background: white;
+  cursor: pointer;
+}
+
+.poll-frequency-selector select:focus {
+  outline: none;
+  border-color: #6366f1;
 }
 
 /* Task Details (expanded) */

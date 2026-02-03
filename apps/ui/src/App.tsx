@@ -439,6 +439,7 @@ function ChatPanel({
   // Query decomposition state
   const [pendingDecomposition, setPendingDecomposition] = useState<DecompositionResult | null>(null);
   const [isCreatingTask, setIsCreatingTask] = useState(false);
+  const [selectedPollFrequency, setSelectedPollFrequency] = useState("5min"); // Default to 5 minutes
   
   // Fact confirmation state (for informational statements)
   const [pendingFactConfirmation, setPendingFactConfirmation] = useState<PendingFactConfirmation | null>(null);
@@ -720,6 +721,7 @@ function ChatPanel({
         originalRequest: originalUserRequest,
         plan: pendingDecomposition.steps.map(s => s.action),
         taskType: taskType,
+        pollFrequency: selectedPollFrequency,
         // For continuous tasks, pass monitoring info
         ...(isContinuous ? {
           monitoringCondition: pendingDecomposition.monitoring_condition ?? undefined,
@@ -947,6 +949,22 @@ function ChatPanel({
             >
               ×
             </button>
+            <div className="poll-frequency-selector">
+              <label>Check frequency:</label>
+              <select 
+                value={selectedPollFrequency}
+                onChange={(e) => setSelectedPollFrequency(e.target.value)}
+                disabled={isCreatingTask}
+              >
+                <option value="1min">Every 1 minute</option>
+                <option value="5min">Every 5 minutes</option>
+                <option value="15min">Every 15 minutes</option>
+                <option value="30min">Every 30 minutes</option>
+                <option value="1hour">Every hour</option>
+                <option value="daily">Daily</option>
+                <option value="on_login">On login only</option>
+              </select>
+            </div>
             <button 
               className="primary" 
               onClick={handleCreateTaskFromDecomposition}
@@ -2755,6 +2773,12 @@ type PendingMessageType = {
   created: string;
 };
 
+type PollFrequency = {
+  type: "preset" | "custom" | "event";
+  value: number | string;
+  label: string;
+};
+
 type TaskType = {
   id: string;
   title: string;
@@ -2763,6 +2787,7 @@ type TaskType = {
   lastUpdated: string;
   nextCheck: number | null;
   autoSend?: boolean;
+  pollFrequency?: PollFrequency;
   originalRequest: string;
   plan: string[];
   currentStep: {
@@ -3008,6 +3033,35 @@ function TasksPage() {
     }
   };
 
+  // Update poll frequency for a task
+  const handleChangePollFrequency = async (taskId: string, newFrequency: string) => {
+    if (!window.wovly) return;
+    
+    const result = await window.wovly.tasks.setPollFrequency(taskId, newFrequency);
+    if (result.ok) {
+      await loadTasks();
+    } else {
+      alert(result.error || "Failed to update poll frequency");
+    }
+  };
+
+  // Helper to get current poll frequency preset key from task
+  const getPollFrequencyKey = (task: TaskType): string => {
+    if (!task.pollFrequency) return "1min";
+    const { type, value } = task.pollFrequency;
+    if (type === "event") return value as string;
+    // Match by value for presets
+    const presetMap: Record<number, string> = {
+      60000: "1min",
+      300000: "5min",
+      900000: "15min",
+      1800000: "30min",
+      3600000: "1hour",
+      86400000: "daily"
+    };
+    return presetMap[value as number] || "1min";
+  };
+
   const getStatusBadge = (status: TaskStatus, hasPendingMessages = false) => {
     const badges: Record<TaskStatus, { className: string; label: string }> = {
       pending: { className: "status-pending", label: "Pending" },
@@ -3242,6 +3296,29 @@ function TasksPage() {
                         <span className="toggle-hint">(Skip approval for future messages from this task)</span>
                       </span>
                     </label>
+                  </div>
+
+                  {/* Poll Frequency Selector */}
+                  <div className="task-section poll-frequency-section">
+                    <label className="poll-frequency-label">
+                      <span>Check frequency:</span>
+                      <select 
+                        value={getPollFrequencyKey(task)}
+                        onChange={(e) => handleChangePollFrequency(task.id, e.target.value)}
+                        className="poll-frequency-select"
+                      >
+                        <option value="1min">Every 1 minute</option>
+                        <option value="5min">Every 5 minutes</option>
+                        <option value="15min">Every 15 minutes</option>
+                        <option value="30min">Every 30 minutes</option>
+                        <option value="1hour">Every hour</option>
+                        <option value="daily">Daily</option>
+                        <option value="on_login">On login only</option>
+                      </select>
+                    </label>
+                    {task.pollFrequency?.type === "event" && (
+                      <span className="poll-frequency-hint">Task will run once when you log in</span>
+                    )}
                   </div>
 
                   <div className="task-actions">

@@ -2111,6 +2111,19 @@ const getTasksDir = async (username) => {
   return tasksDir;
 };
 
+// Poll frequency presets
+const POLL_FREQUENCY_PRESETS = {
+  "1min": { type: "preset", value: 60000, label: "Every 1 minute" },
+  "5min": { type: "preset", value: 300000, label: "Every 5 minutes" },
+  "15min": { type: "preset", value: 900000, label: "Every 15 minutes" },
+  "30min": { type: "preset", value: 1800000, label: "Every 30 minutes" },
+  "1hour": { type: "preset", value: 3600000, label: "Every hour" },
+  "daily": { type: "preset", value: 86400000, label: "Daily" },
+  "on_login": { type: "event", value: "on_login", label: "On login only" }
+};
+
+const DEFAULT_POLL_FREQUENCY = { type: "preset", value: 60000, label: "Every 1 minute" };
+
 // Parse task markdown into structured object
 const parseTaskMarkdown = (markdown, taskId) => {
   const task = {
@@ -2122,6 +2135,7 @@ const parseTaskMarkdown = (markdown, taskId) => {
     nextCheck: null,
     hidden: false,
     autoSend: false, // Auto-send messages without requiring approval
+    pollFrequency: { ...DEFAULT_POLL_FREQUENCY }, // Per-task polling frequency
     originalRequest: "",
     plan: [],
     currentStep: {
@@ -2172,6 +2186,21 @@ const parseTaskMarkdown = (markdown, taskId) => {
           case "next check": task.nextCheck = value ? new Date(value.split(" ")[0]).getTime() : null; break;
           case "hidden": task.hidden = value.toLowerCase() === "true"; break;
           case "auto-send": task.autoSend = value.toLowerCase() === "true"; break;
+          case "poll frequency": {
+            // Format: type:value:label (e.g., "preset:300000:Every 5 minutes" or "event:on_login:On login only")
+            const parts = value.split(":");
+            if (parts.length >= 3) {
+              task.pollFrequency = {
+                type: parts[0],
+                value: parts[0] === "event" ? parts[1] : parseInt(parts[1]) || 60000,
+                label: parts.slice(2).join(":") // In case label contains colons
+              };
+            } else if (parts.length === 1 && POLL_FREQUENCY_PRESETS[value]) {
+              // Handle preset keys like "5min"
+              task.pollFrequency = { ...POLL_FREQUENCY_PRESETS[value] };
+            }
+            break;
+          }
         }
       }
     }
@@ -2277,6 +2306,10 @@ const parseTaskMarkdown = (markdown, taskId) => {
 
 // Serialize task object to markdown
 const serializeTask = (task) => {
+  // Serialize poll frequency as type:value:label
+  const pollFreq = task.pollFrequency || DEFAULT_POLL_FREQUENCY;
+  const pollFreqStr = `${pollFreq.type}:${pollFreq.value}:${pollFreq.label}`;
+  
   let markdown = `# Task: ${task.title || task.id}
 
 ## Metadata
@@ -2286,6 +2319,7 @@ const serializeTask = (task) => {
 - **Next Check**: ${task.nextCheck ? new Date(task.nextCheck).toISOString() : ""}
 - **Hidden**: ${task.hidden ? "true" : "false"}
 - **Auto-Send**: ${task.autoSend ? "true" : "false"}
+- **Poll Frequency**: ${pollFreqStr}
 
 ## Original Request
 ${task.originalRequest || ""}
@@ -2450,6 +2484,20 @@ const createTask = async (taskData, username) => {
   // Determine task type (default to discrete for backward compatibility)
   const taskType = taskData.taskType || taskData.task_type || "discrete";
   
+  // Parse poll frequency - can be a preset key string or a full object
+  let pollFrequency = { ...DEFAULT_POLL_FREQUENCY };
+  if (taskData.pollFrequency) {
+    if (typeof taskData.pollFrequency === 'string') {
+      // Handle preset key like "5min" or "on_login"
+      if (POLL_FREQUENCY_PRESETS[taskData.pollFrequency]) {
+        pollFrequency = { ...POLL_FREQUENCY_PRESETS[taskData.pollFrequency] };
+      }
+    } else if (typeof taskData.pollFrequency === 'object') {
+      // Full object with type, value, label
+      pollFrequency = taskData.pollFrequency;
+    }
+  }
+  
   const task = {
     id: taskId,
     title: taskData.title || "Untitled Task",
@@ -2458,6 +2506,7 @@ const createTask = async (taskData, username) => {
     created: new Date().toISOString(),
     lastUpdated: new Date().toISOString(),
     nextCheck: null,
+    pollFrequency: pollFrequency,
     originalRequest: taskData.originalRequest || "",
     messagingChannel: messagingChannel || null,
     plan: skillPlan,
@@ -2469,7 +2518,7 @@ const createTask = async (taskData, username) => {
     },
     executionLog: [{
       timestamp: new Date().toISOString(),
-      message: `Task created and starting execution${messagingChannel ? ` (using ${messagingChannel})` : ""}${matchedSkill ? ` (skill: ${matchedSkill.name})` : ""}${taskType === "continuous" ? " (continuous monitoring)" : ""}`
+      message: `Task created and starting execution${messagingChannel ? ` (using ${messagingChannel})` : ""}${matchedSkill ? ` (skill: ${matchedSkill.name})` : ""}${taskType === "continuous" ? " (continuous monitoring)" : ""} [Poll: ${pollFrequency.label}]`
     }],
     contextMemory: {
       ...taskData.context,
@@ -2736,6 +2785,11 @@ const startTaskScheduler = () => {
       }
       
       for (const task of tasks) {
+        // Skip event-based tasks - they only run on specific events like login
+        if (task.pollFrequency?.type === "event") {
+          continue;
+        }
+        
         // Check if task needs execution
         if (task.status === "waiting" && task.nextCheck && Date.now() >= task.nextCheck) {
           console.log(`[Tasks] Processing task ${task.id}: nextCheck was ${new Date(task.nextCheck).toISOString()}`);
@@ -2794,12 +2848,15 @@ const startTaskScheduler = () => {
               );
               
               if (!check.hasNew) {
-                // No new messages - reschedule without LLM
-                console.log(`[Tasks] No new ${integration.name} from ${waitingForContact}, rescheduling`);
-                await updateTask(task.id, {
-                  nextCheck: Date.now() + 60000,
-                  contextMemory: { ...task.contextMemory, last_check_time: new Date().toISOString() }
-                });
+                // No new messages - reschedule using task's poll frequency
+                const pollInterval = task.pollFrequency?.type === "event" ? null : (task.pollFrequency?.value || 60000);
+                console.log(`[Tasks] No new ${integration.name} from ${waitingForContact}, rescheduling in ${pollInterval ? pollInterval/1000 + 's' : 'event-based'}`);
+                if (pollInterval) {
+                  await updateTask(task.id, {
+                    nextCheck: Date.now() + pollInterval,
+                    contextMemory: { ...task.contextMemory, last_check_time: new Date().toISOString() }
+                  });
+                }
                 continue; // Skip to next task
               }
               
@@ -2862,11 +2919,15 @@ const startTaskScheduler = () => {
             const emailCheck = await checkForNewEmails(googleAccessToken, legacyWaitingForEmail, new Date(legacyLastCheckTime).getTime());
             
             if (!emailCheck.hasNew) {
-              console.log(`[Tasks] No new emails from ${legacyWaitingForEmail}, rescheduling check`);
-              await updateTask(task.id, {
-                nextCheck: Date.now() + 60000,
-                contextMemory: { ...task.contextMemory, last_email_check: new Date().toISOString() }
-              });
+              // Reschedule using task's poll frequency
+              const pollInterval = task.pollFrequency?.type === "event" ? null : (task.pollFrequency?.value || 60000);
+              console.log(`[Tasks] No new emails from ${legacyWaitingForEmail}, rescheduling in ${pollInterval ? pollInterval/1000 + 's' : 'event-based'}`);
+              if (pollInterval) {
+                await updateTask(task.id, {
+                  nextCheck: Date.now() + pollInterval,
+                  contextMemory: { ...task.contextMemory, last_email_check: new Date().toISOString() }
+                });
+              }
               continue;
             }
             
@@ -2935,6 +2996,48 @@ const resumeTasksOnStartup = async (username) => {
     }
   } catch (err) {
     console.error("[Tasks] Failed to resume tasks:", err.message);
+  }
+};
+
+// Run tasks that are configured to execute on login
+const runOnLoginTasks = async (username) => {
+  console.log("[Tasks] Checking for on-login tasks...");
+  
+  if (!username) {
+    console.log("[Tasks] No user logged in, skipping on-login tasks");
+    return;
+  }
+  
+  try {
+    const tasks = await listActiveTasks(username);
+    
+    // Find tasks with on_login poll frequency that are waiting or active
+    const onLoginTasks = tasks.filter(task => 
+      task.pollFrequency?.type === "event" && 
+      task.pollFrequency?.value === "on_login" &&
+      (task.status === "waiting" || task.status === "active")
+    );
+    
+    if (onLoginTasks.length === 0) {
+      console.log("[Tasks] No on-login tasks to run");
+      return;
+    }
+    
+    console.log(`[Tasks] Found ${onLoginTasks.length} on-login task(s) to execute`);
+    
+    for (const task of onLoginTasks) {
+      console.log(`[Tasks] Running on-login task: ${task.id}`);
+      
+      // Add log entry
+      await updateTask(task.id, {
+        logEntry: "Task triggered by user login"
+      });
+      
+      // Execute the task with a small delay to let app initialize
+      setTimeout(() => executeTaskStep(task.id), 3000);
+    }
+  } catch (err) {
+    console.error("[Tasks] Failed to run on-login tasks:", err.message);
   }
 };
 
@@ -5481,6 +5584,11 @@ Generate ONLY the welcome message, nothing else.`;
         console.error("[Tasks] Error resuming tasks:", err.message);
       });
       
+      // Run event-based tasks triggered by login (in background)
+      runOnLoginTasks(normalizedUsername).catch(err => {
+        console.error("[Tasks] Error running on-login tasks:", err.message);
+      });
+      
       return { 
         ok: true, 
         user: {
@@ -5546,6 +5654,11 @@ Generate ONLY the welcome message, nothing else.`;
           // Resume tasks in background
           resumeTasksOnStartup(currentUser.username).catch(err => {
             console.error("[Tasks] Error resuming tasks:", err.message);
+          });
+          
+          // Run on-login event tasks in background
+          runOnLoginTasks(currentUser.username).catch(err => {
+            console.error("[Tasks] Error running on-login tasks:", err.message);
           });
           
           return { 
@@ -7586,6 +7699,62 @@ Generate ONLY the welcome message, nothing else.`;
     } catch (err) {
       return { ok: false, error: err.message };
     }
+  });
+
+  // Set poll frequency for a task
+  ipcMain.handle("tasks:setPollFrequency", async (_event, { taskId, pollFrequency }) => {
+    try {
+      const task = await getTask(taskId, currentUser?.username);
+      if (!task) {
+        return { ok: false, error: "Task not found" };
+      }
+
+      // Parse poll frequency - can be a preset key or full object
+      let newPollFrequency;
+      if (typeof pollFrequency === 'string') {
+        if (POLL_FREQUENCY_PRESETS[pollFrequency]) {
+          newPollFrequency = { ...POLL_FREQUENCY_PRESETS[pollFrequency] };
+        } else {
+          return { ok: false, error: "Invalid poll frequency preset" };
+        }
+      } else if (typeof pollFrequency === 'object' && pollFrequency.type && pollFrequency.value) {
+        newPollFrequency = pollFrequency;
+      } else {
+        return { ok: false, error: "Invalid poll frequency format" };
+      }
+
+      task.pollFrequency = newPollFrequency;
+      task.lastUpdated = new Date().toISOString();
+      task.executionLog.push({
+        timestamp: new Date().toISOString(),
+        message: `Poll frequency changed to: ${newPollFrequency.label}`
+      });
+
+      // For event-based tasks, clear nextCheck since they don't poll on interval
+      if (newPollFrequency.type === "event") {
+        task.nextCheck = null;
+      } else if (task.status === "waiting" && !task.nextCheck) {
+        // Set next check if task is waiting but doesn't have one scheduled
+        task.nextCheck = Date.now() + newPollFrequency.value;
+      }
+
+      // Save task
+      const tasksDir = await getTasksDir(currentUser?.username);
+      const taskPath = path.join(tasksDir, `${taskId}.md`);
+      await fs.writeFile(taskPath, serializeTask(task), "utf8");
+
+      // Notify UI
+      addTaskUpdate(taskId, `Poll frequency changed to: ${newPollFrequency.label}`);
+
+      return { ok: true, pollFrequency: newPollFrequency };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Get available poll frequency presets
+  ipcMain.handle("tasks:getPollFrequencyPresets", async () => {
+    return { ok: true, presets: POLL_FREQUENCY_PRESETS };
   });
 
   // Slack API helpers for tools

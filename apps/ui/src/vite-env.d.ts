@@ -137,6 +137,12 @@ type TaskCurrentStep = {
   pollInterval: number | null;
 };
 
+type TaskPollFrequency = {
+  type: "preset" | "custom" | "event";
+  value: number | string;
+  label: string;
+};
+
 type TaskLogEntry = {
   timestamp: string;
   message: string;
@@ -161,6 +167,7 @@ type Task = {
   nextCheck: number | null;
   hidden?: boolean;
   autoSend?: boolean; // Auto-send messages without approval
+  pollFrequency?: TaskPollFrequency; // Per-task polling frequency
   originalRequest: string;
   plan: string[];
   currentStep: TaskCurrentStep;
@@ -489,6 +496,7 @@ type WovlyIpcApi = {
       successCriteria?: string | null;
       monitoringCondition?: string | null;
       triggerAction?: string | null;
+      pollFrequency?: string | TaskPollFrequency; // preset key or full object
     }) => Promise<{ ok: boolean; task?: Task; error?: string }>;
     list: () => Promise<{ ok: boolean; tasks?: Task[]; error?: string }>;
     get: (taskId: string) => Promise<{ ok: boolean; task?: Task; error?: string }>;
@@ -504,6 +512,9 @@ type WovlyIpcApi = {
     approvePendingMessage: (taskId: string, messageId: string, editedMessage?: string) => Promise<{ ok: boolean; error?: string }>;
     rejectPendingMessage: (taskId: string, messageId: string) => Promise<{ ok: boolean; error?: string }>;
     setAutoSend: (taskId: string, autoSend: boolean) => Promise<{ ok: boolean; error?: string }>;
+    // Poll frequency operations
+    setPollFrequency: (taskId: string, pollFrequency: string | TaskPollFrequency) => Promise<{ ok: boolean; pollFrequency?: TaskPollFrequency; error?: string }>;
+    getPollFrequencyPresets: () => Promise<{ ok: boolean; presets?: Record<string, TaskPollFrequency>; error?: string }>;
     onPendingMessage: (callback: (data: { taskId: string; message: PendingMessage }) => void) => () => void;
   };
   // Skills - procedural knowledge library

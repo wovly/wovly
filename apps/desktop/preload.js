@@ -180,6 +180,11 @@ contextBridge.exposeInMainWorld("wovly", {
       ipcRenderer.invoke("tasks:rejectPendingMessage", { taskId, messageId }),
     setAutoSend: (taskId, autoSend) => 
       ipcRenderer.invoke("tasks:setAutoSend", { taskId, autoSend }),
+    // Poll frequency operations
+    setPollFrequency: (taskId, pollFrequency) => 
+      ipcRenderer.invoke("tasks:setPollFrequency", { taskId, pollFrequency }),
+    getPollFrequencyPresets: () => 
+      ipcRenderer.invoke("tasks:getPollFrequencyPresets"),
     // Subscribe to pending message events
     onPendingMessage: (callback) => {
       const handler = (_event, data) => callback(data);
