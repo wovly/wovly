@@ -1,12 +1,12 @@
 # Wovly
 
-**Your Autonomous Personal AI Assistant**
+**Your Autonomous Personal AI Communication Assistant**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](https://github.com/bluerune234/wovly)
 [![Electron](https://img.shields.io/badge/Electron-Latest-47848F)](https://www.electronjs.org/)
 
-A privacy-first desktop AI assistant that manages your communications, automates workflows, and remembers context across Email, Slack, iMessage, WhatsApp, Telegram, and more.
+A privacy-first desktop AI communication assistant that manages your contacts, follow ups, chat analysis, and remembers context across Email, Slack, iMessage, WhatsApp, Telegram, and more.
 
 ---
 
@@ -225,7 +225,7 @@ wovly/
 - **Encrypted credentials** – OS-level encryption (Keychain/DPAPI/libsecret)
 - **Direct API calls** – Requests go directly to providers, no proxy
 - **Local browser automation** – Chromium runs on your machine
-- **No data leaves your machine** except for API requests to providers you configure
+- **No data leaves your machine** except for API requests to providers you configure and prompts sent to LLM services (Anthropic, OpenAI, Gemini)
 
 ---
 
