@@ -10787,7 +10787,7 @@ Generate ONLY the welcome message, nothing else.`;
     try {
       switch (toolName) {
         case "create_task": {
-          const task = await createTask(toolInput);
+          const task = await createTask(toolInput, currentUser?.username);
           
           // Send initial notification that task is starting
           if (win && win.webContents) {
@@ -10801,7 +10801,7 @@ Generate ONLY the welcome message, nothing else.`;
           // Auto-start the task immediately (don't await - let it run in background)
           setTimeout(async () => {
             console.log(`[Tasks] Auto-starting task: ${task.id}`);
-            await executeTaskStep(task.id);
+            await executeTaskStep(task.id, currentUser?.username);
           }, 100);
           
           return {
