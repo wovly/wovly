@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](https://github.com/bluerune234/wovly)
 [![Electron](https://img.shields.io/badge/Electron-Latest-47848F)](https://www.electronjs.org/)
-[![Documentation](https://img.shields.io/badge/Docs-wovly.mintlify.app-blue?style=for-the-badge)](https://wovly.mintlify.app/)
+[![Documentation](https://img.shields.io/badge/Docs-wovly.mintlify.app)](https://wovly.mintlify.app/)
 
 A privacy-first desktop AI communication assistant that manages your contacts, follow ups, chat analysis, and remembers context across Email, Slack, iMessage, WhatsApp, Telegram, and more.
 
