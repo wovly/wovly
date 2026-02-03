@@ -7414,7 +7414,7 @@ Generate ONLY the welcome message, nothing else.`;
                       slack_user_id: user.id,
                       [`slack_user_${channel.toLowerCase()}`]: user.id
                     }
-                  });
+                  }, currentUser?.username);
                 } else {
                   console.error(`[Tasks] Could not find Slack user matching "${channel}"`);
                   return { ok: false, error: `Could not find Slack user "${channel}". Please use their exact Slack username or display name.` };
@@ -11590,7 +11590,7 @@ Generate ONLY the welcome message, nothing else.`;
       await updateTask(taskId, {
         status: "failed",
         logEntry: "No API keys configured"
-      });
+      }, currentUser?.username);
       return { error: "No API keys configured" };
     }
 
@@ -11598,7 +11598,7 @@ Generate ONLY the welcome message, nothing else.`;
       await updateTask(taskId, {
         status: "failed",
         logEntry: "Anthropic API key required for task execution"
-      });
+      }, currentUser?.username);
       return { error: "Anthropic API key required" };
     }
 
@@ -11913,7 +11913,7 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
           if (textContent.length > 10) {
             await updateTask(taskId, {
               logEntry: `Analysis: ${textContent.slice(0, 500)}`
-            });
+            }, currentUser?.username);
           }
           break;
         }
@@ -12028,7 +12028,7 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
               };
             }
 
-            await updateTask(taskId, updates);
+            await updateTask(taskId, updates, currentUser?.username);
 
             // PROACTIVE NOTIFICATIONS - Always notify user of important task events
             console.log(`[Tasks] Notification check: win=${!!win}, status=${input.nextStatus}, nextStep=${input.nextStep}, currentStep=${task.currentStep.step}`);
@@ -12157,7 +12157,7 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
           currentStep: { step: nextStep, state: "executing" },
           status: "active",
           logEntry: `Step ${currentStep} completed (auto-advanced). Moving to step ${nextStep}: ${task.plan[nextStep - 1]}`
-        });
+        }, currentUser?.username);
         
         console.log(`[Tasks] Auto-advanced from step ${currentStep} to step ${nextStep}`);
         
@@ -12180,7 +12180,7 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
           status: "completed",
           currentStep: { ...task.currentStep, state: "completed" },
           logEntry: `Task completed (all ${task.plan.length} steps finished)`
-        });
+        }, currentUser?.username);
         
         console.log(`[Tasks] Task ${taskId} completed (auto-completed after last step)`);
         
@@ -12201,7 +12201,7 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
       await updateTask(taskId, {
         status: "failed",
         logEntry: `Execution failed: ${err.message}`
-      });
+      }, currentUser?.username);
       return { error: err.message };
     }
   });
