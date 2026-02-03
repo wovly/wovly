@@ -1083,6 +1083,49 @@ const getWovlyDir = async () => {
   return dir;
 };
 
+// Session persistence - keeps user logged in between app restarts
+const getSessionPath = async () => {
+  const dir = await getWovlyDir();
+  return path.join(dir, "session.json");
+};
+
+const saveSession = async (user) => {
+  try {
+    const sessionPath = await getSessionPath();
+    await fs.writeFile(sessionPath, JSON.stringify({
+      username: user.username,
+      displayName: user.displayName,
+      savedAt: new Date().toISOString()
+    }, null, 2));
+    console.log(`[Auth] Session saved for ${user.username}`);
+  } catch (err) {
+    console.error("[Auth] Failed to save session:", err.message);
+  }
+};
+
+const loadSession = async () => {
+  try {
+    const sessionPath = await getSessionPath();
+    const data = await fs.readFile(sessionPath, "utf8");
+    const session = JSON.parse(data);
+    console.log(`[Auth] Found saved session for ${session.username}`);
+    return session;
+  } catch (err) {
+    // No session file or invalid - that's fine
+    return null;
+  }
+};
+
+const clearSession = async () => {
+  try {
+    const sessionPath = await getSessionPath();
+    await fs.unlink(sessionPath);
+    console.log("[Auth] Session cleared");
+  } catch (err) {
+    // File doesn't exist - that's fine
+  }
+};
+
 // Get user-specific data directory
 const getUserDataDir = async (username) => {
   if (!username) throw new Error("No user logged in");
@@ -5423,6 +5466,9 @@ Generate ONLY the welcome message, nothing else.`;
       users[normalizedUsername].lastLogin = new Date().toISOString();
       await saveUsers(users);
       
+      // Save session for persistence across app restarts
+      await saveSession(currentUser);
+      
       console.log(`[Auth] User logged in: ${normalizedUsername}`);
       
       // Process old memory files for this user (in background)
@@ -5453,6 +5499,8 @@ Generate ONLY the welcome message, nothing else.`;
     try {
       const username = currentUser?.username;
       currentUser = null;
+      // Clear session file
+      await clearSession();
       // Clear user-specific caches
       if (username) {
         credentialsCache.delete(username);
@@ -5466,9 +5514,10 @@ Generate ONLY the welcome message, nothing else.`;
     }
   });
   
-  // Check current session
+  // Check current session - restores from file if not in memory
   ipcMain.handle("auth:checkSession", async () => {
     try {
+      // If already logged in, return current user
       if (currentUser) {
         return { 
           ok: true, 
@@ -5479,6 +5528,40 @@ Generate ONLY the welcome message, nothing else.`;
           }
         };
       }
+      
+      // Try to restore session from file
+      const savedSession = await loadSession();
+      if (savedSession?.username) {
+        // Verify user still exists
+        const users = await loadUsers();
+        const user = users[savedSession.username];
+        if (user) {
+          // Restore the session
+          currentUser = {
+            username: savedSession.username,
+            displayName: savedSession.displayName || user.displayName
+          };
+          console.log(`[Auth] Session restored for ${currentUser.username}`);
+          
+          // Resume tasks in background
+          resumeTasksOnStartup(currentUser.username).catch(err => {
+            console.error("[Tasks] Error resuming tasks:", err.message);
+          });
+          
+          return { 
+            ok: true, 
+            loggedIn: true, 
+            user: {
+              username: currentUser.username,
+              displayName: currentUser.displayName
+            }
+          };
+        } else {
+          // User was deleted, clear the session
+          await clearSession();
+        }
+      }
+      
       return { ok: true, loggedIn: false };
     } catch (err) {
       return { ok: false, error: err.message };

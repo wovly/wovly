@@ -4162,6 +4162,24 @@ button.danger:hover {
   background: #e5e7eb;
 }
 
+.login-privacy-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 24px;
+  padding: 12px 16px;
+  background: #f8fafc;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.login-privacy-note svg {
+  flex-shrink: 0;
+  color: #22c55e;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
    Navigation Bottom (Logout)
    ───────────────────────────────────────────────────────────────────────────── */
