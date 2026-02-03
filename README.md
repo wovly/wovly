@@ -8,6 +8,10 @@
 
 A privacy-first desktop AI communication assistant that manages your contacts, follow ups, chat analysis, and remembers context across Email, Slack, iMessage, WhatsApp, Telegram, and more.
 
+<p align="center">
+  <img src="assets/screenshot.png" alt="Wovly Screenshot" width="900">
+</p>
+
 ---
 
 ## Features
