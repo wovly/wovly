@@ -16,11 +16,6 @@ A privacy-first desktop AI communication assistant that manages your contacts, f
 
 ## Features
 
-### 🧠 Intelligent Memory System
-- **Long-term Memory** – Remembers facts, relationships, and preferences across conversations
-- **Daily Logs** – Automatic conversation summarization and context retention
-- **Personal Profile** – Remembers who you are and your core facts, like spouse, family, job, location, allergies, hobbies, airline seat preference
-
 ### 💬 Multi-Platform Communication and Research
 - **Unified Inbox** – Manage Email, Slack, iMessage, WhatsApp, Telegram, and Discord from one interface
 - **Voice Mimic** – Learns your communication style per contact and platform
@@ -28,9 +23,14 @@ A privacy-first desktop AI communication assistant that manages your contacts, f
 - **Conversation Research** - "Extract any issues from the Sales slack channel and email the summary to the CEO"
 
 ### 🤖 Autonomous Customizable Task Execution
-- **Fire and Forget** – Delegate outcomes, not drafts: "Schedule a meeting with John next week"
-- **Persistent Follow-ups** – Monitors for replies and continues workflows automatically
-- **Background Processing** – Tasks run in the background until completion
+- **Natural Language Tasks** – Describe your task and goals in the chat "monitor my email and schedule any appointment requests that come in"
+- **Persistent Follow-ups** – Monitors for replies and follows up intelligently in your voice
+- **Scheduling** – Automatically schedule meetings on your calendar or others (e.g. Calendly)
+
+### 🧠 Intelligent Memory System
+- **Long-term Memory** – Remembers facts, relationships, and preferences across conversations
+- **Daily Logs** – Automatic conversation summarization and context retention
+- **Personal Profile** – Remembers who you are and your core facts, like spouse, family, job, location, allergies, hobbies, airline seat preference
 
 ### 🤖 Customizable Skills
 - **Teach Once, Automate Forever** – Define standard operating procedures once, and Wovly follows them consistently: "When a customer reports a bug, always log it in Jira and notify the eng team on Slack"
@@ -43,9 +43,9 @@ A privacy-first desktop AI communication assistant that manages your contacts, f
 - **Anti-Detection** – Built-in measures to reduce bot detection
 
 ### 🔒 Privacy-First Architecture
-- **100% Local** – All data stored on your machine, no cloud sync
+- **Local Storage** – All app data stored on your machine.  Only LLM usage or 3rd party API connections send information out.
 - **Multi-User Support** – Per-user data isolation for shared computers
-- **Encrypted Credentials** – OS-level encryption via Keychain/DPAPI/libsecret
+- **Encrypted Credentials** – OS-level encryption via Keychain/DPAPI/libsecret to store your website logins
 
 ---
 
@@ -102,8 +102,8 @@ Choose your preferred AI model:
 "Email the top 3 candidates and ask about availability"
 → Sends personalized outreach and tracks responses
 
-"Find Jeff's favorite Marvel movie - follow up until you get an answer"
-→ Persists through vague responses until getting a definitive answer
+"Scan the sales channel conversations over the past 30 days and provide insights on how I can help"
+→ Process all the of the chat and historical context to generate actional insights
 ```
 
 ### Web Automation
