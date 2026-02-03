@@ -1497,7 +1497,7 @@ input {
   flex: 1;
   overflow-y: auto;
   min-height: 0;
-  padding-top: 8px;
+  padding-top: 20px;
   padding-bottom: 20px;
   display: flex;
   flex-direction: column;
