@@ -14157,7 +14157,7 @@ ${formatDecomposedSteps(steps)}
     // Check if there's a task waiting for user input
     // If so, route the user's message to that task
     const userMessage = messages[messages.length - 1]?.content || "";
-    const waitingTasks = await getTasksWaitingForInput();
+    const waitingTasks = await getTasksWaitingForInput(currentUser.username);
     if (waitingTasks.length > 0 && userMessage.trim()) {
       const task = waitingTasks[0]; // Handle most recent task waiting for input
       console.log(`[Tasks] Routing user message to task ${task.id} waiting for input`);
