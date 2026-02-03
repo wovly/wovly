@@ -14143,6 +14143,11 @@ ${formatDecomposedSteps(steps)}
   async function processChatQuery(messages, options = {}) {
     const { skipDecomposition = false, stepContext = null, workflowContext = null } = options;
     
+    // Ensure user is logged in
+    if (!currentUser?.username) {
+      return { ok: false, error: "Not logged in. Please log in to continue." };
+    }
+    
     // Check if user is responding to an active workflow (e.g., clarification for task creation)
     const isRespondingToWorkflow = workflowContext?.type === 'clarifying_for_task';
     if (isRespondingToWorkflow) {
@@ -15029,6 +15034,11 @@ You have FULL access to the user's tools including calendar, email, contacts, et
   // Chat handler with agentic workflow
   ipcMain.handle("chat:send", async (_event, { messages, skipDecomposition = false, stepContext = null, workflowContext = null }) => {
     try {
+      // Check if user is logged in
+      if (!currentUser?.username) {
+        return { ok: false, error: "Please log in to use chat. Click the logout icon and log in again." };
+      }
+      
       // Use the shared processing function
       const processResult = await processChatQuery(messages, { skipDecomposition, stepContext, workflowContext });
       
