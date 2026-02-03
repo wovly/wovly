@@ -8497,6 +8497,75 @@ Generate ONLY the welcome message, nothing else.`;
     }
   ];
 
+  // Time and Reminder tools
+  const timeTools = [
+    {
+      name: "get_current_time",
+      description: "Get the current date and time. Use this for time-based reminders and scheduling checks. Returns current time, date, day of week, and hour.",
+      input_schema: {
+        type: "object",
+        properties: {
+          timezone: { type: "string", description: "Optional timezone (default: local system time)" }
+        }
+      }
+    },
+    {
+      name: "send_reminder",
+      description: "Send a reminder message to the user in the chat. Use this for timed notifications and alerts. The message will appear in the chat window.",
+      input_schema: {
+        type: "object",
+        properties: {
+          message: { type: "string", description: "The reminder message to display to the user" }
+        },
+        required: ["message"]
+      }
+    }
+  ];
+
+  // Execute Time tool
+  const executeTimeTool = async (toolName, toolInput) => {
+    console.log(`[Time] Executing ${toolName} with input:`, JSON.stringify(toolInput));
+    try {
+      switch (toolName) {
+        case "get_current_time": {
+          const now = new Date();
+          const timeInfo = {
+            time: now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true }),
+            time24: now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
+            date: now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }),
+            dayOfWeek: now.toLocaleDateString('en-US', { weekday: 'long' }),
+            hour: now.getHours(),
+            minute: now.getMinutes(),
+            iso: now.toISOString()
+          };
+          console.log(`[Time] Current time:`, timeInfo);
+          return timeInfo;
+        }
+        case "send_reminder": {
+          const message = toolInput.message;
+          if (!message) {
+            return { error: "Message is required for send_reminder" };
+          }
+          // Send the reminder to the chat window
+          if (win && win.webContents) {
+            win.webContents.send("chat:newMessage", {
+              role: "assistant",
+              content: `🔔 **Reminder:** ${message}`,
+              source: "task"
+            });
+          }
+          console.log(`[Time] Sent reminder: ${message}`);
+          return { success: true, message: `Reminder sent: ${message}` };
+        }
+        default:
+          return { error: `Unknown time tool: ${toolName}` };
+      }
+    } catch (err) {
+      console.error(`[Time] Error executing ${toolName}:`, err.message);
+      return { error: err.message };
+    }
+  };
+
   // Execute Weather tool (using Open-Meteo API)
   const executeWeatherTool = async (toolName, toolInput) => {
     console.log(`[Weather] Executing ${toolName} with input:`, JSON.stringify(toolInput));
@@ -13125,7 +13194,26 @@ FOR CONTINUOUS TASKS (task_type: "continuous"):
 12. Mark steps that repeat with is_recurring=true
 13. The plan should describe ONE monitoring cycle. Examples:
     - "monitor weather and alert when it rains" → steps: 1) Check weather forecast, 2) If rain detected, alert user, 3) Wait and repeat
-    - "watch inbox for emails from X" → steps: 1) Check recent emails from X, 2) If new email found, notify user, 3) Wait and repeat`;
+    - "watch inbox for emails from X" → steps: 1) Check recent emails from X, 2) If new email found, notify user, 3) Wait and repeat
+
+TIME-BASED REMINDERS (IMPORTANT - these are CONTINUOUS tasks):
+14. "remind me to X at Y time" or "alert me at Y" are CONTINUOUS tasks that check time
+15. Use get_current_time to check the current time, and send_reminder to notify the user
+16. Examples:
+    - "remind me to eat lunch at 12pm" → 
+      task_type: "continuous"
+      monitoring_condition: "current time is 12:00 PM"
+      trigger_action: "send reminder to eat lunch"
+      steps: [
+        {step: 1, action: "Check current time using get_current_time", tools_needed: ["get_current_time"], is_recurring: true},
+        {step: 2, action: "If time is 12:00 PM (+/- 2 minutes), send reminder 'Time to eat lunch!' using send_reminder", tools_needed: ["send_reminder"]},
+        {step: 3, action: "Wait and continue monitoring", is_recurring: true}
+      ]
+    - "remind me every day at 9am to take medicine" → same pattern with monitoring_condition: "current time is 9:00 AM"
+    - "alert me when it's 5pm" → same pattern with trigger time of 5:00 PM
+17. Do NOT create meta-tasks about "creating reminders" - THIS task IS the reminder`;
+
+
 
     try {
       // Use Anthropic if available (preferred)
@@ -13963,6 +14051,10 @@ ${formatDecomposedSteps(steps)}
       // Weather tools
       if (weatherEnabled && weatherTools.find(t => t.name === toolName)) {
         return await executeWeatherTool(toolName, toolInput);
+      }
+      // Time tools (always available)
+      if (timeTools.find(t => t.name === toolName)) {
+        return await executeTimeTool(toolName, toolInput);
       }
       // Slack tools
       if (slackAccessToken && slackTools.find(t => t.name === toolName)) {
@@ -15472,7 +15564,7 @@ Example: "email jeff about the meeting" → messagingChannel: "email"
 NEVER create a task without explicit user confirmation first. Only create ONE task per request.`;
 
       // Combine tools
-      const allTools = [...profileTools, ...taskTools, ...memoryTools];
+      const allTools = [...profileTools, ...taskTools, ...memoryTools, ...timeTools];
       if (hasGoogleTools) allTools.push(...googleWorkspaceTools);
       if (hasIMessageTools) allTools.push(...iMessageTools);
       if (weatherEnabled) allTools.push(...weatherTools);
