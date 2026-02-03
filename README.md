@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](https://github.com/bluerune234/wovly)
 [![Electron](https://img.shields.io/badge/Electron-Latest-47848F)](https://www.electronjs.org/)
+[![Documentation](https://img.shields.io/badge/Docs-wovly.mintlify.app-blue?style=for-the-badge)](https://wovly.mintlify.app/)
 
 A privacy-first desktop AI communication assistant that manages your contacts, follow ups, chat analysis, and remembers context across Email, Slack, iMessage, WhatsApp, Telegram, and more.
 
@@ -230,7 +231,7 @@ wovly/
 
 ## Privacy & Security
 
-- **All data stays local** – No cloud sync, no telemetry, no tracking
+- **App data stays local** – No SaaS data sharing, only LLM or 3rd party API information exchange
 - **Per-user isolation** – Each user's data is completely separated
 - **Encrypted credentials** – OS-level encryption (Keychain/DPAPI/libsecret)
 - **Direct API calls** – Requests go directly to providers, no proxy
@@ -241,7 +242,7 @@ wovly/
 
 ## Documentation
 
-Full documentation available at: **[docs.wovly.dev](https://docs.wovly.dev)** (coming soon)
+Full documentation available at: **[docs.wovly.dev](https://wovly.mintlify.app/)** 
 
 Or browse the `/docs` directory for:
 - [Installation Guide](docs/installation.mdx)
