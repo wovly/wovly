@@ -19,17 +19,23 @@ A privacy-first desktop AI communication assistant that manages your contacts, f
 ### 🧠 Intelligent Memory System
 - **Long-term Memory** – Remembers facts, relationships, and preferences across conversations
 - **Daily Logs** – Automatic conversation summarization and context retention
-- **Relationship Awareness** – Understands "my wife", "my boss", "the contractor" without explicit setup
+- **Personal Profile** – Remembers who you are and your core facts, like spouse, family, job, location, allergies, hobbies, airline seat preference
 
-### 💬 Multi-Platform Communication
+### 💬 Multi-Platform Communication and Research
 - **Unified Inbox** – Manage Email, Slack, iMessage, WhatsApp, Telegram, and Discord from one interface
 - **Voice Mimic** – Learns your communication style per contact and platform
 - **Cross-Platform Coordination** – "Text my wife, then Slack my boss" in a single command
+- **Conversation Research** - "Extract any issues from the Sales slack channel and email the summary to the CEO"
 
-### 🤖 Autonomous Task Execution
+### 🤖 Autonomous Customizable Task Execution
 - **Fire and Forget** – Delegate outcomes, not drafts: "Schedule a meeting with John next week"
 - **Persistent Follow-ups** – Monitors for replies and continues workflows automatically
 - **Background Processing** – Tasks run in the background until completion
+
+### 🤖 Customizable Skills
+- **Teach Once, Automate Forever** – Define standard operating procedures once, and Wovly follows them consistently: "When a customer reports a bug, always log it in Jira and notify the eng team on Slack"
+- **Personal Playbooks** – Create reusable workflows tailored to your role: "Weekly status report: summarize my sent emails, check Asana tasks, draft update to manager"
+- **Constraint-Aware Execution** – Set guardrails for sensitive actions: "Never auto-send messages to executives without approval"
 
 ### 🌐 Browser Automation
 - **Web Research** – Navigate websites, extract data, fill forms
