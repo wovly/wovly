@@ -814,6 +814,10 @@ input {
   display: flex;
   flex-direction: column;
   height: 100%;
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(25, 25, 50, 0.08);
+  padding: 20px;
 }
 
 .chat-panel .chat-body {
@@ -1459,6 +1463,10 @@ input {
   display: flex;
   flex-direction: column;
   height: 100%;
+  background: #fafbfc;
+  border-radius: 12px;
+  padding: 16px;
+  opacity: 0.95;
 }
 
 .agenda-header-text {
@@ -1548,21 +1556,22 @@ input {
 
 .timeline-event {
   position: absolute;
-  background: #6366f1;
-  color: white;
+  background: linear-gradient(135deg, #a5b4fc 0%, #c4b5fd 100%);
+  color: #3730a3;
   border-radius: 8px;
   padding: 6px 10px;
   overflow: hidden;
   cursor: pointer;
   transition: transform 0.1s, box-shadow 0.1s;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-  border-left: 3px solid rgba(255, 255, 255, 0.4);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  border-left: 3px solid rgba(99, 102, 241, 0.4);
 }
 
 .timeline-event:hover {
   transform: scale(1.02);
-  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+  box-shadow: 0 4px 12px rgba(165, 180, 252, 0.4);
   z-index: 10;
+  background: linear-gradient(135deg, #93a3f8 0%, #b8a5f8 100%);
 }
 
 .timeline-event-title {
@@ -3682,9 +3691,7 @@ button.danger:hover {
    ───────────────────────────────────────────────────────────────────────────── */
 
 .about-me-page {
-  padding: 24px;
-  max-width: 800px;
-  margin: 0 auto;
+  padding: 20px;
   height: 100%;
   overflow-y: auto;
 }
