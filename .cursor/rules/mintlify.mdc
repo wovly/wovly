@@ -1,0 +1,76 @@
+---
+description: Mintlify documentation conventions, MDX syntax, and structure
+alwaysApply: true
+---
+
+# Mintlify Documentation
+
+Documentation lives in `docs/` and uses Mintlify with MDX.
+
+## MDX File Structure
+
+Every `.mdx` file requires YAML frontmatter:
+
+```mdx
+---
+title: "Page Title"
+description: "Brief description for SEO and previews"
+---
+```
+
+## Common Components
+
+### Cards
+
+```mdx
+<Card title="Title" icon="icon-name" href="/path">
+  Description text
+</Card>
+
+<CardGroup cols={2}>
+  <Card title="..." icon="..." href="...">...</Card>
+  <Card title="..." icon="..." href="...">...</Card>
+</CardGroup>
+
+<Columns cols={2}>
+  <Card>...</Card>
+  <Card>...</Card>
+</Columns>
+```
+
+### Accordions
+
+```mdx
+<AccordionGroup>
+  <Accordion icon="github" title="Accordion Title">
+    Content here
+  </Accordion>
+</AccordionGroup>
+```
+
+### Callouts
+
+```mdx
+<Tip>Helpful tips</Tip>
+<Note>Important information</Note>
+<Warning>Caution notices</Warning>
+```
+
+## Navigation
+
+Edit `docs/docs.json` to update navigation:
+- Add pages to `navigation.tabs[].groups[].pages[]`
+- Reference pages without `.mdx` extension
+- Use relative paths from docs root (e.g., `"essentials/markdown"`)
+
+## Structure
+
+```
+docs/
+├── docs.json          # Site config & navigation
+├── index.mdx          # Home page
+├── quickstart.mdx     # Getting started
+├── essentials/        # Core documentation
+├── api-reference/     # API docs
+└── images/            # Static assets
+```

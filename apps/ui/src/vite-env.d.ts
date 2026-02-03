@@ -191,7 +191,10 @@ type WovlyIpcApi = {
     set: (settings: Record<string, unknown>) => Promise<{ ok: boolean; error?: string }>;
   };
   chat: {
-    send: (messages: Array<{ role: string; content: string }>) => Promise<{
+    send: (
+      messages: Array<{ role: string; content: string }>,
+      workflowContext?: { type: string; original_query?: string } | null
+    ) => Promise<{
       ok: boolean;
       response?: string;
       error?: string;
@@ -205,6 +208,8 @@ type WovlyIpcApi = {
       conflicts?: FactConflictType[];
       originalInput?: string;
       nonConflictingIndexes?: number[];
+      // Facts detected during workflow (for deferred saving)
+      detectedFacts?: ExtractedFactType[];
       // Query decomposition fields
       suggestTask?: boolean;
       executedInline?: boolean;
@@ -321,6 +326,62 @@ type WovlyIpcApi = {
     setBrowserEnabled: (enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
     testBrowser: () => Promise<{ ok: boolean; message?: string; screenshot?: string; error?: string }>;
   };
+  // Telegram integration
+  telegram: {
+    setToken: (token: string) => Promise<{ ok: boolean; bot?: { username: string; name: string }; error?: string }>;
+    checkAuth: () => Promise<{ authorized: boolean }>;
+    disconnect: () => Promise<{ ok: boolean; error?: string }>;
+    test: () => Promise<{ ok: boolean; message?: string; error?: string }>;
+  };
+  // Discord integration
+  discord: {
+    startOAuth: (clientId: string, clientSecret: string) => Promise<{ ok: boolean; error?: string }>;
+    checkAuth: () => Promise<{ authorized: boolean }>;
+    disconnect: () => Promise<{ ok: boolean; error?: string }>;
+    test: () => Promise<{ ok: boolean; message?: string; error?: string }>;
+  };
+  // X (Twitter) integration
+  x: {
+    startOAuth: (clientId: string, clientSecret: string) => Promise<{ ok: boolean; error?: string }>;
+    checkAuth: () => Promise<{ authorized: boolean }>;
+    disconnect: () => Promise<{ ok: boolean; error?: string }>;
+    test: () => Promise<{ ok: boolean; message?: string; error?: string }>;
+  };
+  // Notion integration
+  notion: {
+    startOAuth: (clientId: string, clientSecret: string) => Promise<{ ok: boolean; workspace?: string; error?: string }>;
+    checkAuth: () => Promise<{ authorized: boolean }>;
+    disconnect: () => Promise<{ ok: boolean; error?: string }>;
+    test: () => Promise<{ ok: boolean; message?: string; error?: string }>;
+  };
+  // GitHub integration
+  github: {
+    startOAuth: (clientId: string, clientSecret: string) => Promise<{ ok: boolean; error?: string }>;
+    checkAuth: () => Promise<{ authorized: boolean }>;
+    disconnect: () => Promise<{ ok: boolean; error?: string }>;
+    test: () => Promise<{ ok: boolean; message?: string; error?: string }>;
+  };
+  // Asana integration
+  asana: {
+    startOAuth: (clientId: string, clientSecret: string) => Promise<{ ok: boolean; error?: string }>;
+    checkAuth: () => Promise<{ authorized: boolean }>;
+    disconnect: () => Promise<{ ok: boolean; error?: string }>;
+    test: () => Promise<{ ok: boolean; message?: string; error?: string }>;
+  };
+  // Reddit integration
+  reddit: {
+    startOAuth: (clientId: string, clientSecret: string) => Promise<{ ok: boolean; error?: string }>;
+    checkAuth: () => Promise<{ authorized: boolean }>;
+    disconnect: () => Promise<{ ok: boolean; error?: string }>;
+    test: () => Promise<{ ok: boolean; message?: string; error?: string }>;
+  };
+  // Spotify integration
+  spotify: {
+    startOAuth: (clientId: string, clientSecret: string) => Promise<{ ok: boolean; error?: string }>;
+    checkAuth: () => Promise<{ authorized: boolean }>;
+    disconnect: () => Promise<{ ok: boolean; error?: string }>;
+    test: () => Promise<{ ok: boolean; message?: string; error?: string }>;
+  };
   profile: {
     get: () => Promise<{
       ok: boolean;
@@ -374,7 +435,7 @@ type WovlyIpcApi = {
       error?: string;
     }>;
   };
-  // Chat Interfaces (WhatsApp, etc.)
+  // Chat Interfaces (WhatsApp, Telegram, etc.)
   whatsapp: {
     connect: () => Promise<{ ok: boolean; error?: string }>;
     disconnect: () => Promise<{ ok: boolean; error?: string }>;
@@ -401,6 +462,21 @@ type WovlyIpcApi = {
       ready: boolean;
     }>;
     onStatus: (callback: (data: WhatsAppStatusData) => void) => () => void;
+  };
+  // Telegram Chat Interface (talk to Wovly via Telegram bot)
+  telegramInterface: {
+    connect: () => Promise<{ ok: boolean; error?: string }>;
+    disconnect: () => Promise<{ ok: boolean; error?: string }>;
+    getStatus: () => Promise<{
+      ok: boolean;
+      status: "disconnected" | "connecting" | "connected";
+    }>;
+    checkAuth: () => Promise<{
+      ok: boolean;
+      hasBot: boolean;
+      connected: boolean;
+    }>;
+    onStatus: (callback: (data: { status: "disconnected" | "connecting" | "connected" }) => void) => () => void;
   };
   // Tasks - autonomous background tasks
   tasks: {
@@ -457,6 +533,41 @@ type WovlyIpcApi = {
     }>;
     delete: (domain: string) => Promise<{ 
       ok: boolean;
+      error?: string;
+    }>;
+  };
+  // Shell utilities
+  shell: {
+    openExternal: (url: string) => Promise<{ ok: boolean; error?: string }>;
+  };
+  // Authentication
+  auth: {
+    hasUsers: () => Promise<{ ok: boolean; hasUsers?: boolean; error?: string }>;
+    listUsers: () => Promise<{ 
+      ok: boolean; 
+      users?: Array<{ username: string; displayName: string; createdAt: string }>;
+      error?: string;
+    }>;
+    register: (username: string, password: string, displayName?: string) => Promise<{ 
+      ok: boolean; 
+      username?: string;
+      error?: string;
+    }>;
+    login: (username: string, password: string) => Promise<{ 
+      ok: boolean; 
+      user?: { username: string; displayName: string };
+      error?: string;
+    }>;
+    logout: () => Promise<{ ok: boolean; error?: string }>;
+    checkSession: () => Promise<{ 
+      ok: boolean; 
+      loggedIn?: boolean;
+      user?: { username: string; displayName: string };
+      error?: string;
+    }>;
+    getCurrentUser: () => Promise<{ 
+      ok: boolean; 
+      user?: { username: string; displayName: string };
       error?: string;
     }>;
   };

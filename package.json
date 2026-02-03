@@ -8,6 +8,10 @@
   "scripts": {
     "dev": "concurrently -n ui,desktop \"npm run -w apps/ui dev\" \"npm run -w apps/desktop dev\"",
     "build": "npm run -w apps/ui build && npm run -w apps/desktop build",
+    "build:mac": "npm run -w apps/ui build && npm run -w apps/desktop build:mac",
+    "build:win": "npm run -w apps/ui build && npm run -w apps/desktop build:win",
+    "build:linux": "npm run -w apps/ui build && npm run -w apps/desktop build:linux",
+    "dist": "npm run -w apps/ui build && npm run -w apps/desktop dist",
     "lint": "npm run -w apps/ui lint && npm run -w apps/desktop lint"
   },
   "devDependencies": {

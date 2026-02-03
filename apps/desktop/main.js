@@ -81,6 +81,7 @@ class BrowserController {
     this.initialized = false;
     this.initializing = null; // Promise for initialization in progress
     this.elementRefs = new Map(); // sessionId -> Map(ref -> backendNodeId)
+    this.username = null; // Current user for per-user data isolation
   }
 
   /**
@@ -177,11 +178,24 @@ class BrowserController {
 
   /**
    * Initialize the browser instance
+   * @param {string} username - Username for per-user data isolation
    */
-  async initialize() {
+  async initialize(username) {
+    if (!username) {
+      throw new Error("[BrowserController] Username required for initialization");
+    }
+    
+    // If already initialized with a different user, close and reinitialize
+    if (this.initialized && this.username !== username) {
+      console.log(`[BrowserController] User changed from ${this.username} to ${username}, reinitializing...`);
+      await this.cleanup();
+      this.initialized = false;
+    }
+    
     if (this.initialized) return;
     if (this.initializing) return this.initializing;
     
+    this.username = username;
     this.initializing = this._doInitialize();
     try {
       await this.initializing;
@@ -192,7 +206,7 @@ class BrowserController {
   }
 
   async _doInitialize() {
-    console.log("[BrowserController] Initializing...");
+    console.log(`[BrowserController] Initializing for user: ${this.username}...`);
     
     if (!puppeteer) {
       puppeteer = await loadPuppeteer();
@@ -200,11 +214,12 @@ class BrowserController {
     
     const chromiumPath = await this.getChromiumPath();
     
-    // User data directory for persistence
-    const userDataDir = path.join(os.homedir(), ".wovly", "browser-data");
+    // Per-user data directory for browser persistence (cookies, sessions, etc.)
+    const userDataDir = path.join(os.homedir(), ".wovly-assistant", "users", this.username, "browser-data");
     try {
       await fs.mkdir(userDataDir, { recursive: true });
     } catch { /* ignore */ }
+    console.log(`[BrowserController] Using per-user browser data: ${userDataDir}`);
     
     // Anti-detection arguments for browser automation
     const args = [
@@ -251,7 +266,9 @@ class BrowserController {
    * @param {string} sessionId - Session identifier (default: "default")
    */
   async getPage(sessionId = "default") {
-    await this.initialize();
+    if (!this.initialized || !this.username) {
+      throw new Error("[BrowserController] Browser not initialized. Call getBrowserController(username) first.");
+    }
     
     // Check if we already have a context for this session
     if (this.contexts.has(sessionId)) {
@@ -829,14 +846,23 @@ class BrowserController {
 let browserController = null;
 
 /**
- * Get or create the browser controller
+ * Get or create the browser controller with per-user isolation
+ * @param {string} username - Username for per-user data isolation
  */
-async function getBrowserController() {
+async function getBrowserController(username) {
+  if (!username) {
+    throw new Error("[BrowserController] Username required to get browser controller");
+  }
   if (!browserController) {
     browserController = new BrowserController();
   }
+  // Initialize ensures correct user (will reinitialize if user changed)
+  await browserController.initialize(username);
   return browserController;
 }
+
+// Currently logged in user (module-level for cross-function access)
+let currentUser = null;
 
 let win;
 
@@ -850,7 +876,13 @@ let confirmationIdCounter = 0;
 const TOOLS_REQUIRING_CONFIRMATION = [
   'send_email',
   'send_imessage', 
-  'send_slack_message'
+  'send_slack_message',
+  'send_telegram_message',
+  'send_discord_message',
+  'post_tweet',
+  'send_x_dm',
+  'create_reddit_post',
+  'create_reddit_comment'
 ];
 
 /**
@@ -1010,7 +1042,7 @@ async function requestMessageConfirmation(toolName, toolInput, taskContext = nul
  * Add a pending message to a task
  */
 async function addPendingMessageToTask(taskId, pendingMessage) {
-  const task = await getTask(taskId);
+  const task = await getTask(taskId, currentUser?.username);
   if (!task) {
     throw new Error(`Task ${taskId} not found`);
   }
@@ -1025,7 +1057,7 @@ async function addPendingMessageToTask(taskId, pendingMessage) {
   task.lastUpdated = new Date().toISOString();
   
   // Save the task
-  const tasksDir = await getTasksDir();
+  const tasksDir = await getTasksDir(currentUser?.username);
   const taskPath = path.join(tasksDir, `${taskId}.md`);
   await fs.writeFile(taskPath, serializeTask(task), "utf8");
   
@@ -1051,8 +1083,17 @@ const getWovlyDir = async () => {
   return dir;
 };
 
-const getSettingsPath = async () => {
-  const dir = await getWovlyDir();
+// Get user-specific data directory
+const getUserDataDir = async (username) => {
+  if (!username) throw new Error("No user logged in");
+  const baseDir = await getWovlyDir();
+  const userDir = path.join(baseDir, "users", username);
+  await fs.mkdir(userDir, { recursive: true });
+  return userDir;
+};
+
+const getSettingsPath = async (username) => {
+  const dir = await getUserDataDir(username);
   return path.join(dir, "settings.json");
 };
 
@@ -1062,25 +1103,26 @@ const getSettingsPath = async () => {
 // Credentials are NEVER sent to LLMs - only used locally for browser automation
 // ─────────────────────────────────────────────────────────────────────────────
 
-const getCredentialsPath = async () => {
-  const dir = await getWovlyDir();
+const getCredentialsPath = async (username) => {
+  const dir = await getUserDataDir(username);
   return path.join(dir, "credentials.enc");
 };
 
-// In-memory cache of decrypted credentials
-let credentialsCache = null;
+// In-memory cache of decrypted credentials (per user)
+let credentialsCache = new Map(); // username -> credentials object
 
 /**
  * Load and decrypt credentials from storage
+ * @param {string} username - Username for user-specific credentials
  * @returns {Object} Credentials object keyed by domain
  */
-const loadCredentials = async () => {
+const loadCredentials = async (username) => {
   // Return cached if available
-  if (credentialsCache !== null) {
-    return credentialsCache;
+  if (credentialsCache.has(username)) {
+    return credentialsCache.get(username);
   }
 
-  const credentialsPath = await getCredentialsPath();
+  const credentialsPath = await getCredentialsPath(username);
   
   try {
     // Check if safeStorage is available
@@ -1088,46 +1130,50 @@ const loadCredentials = async () => {
       console.warn("[Credentials] Encryption not available on this system");
       // Fall back to checking for unencrypted file (migration case)
       try {
-        const plainPath = path.join(await getWovlyDir(), "credentials.json");
+        const userDir = await getUserDataDir(username);
+        const plainPath = path.join(userDir, "credentials.json");
         const data = await fs.readFile(plainPath, "utf8");
-        credentialsCache = JSON.parse(data);
+        const creds = JSON.parse(data);
+        credentialsCache.set(username, creds);
         // Migrate to encrypted storage
-        await saveCredentials(credentialsCache);
+        await saveCredentials(creds, username);
         await fs.unlink(plainPath).catch(() => {}); // Delete plain file
         console.log("[Credentials] Migrated from unencrypted to encrypted storage");
-        return credentialsCache;
+        return creds;
       } catch {
-        credentialsCache = {};
-        return credentialsCache;
+        credentialsCache.set(username, {});
+        return {};
       }
     }
 
     // Read encrypted file
     const encryptedBuffer = await fs.readFile(credentialsPath);
     const decryptedString = safeStorage.decryptString(encryptedBuffer);
-    credentialsCache = JSON.parse(decryptedString);
-    console.log(`[Credentials] Loaded ${Object.keys(credentialsCache).length} credentials`);
-    return credentialsCache;
+    const creds = JSON.parse(decryptedString);
+    credentialsCache.set(username, creds);
+    console.log(`[Credentials] Loaded ${Object.keys(creds).length} credentials for ${username}`);
+    return creds;
   } catch (err) {
     if (err.code === "ENOENT") {
       // File doesn't exist yet - start fresh
-      credentialsCache = {};
-      return credentialsCache;
+      credentialsCache.set(username, {});
+      return {};
     }
     console.error("[Credentials] Error loading credentials:", err.message);
-    credentialsCache = {};
-    return credentialsCache;
+    credentialsCache.set(username, {});
+    return {};
   }
 };
 
 /**
  * Get list of domains that have saved credentials
  * This allows the LLM to know which sites have credentials available
+ * @param {string} username - Username for user-specific credentials
  * @returns {Promise<string[]>} Array of domain names
  */
-const getAvailableCredentialDomains = async () => {
+const getAvailableCredentialDomains = async (username) => {
   try {
-    const credentials = await loadCredentials();
+    const credentials = await loadCredentials(username);
     return Object.keys(credentials);
   } catch {
     return [];
@@ -1137,9 +1183,10 @@ const getAvailableCredentialDomains = async () => {
 /**
  * Encrypt and save credentials to storage
  * @param {Object} credentials - Credentials object to save
+ * @param {string} username - Username for user-specific credentials
  */
-const saveCredentials = async (credentials) => {
-  const credentialsPath = await getCredentialsPath();
+const saveCredentials = async (credentials, username) => {
+  const credentialsPath = await getCredentialsPath(username);
   
   try {
     if (!safeStorage.isEncryptionAvailable()) {
@@ -1148,15 +1195,15 @@ const saveCredentials = async (credentials) => {
       await fs.writeFile(credentialsPath + ".json", JSON.stringify(credentials, null, 2), {
         mode: 0o600 // Owner read/write only
       });
-      credentialsCache = credentials;
+      credentialsCache.set(username, credentials);
       return;
     }
 
     const jsonString = JSON.stringify(credentials);
     const encryptedBuffer = safeStorage.encryptString(jsonString);
     await fs.writeFile(credentialsPath, encryptedBuffer);
-    credentialsCache = credentials;
-    console.log(`[Credentials] Saved ${Object.keys(credentials).length} credentials (encrypted)`);
+    credentialsCache.set(username, credentials);
+    console.log(`[Credentials] Saved ${Object.keys(credentials).length} credentials for ${username} (encrypted)`);
   } catch (err) {
     console.error("[Credentials] Error saving credentials:", err.message);
     throw err;
@@ -1166,10 +1213,11 @@ const saveCredentials = async (credentials) => {
 /**
  * Get credential for a specific domain
  * @param {string} domain - Domain to look up (e.g., "amazon.com")
+ * @param {string} username - Username for user-specific credentials
  * @returns {Object|null} Credential object or null if not found
  */
-const getCredentialForDomain = async (domain) => {
-  const credentials = await loadCredentials();
+const getCredentialForDomain = async (domain, username) => {
+  const credentials = await loadCredentials(username);
   
   // Try exact match first
   if (credentials[domain]) {
@@ -1292,15 +1340,15 @@ const validateNoCredentialLeakage = (text, credentials = []) => {
 // Memory System - Date Helpers and Paths
 // ─────────────────────────────────────────────────────────────────────────────
 
-const getMemoryDailyDir = async () => {
-  const dir = await getWovlyDir();
+const getMemoryDailyDir = async (username) => {
+  const dir = await getUserDataDir(username);
   const dailyDir = path.join(dir, "memory", "daily");
   await fs.mkdir(dailyDir, { recursive: true });
   return dailyDir;
 };
 
-const getMemoryLongtermDir = async () => {
-  const dir = await getWovlyDir();
+const getMemoryLongtermDir = async (username) => {
+  const dir = await getUserDataDir(username);
   const longtermDir = path.join(dir, "memory", "longterm");
   await fs.mkdir(longtermDir, { recursive: true });
   return longtermDir;
@@ -1399,14 +1447,18 @@ ${content}`;
   }
 };
 
-// Process old memory files on startup - summarize and move to longterm
-const processOldMemoryFiles = async () => {
-  console.log("[Memory] Processing old memory files...");
+// Process old memory files - summarize and move to longterm
+const processOldMemoryFiles = async (username) => {
+  if (!username) {
+    console.log("[Memory] No user logged in, skipping memory processing");
+    return;
+  }
+  console.log(`[Memory] Processing old memory files for ${username}...`);
   
   // Get API key for summarization
   let apiKey = null;
   try {
-    const settingsPath = await getSettingsPath();
+    const settingsPath = await getSettingsPath(username);
     const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
     apiKey = settings.apiKeys?.anthropic;
   } catch {
@@ -1419,8 +1471,8 @@ const processOldMemoryFiles = async () => {
     return;
   }
 
-  const dailyDir = await getMemoryDailyDir();
-  const longtermDir = await getMemoryLongtermDir();
+  const dailyDir = await getMemoryDailyDir(username);
+  const longtermDir = await getMemoryLongtermDir(username);
   const today = getTodayDate();
   const yesterday = getYesterdayDate();
 
@@ -1515,9 +1567,9 @@ const truncateToLimit = (text, maxChars, label = "content") => {
 
 // Load conversation context for LLM - today, yesterday, and recent summaries
 // With token limits to prevent context explosion
-const loadConversationContext = async () => {
-  const dailyDir = await getMemoryDailyDir();
-  const longtermDir = await getMemoryLongtermDir();
+const loadConversationContext = async (username) => {
+  const dailyDir = await getMemoryDailyDir(username);
+  const longtermDir = await getMemoryLongtermDir(username);
   const today = getTodayDate();
   const yesterday = getYesterdayDate();
 
@@ -1609,8 +1661,8 @@ const loadConversationContext = async () => {
   return { todayMessages, yesterdayMessages, recentSummaries };
 };
 
-const getUserProfilePath = async () => {
-  const dir = await getWovlyDir();
+const getUserProfilePath = async (username) => {
+  const dir = await getUserDataDir(username);
   const profilesDir = path.join(dir, "profiles");
   await fs.mkdir(profilesDir, { recursive: true });
   
@@ -1754,8 +1806,8 @@ const serializeUserProfile = (profile) => {
 // Skills Storage Functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-const getSkillsDir = async () => {
-  const dir = await getWovlyDir();
+const getSkillsDir = async (username) => {
+  const dir = await getUserDataDir(username);
   const skillsDir = path.join(dir, "skills");
   await fs.mkdir(skillsDir, { recursive: true });
   return skillsDir;
@@ -1847,8 +1899,8 @@ ${skill.tools.join(", ")}
 };
 
 // Load all skills from the skills directory
-const loadAllSkills = async () => {
-  const skillsDir = await getSkillsDir();
+const loadAllSkills = async (username) => {
+  const skillsDir = await getSkillsDir(username);
   const skills = [];
 
   try {
@@ -1875,8 +1927,8 @@ const loadAllSkills = async () => {
 };
 
 // Get a single skill by ID
-const getSkill = async (skillId) => {
-  const skillsDir = await getSkillsDir();
+const getSkill = async (skillId, username) => {
+  const skillsDir = await getSkillsDir(username);
   const filePath = path.join(skillsDir, `${skillId}.md`);
   
   try {
@@ -1889,7 +1941,7 @@ const getSkill = async (skillId) => {
 
 // Save a skill (create or update)
 const saveSkill = async (skillId, content) => {
-  const skillsDir = await getSkillsDir();
+  const skillsDir = await getSkillsDir(currentUser?.username);
   const filePath = path.join(skillsDir, `${skillId}.md`);
   await fs.writeFile(filePath, content, "utf8");
   return parseSkill(content, `${skillId}.md`);
@@ -1897,7 +1949,7 @@ const saveSkill = async (skillId, content) => {
 
 // Delete a skill
 const deleteSkill = async (skillId) => {
-  const skillsDir = await getSkillsDir();
+  const skillsDir = await getSkillsDir(currentUser?.username);
   const filePath = path.join(skillsDir, `${skillId}.md`);
   await fs.unlink(filePath);
 };
@@ -1966,7 +2018,7 @@ const calculateSkillScore = (queryKeywords, skill) => {
 const findBestSkill = async (userQuery, skills = null) => {
   // Load skills if not provided
   if (!skills) {
-    skills = await loadAllSkills();
+    skills = await loadAllSkills(currentUser?.username);
   }
   
   if (skills.length === 0) {
@@ -2009,8 +2061,8 @@ const findBestSkill = async (userQuery, skills = null) => {
 // Task Storage Functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-const getTasksDir = async () => {
-  const dir = await getWovlyDir();
+const getTasksDir = async (username) => {
+  const dir = await getUserDataDir(username);
   const tasksDir = path.join(dir, "tasks");
   await fs.mkdir(tasksDir, { recursive: true });
   return tasksDir;
@@ -2264,20 +2316,29 @@ ${msg.message}
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Create a new task and save to markdown file
-const createTask = async (taskData) => {
-  const tasksDir = await getTasksDir();
+const createTask = async (taskData, username) => {
+  const tasksDir = await getTasksDir(username);
   const taskId = `${taskData.title?.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 30) || "task"}-${require("crypto").randomUUID().slice(0, 8)}`;
   
   // Auto-detect messaging channel from original request if not provided
+  // IMPORTANT: Check specific platforms FIRST before generic "message" keyword
   let messagingChannel = taskData.messagingChannel;
   if (!messagingChannel && taskData.originalRequest) {
     const request = taskData.originalRequest.toLowerCase();
-    if (request.includes("text") || request.includes("imessage") || request.includes("sms") || request.match(/\bmessage\b/)) {
-      messagingChannel = "imessage";
-    } else if (request.includes("slack")) {
+    // Check specific platforms first (before generic "message" which defaults to iMessage)
+    if (request.includes("slack")) {
       messagingChannel = "slack";
-    } else if (request.includes("email") || request.includes("mail")) {
+    } else if (request.includes("telegram")) {
+      messagingChannel = "telegram";
+    } else if (request.includes("discord")) {
+      messagingChannel = "discord";
+    } else if (request.includes("tweet") || request.match(/\bx\b/) || request.includes("twitter")) {
+      messagingChannel = "x";
+    } else if (request.includes("email") || request.includes("mail") || request.includes("gmail")) {
       messagingChannel = "email";
+    } else if (request.includes("text") || request.includes("imessage") || request.includes("sms") || request.match(/\bmessage\b/)) {
+      // Generic "message" defaults to iMessage - check this LAST
+      messagingChannel = "imessage";
     }
   }
   
@@ -2323,7 +2384,7 @@ const createTask = async (taskData) => {
   }
   
   try {
-    const skills = await loadAllSkills();
+    const skills = await loadAllSkills(username);
     if (skills.length > 0 && taskData.originalRequest) {
       const result = await findBestSkill(taskData.originalRequest, skills);
       if (result && result.confidence >= 0.3) {
@@ -2392,8 +2453,8 @@ const createTask = async (taskData) => {
 };
 
 // Get a single task by ID
-const getTask = async (taskId) => {
-  const tasksDir = await getTasksDir();
+const getTask = async (taskId, username) => {
+  const tasksDir = await getTasksDir(username);
   const taskPath = path.join(tasksDir, `${taskId}.md`);
   
   try {
@@ -2406,8 +2467,8 @@ const getTask = async (taskId) => {
 };
 
 // Update a task with new data
-const updateTask = async (taskId, updates) => {
-  const task = await getTask(taskId);
+const updateTask = async (taskId, updates, username) => {
+  const task = await getTask(taskId, username);
   if (!task) {
     return { error: `Task ${taskId} not found` };
   }
@@ -2437,7 +2498,7 @@ const updateTask = async (taskId, updates) => {
   task.lastUpdated = new Date().toISOString();
 
   // Save updated task
-  const tasksDir = await getTasksDir();
+  const tasksDir = await getTasksDir(username);
   const taskPath = path.join(tasksDir, `${taskId}.md`);
   await fs.writeFile(taskPath, serializeTask(task), "utf8");
   
@@ -2446,8 +2507,8 @@ const updateTask = async (taskId, updates) => {
 };
 
 // List all tasks
-const listTasks = async () => {
-  const tasksDir = await getTasksDir();
+const listTasks = async (username) => {
+  const tasksDir = await getTasksDir(username);
   
   try {
     const files = await fs.readdir(tasksDir);
@@ -2456,7 +2517,7 @@ const listTasks = async () => {
     for (const file of files) {
       if (file.endsWith(".md")) {
         const taskId = file.replace(".md", "");
-        const task = await getTask(taskId);
+        const task = await getTask(taskId, username);
         if (task) {
           tasks.push(task);
         }
@@ -2474,20 +2535,20 @@ const listTasks = async () => {
 };
 
 // List only active/waiting tasks (for scheduler)
-const listActiveTasks = async () => {
-  const tasks = await listTasks();
+const listActiveTasks = async (username) => {
+  const tasks = await listTasks(username);
   return tasks.filter(t => t.status === "active" || t.status === "waiting");
 };
 
 // Get tasks waiting for user input (for routing clarification responses)
-const getTasksWaitingForInput = async () => {
-  const tasks = await listTasks();
+const getTasksWaitingForInput = async (username) => {
+  const tasks = await listTasks(username);
   return tasks.filter(t => t.status === "waiting_for_input");
 };
 
 // Cancel a task
-const cancelTask = async (taskId) => {
-  const task = await getTask(taskId);
+const cancelTask = async (taskId, username) => {
+  const task = await getTask(taskId, username);
   if (!task) {
     return { error: `Task ${taskId} not found` };
   }
@@ -2495,15 +2556,15 @@ const cancelTask = async (taskId) => {
   await updateTask(taskId, {
     status: "cancelled",
     logEntry: "Task cancelled by user"
-  });
+  }, username);
   
   console.log(`[Tasks] Cancelled task: ${taskId}`);
   return { success: true };
 };
 
 // Hide a task from UI (keeps the file)
-const hideTask = async (taskId) => {
-  const task = await getTask(taskId);
+const hideTask = async (taskId, username) => {
+  const task = await getTask(taskId, username);
   if (!task) {
     return { error: `Task ${taskId} not found` };
   }
@@ -2511,15 +2572,15 @@ const hideTask = async (taskId) => {
   await updateTask(taskId, {
     hidden: true,
     logEntry: "Task hidden from UI"
-  });
+  }, username);
   
   console.log(`[Tasks] Hidden task: ${taskId}`);
   return { success: true };
 };
 
 // Get raw markdown for editing
-const getTaskRawMarkdown = async (taskId) => {
-  const tasksDir = await getTasksDir();
+const getTaskRawMarkdown = async (taskId, username) => {
+  const tasksDir = await getTasksDir(username);
   const taskPath = path.join(tasksDir, `${taskId}.md`);
   
   try {
@@ -2530,13 +2591,13 @@ const getTaskRawMarkdown = async (taskId) => {
 };
 
 // Save raw markdown with basic validation
-const saveTaskRawMarkdown = async (taskId, markdown) => {
+const saveTaskRawMarkdown = async (taskId, markdown, username) => {
   // Basic validation - ensure required sections exist
   if (!markdown.includes("## Metadata") || !markdown.includes("**Status**")) {
     return { error: "Invalid markdown format: Missing required Metadata section or Status field" };
   }
 
-  const tasksDir = await getTasksDir();
+  const tasksDir = await getTasksDir(username);
   const taskPath = path.join(tasksDir, `${taskId}.md`);
   
   try {
@@ -2550,7 +2611,19 @@ const saveTaskRawMarkdown = async (taskId, markdown) => {
 
 // Track task updates for notifications
 let taskUpdates = [];
-const addTaskUpdate = (taskId, message) => {
+
+/**
+ * Add a task update and optionally send to main chat
+ * @param {string} taskId - The task ID
+ * @param {string} message - Update message
+ * @param {Object} options - Optional settings
+ * @param {boolean} options.toChat - Also send to main chat (default: false)
+ * @param {string} options.emoji - Emoji prefix for chat message (default: 📋)
+ * @param {string} options.taskTitle - Task title for chat display
+ */
+const addTaskUpdate = (taskId, message, options = {}) => {
+  const { toChat = false, emoji = "📋", taskTitle = null } = options;
+  
   taskUpdates.push({
     taskId,
     message,
@@ -2560,9 +2633,26 @@ const addTaskUpdate = (taskId, message) => {
   if (taskUpdates.length > 50) {
     taskUpdates = taskUpdates.slice(-50);
   }
-  // Notify renderer
-  if (win) {
+  // Notify renderer - tasks panel
+  if (win && !win.isDestroyed()) {
     win.webContents.send("task:update", { taskId, message });
+    
+    // Also send to main chat if requested
+    if (toChat) {
+      const chatMessage = taskTitle 
+        ? `${emoji} **Task: ${taskTitle}**\n\n${message}`
+        : `${emoji} **Task Update**\n\n${message}`;
+      
+      console.log(`[Tasks] Sending to chat: ${chatMessage.slice(0, 100)}...`);
+      win.webContents.send("chat:newMessage", {
+        role: "assistant",
+        content: chatMessage,
+        source: "task",
+        taskId
+      });
+    }
+  } else {
+    console.log(`[Tasks] Cannot send update - window not available: win=${!!win}`);
   }
 };
 
@@ -2589,9 +2679,13 @@ const startTaskScheduler = () => {
   
   taskSchedulerInterval = setInterval(async () => {
     try {
-      const tasks = await listActiveTasks();
-      const googleAccessToken = await getGoogleAccessToken();
-      const slackAccessToken = await getSlackAccessToken();
+      // Skip scheduler tick if no user is logged in
+      if (!currentUser?.username) {
+        return;
+      }
+      const tasks = await listActiveTasks(currentUser.username);
+      const googleAccessToken = await getGoogleAccessToken(currentUser.username);
+      const slackAccessToken = await getSlackAccessToken(currentUser.username);
       
       const waitingTasks = tasks.filter(t => t.status === "waiting");
       if (waitingTasks.length > 0) {
@@ -2623,11 +2717,37 @@ const startTaskScheduler = () => {
               const accessToken = waitingVia === "email" ? googleAccessToken :
                                   waitingVia === "slack" ? slackAccessToken : null;
               
-              console.log(`[Tasks] Checking ${integration.name} for reply from ${waitingForContact}`);
+              // Get conversation/thread ID if available (for filtering to specific conversation)
+              // This ensures we only see replies in the SAME thread, not from group chats or other conversations
+              let conversationId = task.contextMemory?.conversation_id || task.contextMemory?.chat_id || null;
+              
+              // For iMessage tasks without a conversation_id, try to capture it now
+              // This handles tasks created before the conversation tracking fix
+              if (!conversationId && waitingVia === 'imessage') {
+                const phoneNumber = task.contextMemory?.adaira_phone || 
+                                   task.contextMemory?.[`${waitingForContact.toLowerCase()}_phone`] ||
+                                   waitingForContact;
+                console.log(`[Tasks] No conversation_id for iMessage task, attempting to capture for ${phoneNumber}`);
+                try {
+                  conversationId = await getIMessageChatId(phoneNumber);
+                  if (conversationId) {
+                    console.log(`[Tasks] Captured missing conversation_id: ${conversationId}`);
+                    // Store it for future checks
+                    await updateTask(task.id, {
+                      contextMemory: { ...task.contextMemory, conversation_id: conversationId }
+                    });
+                  }
+                } catch (err) {
+                  console.error(`[Tasks] Failed to capture conversation_id: ${err.message}`);
+                }
+              }
+              
+              console.log(`[Tasks] Checking ${integration.name} for reply from ${waitingForContact}${conversationId ? ` (conversation: ${conversationId})` : ''}`);
               const check = await integration.checkForNewMessages(
                 waitingForContact, 
                 new Date(lastMessageTime).getTime(),
-                accessToken
+                accessToken,
+                conversationId  // Pass conversation ID for thread-specific filtering
               );
               
               if (!check.hasNew) {
@@ -2642,21 +2762,52 @@ const startTaskScheduler = () => {
               
               console.log(`[Tasks] New ${integration.name} from ${waitingForContact}! Running executor.`);
               
+              // Extract message preview from check result if available
+              let messagePreview = '';
+              let messages = [];
+              if (check.messages && Array.isArray(check.messages)) {
+                messages = check.messages;
+                // Get preview of first/latest message
+                const latestMsg = messages[0];
+                if (latestMsg) {
+                  messagePreview = latestMsg.snippet || latestMsg.text || latestMsg.body || '';
+                  if (messagePreview.length > 200) {
+                    messagePreview = messagePreview.substring(0, 200) + '...';
+                  }
+                }
+              } else if (check.snippet) {
+                messagePreview = check.snippet;
+              } else if (check.text) {
+                messagePreview = check.text;
+              }
+              
+              // Log the received message in execution log
+              const logMessage = messagePreview 
+                ? `Received reply from ${waitingForContact} via ${integration.name}: "${messagePreview}"`
+                : `Received reply from ${waitingForContact} via ${integration.name}`;
+              
               // Update task context with info about new messages so executor knows a reply was received
               await updateTask(task.id, {
                 contextMemory: { 
                   ...task.contextMemory, 
                   new_reply_detected: true,
                   new_reply_count: check.count || 1,
-                  last_check_time: new Date().toISOString()
-                }
+                  last_check_time: new Date().toISOString(),
+                  last_reply_preview: messagePreview,
+                  recent_messages: messages.slice(0, 5) // Store up to 5 recent messages
+                },
+                logEntry: logMessage
               });
               
               // Proactively notify user that a reply was received
               if (win) {
+                const displayMessage = messagePreview 
+                  ? `📬 **Task: ${task.title}**\n\nReceived a reply from ${waitingForContact} via ${integration.name}:\n\n> ${messagePreview}\n\nProcessing now...`
+                  : `📬 **Task: ${task.title}**\n\nReceived a reply from ${waitingForContact} via ${integration.name}! Processing now...`;
+                  
                 win.webContents.send("chat:newMessage", {
                   role: "assistant",
-                  content: `📬 **Task: ${task.title}**\n\nReceived a reply from ${waitingForContact} via ${integration.name}! Processing now...`,
+                  content: displayMessage,
                   source: "task"
                 });
               }
@@ -2698,23 +2849,45 @@ const stopTaskScheduler = () => {
 };
 
 // Resume tasks on app startup
-const resumeTasksOnStartup = async () => {
+const resumeTasksOnStartup = async (username) => {
   console.log("[Tasks] Checking for tasks to resume...");
   
+  if (!username) {
+    console.log("[Tasks] No user logged in, skipping task resume");
+    return;
+  }
+  
   try {
-    const tasks = await listActiveTasks();
+    const tasks = await listActiveTasks(username);
     
     for (const task of tasks) {
-      if (task.status === "waiting" && task.nextCheck) {
+      // Log task state for debugging
+      console.log(`[Tasks] Task ${task.id}: status=${task.status}, step=${task.currentStep?.step}, pending=${task.pendingMessages?.length || 0}`);
+      
+      if (task.status === "waiting_approval" && task.pendingMessages?.length > 0) {
+        // Task has messages awaiting user approval - just notify, don't execute
+        console.log(`[Tasks] Task ${task.id} has ${task.pendingMessages.length} messages awaiting approval`);
+        addTaskUpdate(task.id, `Task resumed - ${task.pendingMessages.length} message(s) awaiting your approval`);
+      } else if (task.status === "waiting" && task.nextCheck) {
         // Check if we missed any polls while app was closed
         if (Date.now() >= task.nextCheck) {
           console.log(`[Tasks] Resuming task: ${task.id} (missed scheduled check)`);
-          await executeTaskStep(task.id);
+          // Schedule immediate check for replies
+          setTimeout(() => executeTaskStep(task.id), 5000);
         } else {
           console.log(`[Tasks] Task ${task.id} will be checked at next scheduled time`);
         }
+      } else if (task.status === "waiting" && !task.nextCheck) {
+        // Waiting but no next check scheduled - set one up
+        console.log(`[Tasks] Task ${task.id} is waiting but has no nextCheck - scheduling`);
+        await updateTask(task.id, {
+          nextCheck: Date.now() + 60000,
+          logEntry: "Task resumed after app restart - checking for replies"
+        });
       } else if (task.status === "active") {
         console.log(`[Tasks] Task ${task.id} is active, will continue execution`);
+        // Resume active tasks after a delay to let the app fully initialize
+        setTimeout(() => executeTaskStep(task.id), 10000);
       }
     }
   } catch (err) {
@@ -2739,8 +2912,12 @@ const setTaskExecutor = (executor) => {
 };
 
 // Get Google access token (with refresh if needed)
-const getGoogleAccessToken = async () => {
-  const settingsPath = await getSettingsPath();
+const getGoogleAccessToken = async (username) => {
+  if (!username) {
+    console.error("[Google] getGoogleAccessToken called without username");
+    return null;
+  }
+  const settingsPath = await getSettingsPath(username);
   let settings;
   try {
     settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
@@ -2784,9 +2961,13 @@ const getGoogleAccessToken = async () => {
 };
 
 // Helper to get Slack access token (moved outside app.whenReady for scheduler access)
-const getSlackAccessToken = async () => {
+const getSlackAccessToken = async (username) => {
+  if (!username) {
+    console.error("[Slack] getSlackAccessToken called without username");
+    return null;
+  }
   try {
-    const settingsPath = await getSettingsPath();
+    const settingsPath = await getSettingsPath(username);
     const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
     
     if (!settings.slackTokens?.access_token) {
@@ -2841,7 +3022,8 @@ const checkForNewEmails = async (accessToken, fromEmail, afterTimestamp) => {
     
     for (const msg of messageIds.slice(0, 5)) { // Check up to 5 most recent
       try {
-        const msgUrl = `https://www.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=Date&metadataHeaders=Subject`;
+        // Use minimal format to get snippet, but include metadata for headers
+        const msgUrl = `https://www.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`;
         const msgResponse = await fetch(msgUrl, {
           headers: { "Authorization": `Bearer ${accessToken}` }
         });
@@ -2853,12 +3035,14 @@ const checkForNewEmails = async (accessToken, fromEmail, afterTimestamp) => {
           if (internalDate > afterTimestamp) {
             newMessageCount++;
             const subjectHeader = msgData.payload?.headers?.find(h => h.name === "Subject");
+            const snippet = msgData.snippet || ''; // Gmail returns snippet with the message
             newMessages.push({
               id: msg.id,
               timestamp: internalDate,
-              subject: subjectHeader?.value || "(no subject)"
+              subject: subjectHeader?.value || "(no subject)",
+              snippet: snippet
             });
-            console.log(`[Tasks] Found NEW email: ${subjectHeader?.value || "(no subject)"} at ${new Date(internalDate).toISOString()}`);
+            console.log(`[Tasks] Found NEW email: ${subjectHeader?.value || "(no subject)"} - "${snippet.substring(0, 100)}..." at ${new Date(internalDate).toISOString()}`);
           } else {
             console.log(`[Tasks] Email too old: internalDate ${new Date(internalDate).toISOString()} <= ${new Date(afterTimestamp).toISOString()}`);
           }
@@ -2916,7 +3100,93 @@ const getEnabledMessagingIntegrations = () => {
 };
 
 // Lightweight check for new iMessages - zero cost (local SQLite query)
-const checkForNewIMessages = async (contactIdentifier, afterTimestamp) => {
+/**
+ * Get the chat_id for the most recent 1:1 conversation with a contact
+ * This is used to track which specific conversation thread to monitor for replies
+ * 
+ * Important: This filters OUT group chats (chat_identifier starting with 'chat')
+ * and only returns direct 1:1 conversations (iMessage;-; or SMS;-; prefixed)
+ */
+const getIMessageChatId = async (contactIdentifier) => {
+  if (!contactIdentifier) {
+    console.log(`[Messaging] getIMessageChatId: no contact identifier provided`);
+    return null;
+  }
+  
+  const dbPath = path.join(os.homedir(), "Library", "Messages", "chat.db");
+  
+  try {
+    await fs.access(dbPath);
+  } catch {
+    console.log(`[Messaging] getIMessageChatId: cannot access Messages database`);
+    return null;
+  }
+
+  const digits = contactIdentifier.replace(/\D/g, "");
+  const lastDigits = digits.slice(-10);
+  
+  console.log(`[Messaging] getIMessageChatId: looking for chat with ${contactIdentifier} (digits: ${lastDigits})`);
+  
+  // Query to find the most recent 1:1 chat with this contact
+  // Group chats have chat_identifier starting with 'chat', 1:1 chats start with 'iMessage;-;' or 'SMS;-;'
+  const query = lastDigits 
+    ? `SELECT c.ROWID, c.chat_identifier, h.id as handle_id 
+       FROM chat c 
+       JOIN chat_handle_join chj ON c.ROWID = chj.chat_id 
+       JOIN handle h ON chj.handle_id = h.ROWID 
+       WHERE h.id LIKE '%${lastDigits}%' 
+       AND (c.chat_identifier LIKE 'iMessage;%' OR c.chat_identifier LIKE 'SMS;%' OR c.chat_identifier LIKE '+%')
+       ORDER BY c.ROWID DESC LIMIT 1`
+    : `SELECT c.ROWID, c.chat_identifier, h.id as handle_id 
+       FROM chat c 
+       JOIN chat_handle_join chj ON c.ROWID = chj.chat_id 
+       JOIN handle h ON chj.handle_id = h.ROWID 
+       WHERE h.id LIKE '%${contactIdentifier.replace(/'/g, "''")}%' 
+       AND (c.chat_identifier LIKE 'iMessage;%' OR c.chat_identifier LIKE 'SMS;%' OR c.chat_identifier LIKE '+%')
+       ORDER BY c.ROWID DESC LIMIT 1`;
+
+  console.log(`[Messaging] getIMessageChatId query: ${query.replace(/\s+/g, ' ').trim()}`);
+
+  return new Promise((resolve) => {
+    const { exec } = require("child_process");
+    exec(`sqlite3 "${dbPath}" "${query.replace(/"/g, '\\"')}"`, { timeout: 5000 }, (error, stdout) => {
+      if (error) {
+        console.error(`[Messaging] getIMessageChatId error: ${error.message}`);
+        resolve(null);
+        return;
+      }
+      const result = stdout.trim();
+      if (result) {
+        const parts = result.split("|");
+        const chatId = parts[0];
+        const chatIdentifier = parts[1];
+        const handleId = parts[2];
+        console.log(`[Messaging] Found 1:1 chat_id ${chatId} (${chatIdentifier}) with handle ${handleId} for ${contactIdentifier}`);
+        resolve(chatId);
+      } else {
+        console.log(`[Messaging] No 1:1 chat found for ${contactIdentifier} - might need to check query`);
+        // Debug: List all chats for this handle to see what's available
+        const debugQuery = lastDigits 
+          ? `SELECT c.ROWID, c.chat_identifier FROM chat c JOIN chat_handle_join chj ON c.ROWID = chj.chat_id JOIN handle h ON chj.handle_id = h.ROWID WHERE h.id LIKE '%${lastDigits}%' LIMIT 5`
+          : `SELECT c.ROWID, c.chat_identifier FROM chat c JOIN chat_handle_join chj ON c.ROWID = chj.chat_id JOIN handle h ON chj.handle_id = h.ROWID WHERE h.id LIKE '%${contactIdentifier}%' LIMIT 5`;
+        exec(`sqlite3 "${dbPath}" "${debugQuery.replace(/"/g, '\\"')}"`, { timeout: 5000 }, (err, debugOut) => {
+          if (!err && debugOut.trim()) {
+            console.log(`[Messaging] Debug - available chats for ${contactIdentifier}: ${debugOut.trim()}`);
+          }
+          resolve(null);
+        });
+      }
+    });
+  });
+};
+
+/**
+ * Check for new iMessages from a contact
+ * @param {string} contactIdentifier - Phone number or contact name
+ * @param {number} afterTimestamp - Unix timestamp in milliseconds
+ * @param {string} chatId - Optional: specific chat_id to filter to (for thread-specific checking)
+ */
+const checkForNewIMessages = async (contactIdentifier, afterTimestamp, chatId = null) => {
   if (!contactIdentifier) {
     return { hasNew: false, reason: "missing contact" };
   }
@@ -2933,21 +3203,45 @@ const checkForNewIMessages = async (contactIdentifier, afterTimestamp) => {
   const appleEpoch = new Date("2001-01-01T00:00:00Z").getTime();
   const cutoffTimestamp = (afterTimestamp - appleEpoch) * 1000000;
 
-  // Resolve contact name to phone if needed (reuse findContactsByName from iMessage tools)
+  // Resolve contact name to phone if needed
   let phoneFilter = contactIdentifier;
   if (/[a-zA-Z]/.test(contactIdentifier) && !/[@]/.test(contactIdentifier)) {
     // This is a name, not a phone number or email - we'll resolve it in the query
-    // For now, just use the name as-is and match against handle.id
   }
 
   // Build query to count messages FROM contact (not from me) after timestamp
   const digits = phoneFilter.replace(/\D/g, "");
   const lastDigits = digits.slice(-10);
   
-  // Query for messages from this contact after the cutoff time
-  const query = lastDigits 
-    ? `SELECT COUNT(*) as count FROM message m JOIN handle h ON m.handle_id = h.ROWID WHERE h.id LIKE '%${lastDigits}%' AND m.is_from_me = 0 AND m.date > ${cutoffTimestamp}`
-    : `SELECT COUNT(*) as count FROM message m JOIN handle h ON m.handle_id = h.ROWID WHERE h.id LIKE '%${contactIdentifier.replace(/'/g, "''")}%' AND m.is_from_me = 0 AND m.date > ${cutoffTimestamp}`;
+  // Build the contact filter part
+  const contactFilter = lastDigits 
+    ? `h.id LIKE '%${lastDigits}%'`
+    : `h.id LIKE '%${contactIdentifier.replace(/'/g, "''")}%'`;
+  
+  // If we have a specific chat_id, filter to only that conversation
+  // This ensures we only see replies in the SAME thread, not from group chats or other conversations
+  let query;
+  if (chatId) {
+    // Use chat_message_join to filter to specific conversation
+    query = `SELECT COUNT(*) as count, GROUP_CONCAT(SUBSTR(m.text, 1, 100), ' | ') as previews
+             FROM message m 
+             JOIN handle h ON m.handle_id = h.ROWID 
+             JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+             WHERE cmj.chat_id = ${chatId}
+             AND ${contactFilter}
+             AND m.is_from_me = 0 
+             AND m.date > ${cutoffTimestamp}`;
+    console.log(`[Messaging] Checking iMessage in chat_id ${chatId} for ${contactIdentifier} after ${new Date(afterTimestamp).toISOString()}`);
+  } else {
+    // Fallback: check all messages from contact (less precise, may include other threads)
+    query = `SELECT COUNT(*) as count, GROUP_CONCAT(SUBSTR(m.text, 1, 100), ' | ') as previews
+             FROM message m 
+             JOIN handle h ON m.handle_id = h.ROWID 
+             WHERE ${contactFilter}
+             AND m.is_from_me = 0 
+             AND m.date > ${cutoffTimestamp}`;
+    console.log(`[Messaging] Checking ALL iMessages from ${contactIdentifier} after ${new Date(afterTimestamp).toISOString()} (no chat_id filter)`);
+  }
 
   return new Promise((resolve) => {
     const { exec } = require("child_process");
@@ -2957,9 +3251,21 @@ const checkForNewIMessages = async (contactIdentifier, afterTimestamp) => {
         resolve({ hasNew: false, reason: error.message });
         return;
       }
-      const count = parseInt(stdout.trim()) || 0;
-      console.log(`[Messaging] iMessage check for ${contactIdentifier}: ${count} new messages`);
-      resolve({ hasNew: count > 0, count });
+      const result = stdout.trim();
+      const parts = result.split("|");
+      const count = parseInt(parts[0]) || 0;
+      const snippet = parts.length > 1 ? parts.slice(1).join("|").trim() : "";
+      
+      console.log(`[Messaging] iMessage check for ${contactIdentifier}${chatId ? ` (chat ${chatId})` : ''}: ${count} new messages`);
+      if (count > 0 && snippet) {
+        console.log(`[Messaging] Message preview: "${snippet.substring(0, 100)}..."`);
+      }
+      
+      resolve({ 
+        hasNew: count > 0, 
+        count,
+        snippet: snippet || undefined
+      });
     });
   });
 };
@@ -3049,10 +3355,23 @@ const checkForNewSlackMessages = async (channelOrUser, afterTimestamp, accessTok
     }
 
     // Count messages not from bot (filter out our own messages if possible)
-    const messageCount = data.messages?.length || 0;
+    const messages = data.messages || [];
+    const messageCount = messages.length;
     console.log(`[Messaging] Slack check for ${channelOrUser}: ${messageCount} new messages`);
     
-    return { hasNew: messageCount > 0, count: messageCount };
+    // Extract message previews for display
+    const messageDetails = messages.map(m => ({
+      text: m.text || '',
+      timestamp: m.ts,
+      user: m.user
+    }));
+    
+    return { 
+      hasNew: messageCount > 0, 
+      count: messageCount,
+      messages: messageDetails,
+      snippet: messages[0]?.text || ''
+    };
   } catch (err) {
     console.error(`[Messaging] Slack check error: ${err.message}`);
     return { hasNew: false, reason: err.message };
@@ -3436,8 +3755,8 @@ const fetchCalendarEvents = async (accessToken, startDate, endDate) => {
 // WhatsApp Connection Manager
 // ─────────────────────────────────────────────────────────────────────────────
 
-const getWhatsAppAuthDir = async () => {
-  const dir = await getWovlyDir();
+const getWhatsAppAuthDir = async (username) => {
+  const dir = await getUserDataDir(username);
   const authDir = path.join(dir, "whatsapp-auth");
   await fs.mkdir(authDir, { recursive: true });
   return authDir;
@@ -3667,16 +3986,206 @@ const notifyWhatsAppStatus = () => {
   }
 };
 
-// Process incoming WhatsApp message with LLM - uses SAME tools as main chat
+// Process incoming external message with LLM - uses SAME tools as main chat
 // This is a placeholder that will be replaced with full tool access in app.whenReady()
-let processWhatsAppMessage = async (text, senderId) => {
-  console.log("[WhatsApp] Placeholder processWhatsAppMessage called");
+// Shared by WhatsApp, Telegram, and other chat interfaces
+let processExternalMessage = async (text, senderId, source) => {
+  console.log(`[${source}] Placeholder processExternalMessage called`);
   return "Sorry, the message processor is still initializing. Please try again in a moment.";
 };
 
+// Legacy alias for WhatsApp compatibility
+let processWhatsAppMessage = async (text, senderId) => {
+  return processExternalMessage(text, senderId, "WhatsApp");
+};
+
 // This will be called from app.whenReady() to inject the real implementation with full tool access
-const setWhatsAppMessageProcessor = (processor) => {
-  processWhatsAppMessage = processor;
+const setExternalMessageProcessor = (processor) => {
+  processExternalMessage = processor;
+  // Keep processWhatsAppMessage in sync
+  processWhatsAppMessage = async (text, senderId) => processor(text, senderId, "WhatsApp");
+};
+
+// Legacy alias
+const setWhatsAppMessageProcessor = setExternalMessageProcessor;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram Chat Interface (similar to WhatsApp)
+// Uses the bot token from integrations to receive and respond to messages
+// ─────────────────────────────────────────────────────────────────────────────
+
+let telegramInterfaceActive = false;
+let telegramPollingInterval = null;
+let telegramLastUpdateId = 0;
+let telegramInterfaceStatus = "disconnected"; // disconnected, connecting, connected
+
+const notifyTelegramInterfaceStatus = () => {
+  if (win && !win.isDestroyed()) {
+    win.webContents.send("telegram:interfaceStatus", {
+      status: telegramInterfaceStatus
+    });
+  }
+};
+
+const connectTelegramInterface = async () => {
+  const botToken = await getTelegramToken();
+  if (!botToken) {
+    throw new Error("Telegram bot not configured. Please set up Telegram in the Integrations page first.");
+  }
+
+  telegramInterfaceStatus = "connecting";
+  notifyTelegramInterfaceStatus();
+
+  // Test the bot token
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
+    const data = await response.json();
+    if (!data.ok) {
+      throw new Error(data.description || "Invalid bot token");
+    }
+    console.log(`[Telegram Interface] Bot connected: @${data.result.username}`);
+  } catch (err) {
+    telegramInterfaceStatus = "disconnected";
+    notifyTelegramInterfaceStatus();
+    throw err;
+  }
+
+  telegramInterfaceActive = true;
+  telegramInterfaceStatus = "connected";
+  notifyTelegramInterfaceStatus();
+
+  // Save enabled state for auto-reconnect
+  try {
+    const settingsPath = await getSettingsPath(currentUser?.username);
+    let settings = {};
+    try {
+      settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+    } catch { /* No settings */ }
+    settings.telegramInterfaceEnabled = true;
+    await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+  } catch (err) {
+    console.error("[Telegram Interface] Failed to save enabled state:", err.message);
+  }
+
+  // Start long-polling for messages
+  const pollForMessages = async () => {
+    if (!telegramInterfaceActive) return;
+
+    const token = await getTelegramToken();
+    if (!token) {
+      telegramInterfaceActive = false;
+      telegramInterfaceStatus = "disconnected";
+      notifyTelegramInterfaceStatus();
+      return;
+    }
+
+    try {
+      const url = `https://api.telegram.org/bot${token}/getUpdates?offset=${telegramLastUpdateId + 1}&timeout=30`;
+      const response = await fetch(url);
+      const data = await response.json();
+
+      if (data.ok && data.result.length > 0) {
+        for (const update of data.result) {
+          telegramLastUpdateId = update.update_id;
+
+          // Process message
+          const message = update.message;
+          if (!message || !message.text) continue;
+
+          const chatId = message.chat.id;
+          const text = message.text;
+          const fromUser = message.from?.first_name || message.from?.username || "User";
+
+          // Skip bot's own messages (loop prevention)
+          if (text.startsWith("[Wovly]")) {
+            continue;
+          }
+
+          console.log(`[Telegram Interface] Message from ${fromUser}: ${text.substring(0, 50)}...`);
+
+          // Notify UI about incoming message
+          if (win && !win.isDestroyed()) {
+            win.webContents.send("chat:newMessage", {
+              role: "user",
+              content: text,
+              source: "telegram",
+              timestamp: Date.now()
+            });
+          }
+
+          // Process with LLM (reusing the same processor as WhatsApp)
+          try {
+            const response = await processExternalMessage(text, chatId.toString(), "Telegram");
+
+            if (response) {
+              // Send response back via Telegram
+              const sendResponse = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  text: `[Wovly] ${response}`,
+                  parse_mode: "Markdown"
+                })
+              });
+
+              if (!sendResponse.ok) {
+                console.error("[Telegram Interface] Failed to send response");
+              }
+
+              // Notify UI about AI response
+              if (win && !win.isDestroyed()) {
+                win.webContents.send("chat:newMessage", {
+                  role: "assistant",
+                  content: response,
+                  source: "telegram",
+                  timestamp: Date.now()
+                });
+              }
+            }
+          } catch (err) {
+            console.error("[Telegram Interface] Error processing message:", err.message);
+          }
+        }
+      }
+    } catch (err) {
+      console.error("[Telegram Interface] Polling error:", err.message);
+    }
+
+    // Continue polling if still active
+    if (telegramInterfaceActive) {
+      telegramPollingInterval = setTimeout(pollForMessages, 1000);
+    }
+  };
+
+  // Start polling
+  pollForMessages();
+  console.log("[Telegram Interface] Started message polling");
+};
+
+const disconnectTelegramInterface = async () => {
+  telegramInterfaceActive = false;
+  if (telegramPollingInterval) {
+    clearTimeout(telegramPollingInterval);
+    telegramPollingInterval = null;
+  }
+  telegramInterfaceStatus = "disconnected";
+  notifyTelegramInterfaceStatus();
+  
+  // Clear enabled state
+  try {
+    const settingsPath = await getSettingsPath(currentUser?.username);
+    let settings = {};
+    try {
+      settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+    } catch { /* No settings */ }
+    settings.telegramInterfaceEnabled = false;
+    await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+  } catch (err) {
+    console.error("[Telegram Interface] Failed to clear enabled state:", err.message);
+  }
+  
+  console.log("[Telegram Interface] Disconnected");
 };
 
 function createWindow() {
@@ -3697,20 +4206,19 @@ function createWindow() {
     win.loadURL("http://localhost:5173");
     win.webContents.openDevTools();
   } else {
-    win.loadFile(path.join(__dirname, "../ui/dist/index.html"));
+    // In packaged app, UI is in resources/ui folder
+    const uiPath = path.join(process.resourcesPath, "ui", "index.html");
+    win.loadFile(uiPath);
   }
 }
 
 app.whenReady().then(async () => {
   createWindow();
 
-  // Process old memory files (summarize and move to longterm)
-  processOldMemoryFiles().catch(err => {
-    console.error("[Memory] Error processing old files:", err.message);
-  });
+  // Process old memory files (summarize and move to longterm) - deferred until user logs in
+  // This will be triggered after login via auth:login handler
 
-  // Resume tasks and start scheduler
-  await resumeTasksOnStartup();
+  // Start task scheduler (tasks are resumed after user login)
   startTaskScheduler();
   
   // Auto-reconnect WhatsApp if previously connected
@@ -3735,10 +4243,231 @@ app.whenReady().then(async () => {
     console.log("[WhatsApp] No saved auth state found");
   }
 
+  // Auto-reconnect Telegram interface if it was previously active
+  try {
+    const settingsPath = await getSettingsPath(currentUser?.username);
+    const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+    
+    if (settings.telegramInterfaceEnabled && settings.telegramBotToken) {
+      console.log("[Telegram Interface] Found saved state, auto-reconnecting...");
+      setTimeout(async () => {
+        try {
+          await connectTelegramInterface();
+          console.log("[Telegram Interface] Auto-reconnect initiated");
+        } catch (err) {
+          console.error("[Telegram Interface] Auto-reconnect failed:", err.message);
+        }
+      }, 3000);
+    }
+  } catch (err) {
+    console.log("[Telegram Interface] No saved state found");
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Auto-reconnect new integrations on startup
+  // ─────────────────────────────────────────────────────────────────────────────
+  
+  const refreshIntegrationsOnStartup = async () => {
+    console.log("[Integrations] Checking saved integrations...");
+    const settingsPath = await getSettingsPath(currentUser?.username);
+    let settings = {};
+    try {
+      settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+    } catch {
+      return; // No settings file yet
+    }
+
+    let updated = false;
+
+    // Telegram - Verify bot token still works
+    if (settings.telegramBotToken) {
+      try {
+        const response = await fetch(`https://api.telegram.org/bot${settings.telegramBotToken}/getMe`);
+        const data = await response.json();
+        if (data.ok) {
+          console.log(`[Telegram] Connected as @${data.result.username}`);
+        } else {
+          console.log("[Telegram] Token invalid, clearing...");
+          delete settings.telegramBotToken;
+          updated = true;
+        }
+      } catch (err) {
+        console.log("[Telegram] Connection check failed:", err.message);
+      }
+    }
+
+    // Discord - Refresh token if needed
+    if (settings.discordTokens?.refresh_token) {
+      try {
+        if (Date.now() > (settings.discordTokens.expires_at || 0) - 60000) {
+          console.log("[Discord] Refreshing token...");
+          const refreshed = await refreshDiscordToken(settings.discordTokens);
+          if (refreshed) {
+            settings.discordTokens = refreshed;
+            updated = true;
+            console.log("[Discord] Token refreshed successfully");
+          } else {
+            console.log("[Discord] Token refresh failed, user may need to re-authorize");
+          }
+        } else {
+          console.log("[Discord] Token still valid");
+        }
+      } catch (err) {
+        console.log("[Discord] Token refresh error:", err.message);
+      }
+    }
+
+    // X (Twitter) - Refresh token if needed
+    if (settings.xTokens?.refresh_token) {
+      try {
+        if (Date.now() > (settings.xTokens.expires_at || 0) - 60000) {
+          console.log("[X] Refreshing token...");
+          const refreshed = await refreshXToken(settings.xTokens);
+          if (refreshed) {
+            settings.xTokens = refreshed;
+            updated = true;
+            console.log("[X] Token refreshed successfully");
+          } else {
+            console.log("[X] Token refresh failed, user may need to re-authorize");
+          }
+        } else {
+          console.log("[X] Token still valid");
+        }
+      } catch (err) {
+        console.log("[X] Token refresh error:", err.message);
+      }
+    }
+
+    // Notion - Tokens don't expire, just verify connection
+    if (settings.notionTokens?.access_token) {
+      try {
+        const response = await fetch("https://api.notion.com/v1/users/me", {
+          headers: {
+            "Authorization": `Bearer ${settings.notionTokens.access_token}`,
+            "Notion-Version": "2022-06-28"
+          }
+        });
+        if (response.ok) {
+          const data = await response.json();
+          console.log(`[Notion] Connected as ${data.name || "user"}`);
+        } else {
+          console.log("[Notion] Token invalid, clearing...");
+          delete settings.notionTokens;
+          updated = true;
+        }
+      } catch (err) {
+        console.log("[Notion] Connection check failed:", err.message);
+      }
+    }
+
+    // GitHub - Tokens don't expire, just verify connection
+    if (settings.githubTokens?.access_token) {
+      try {
+        const response = await fetch("https://api.github.com/user", {
+          headers: {
+            "Authorization": `Bearer ${settings.githubTokens.access_token}`,
+            "Accept": "application/vnd.github+json"
+          }
+        });
+        if (response.ok) {
+          const data = await response.json();
+          console.log(`[GitHub] Connected as @${data.login}`);
+        } else {
+          console.log("[GitHub] Token invalid, clearing...");
+          delete settings.githubTokens;
+          updated = true;
+        }
+      } catch (err) {
+        console.log("[GitHub] Connection check failed:", err.message);
+      }
+    }
+
+    // Asana - Refresh token if needed
+    if (settings.asanaTokens?.refresh_token) {
+      try {
+        if (Date.now() > (settings.asanaTokens.expires_at || 0) - 60000) {
+          console.log("[Asana] Refreshing token...");
+          const refreshed = await refreshAsanaToken(settings.asanaTokens);
+          if (refreshed) {
+            settings.asanaTokens = refreshed;
+            updated = true;
+            console.log("[Asana] Token refreshed successfully");
+          } else {
+            console.log("[Asana] Token refresh failed, user may need to re-authorize");
+          }
+        } else {
+          console.log("[Asana] Token still valid");
+        }
+      } catch (err) {
+        console.log("[Asana] Token refresh error:", err.message);
+      }
+    }
+
+    // Reddit - Refresh token if needed
+    if (settings.redditTokens?.refresh_token) {
+      try {
+        if (Date.now() > (settings.redditTokens.expires_at || 0) - 60000) {
+          console.log("[Reddit] Refreshing token...");
+          const refreshed = await refreshRedditToken(settings.redditTokens);
+          if (refreshed) {
+            settings.redditTokens = refreshed;
+            updated = true;
+            console.log("[Reddit] Token refreshed successfully");
+          } else {
+            console.log("[Reddit] Token refresh failed, user may need to re-authorize");
+          }
+        } else {
+          console.log("[Reddit] Token still valid");
+        }
+      } catch (err) {
+        console.log("[Reddit] Token refresh error:", err.message);
+      }
+    }
+
+    // Spotify - Refresh token if needed
+    if (settings.spotifyTokens?.refresh_token) {
+      try {
+        if (Date.now() > (settings.spotifyTokens.expires_at || 0) - 60000) {
+          console.log("[Spotify] Refreshing token...");
+          const refreshed = await refreshSpotifyToken(settings.spotifyTokens);
+          if (refreshed) {
+            settings.spotifyTokens = refreshed;
+            updated = true;
+            console.log("[Spotify] Token refreshed successfully");
+          } else {
+            console.log("[Spotify] Token refresh failed, user may need to re-authorize");
+          }
+        } else {
+          console.log("[Spotify] Token still valid");
+        }
+      } catch (err) {
+        console.log("[Spotify] Token refresh error:", err.message);
+      }
+    }
+
+    // Save updated tokens if any were refreshed
+    if (updated) {
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      console.log("[Integrations] Saved refreshed tokens");
+    }
+
+    console.log("[Integrations] Startup check complete");
+  };
+
+  // Run integration refresh with a slight delay to not block app startup
+  setTimeout(() => {
+    refreshIntegrationsOnStartup().catch(err => {
+      console.error("[Integrations] Startup refresh error:", err.message);
+    });
+  }, 1000);
+
   // Settings handlers
   ipcMain.handle("settings:get", async () => {
     try {
-      const settingsPath = await getSettingsPath();
+      if (!currentUser?.username) {
+        return { ok: true, settings: {} };
+      }
+      const settingsPath = await getSettingsPath(currentUser.username);
       const data = await fs.readFile(settingsPath, "utf8");
       return { ok: true, settings: JSON.parse(data) };
     } catch {
@@ -3748,7 +4477,10 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("settings:set", async (_event, { settings }) => {
     try {
-      const settingsPath = await getSettingsPath();
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const settingsPath = await getSettingsPath(currentUser.username);
       let existing = {};
       try {
         existing = JSON.parse(await fs.readFile(settingsPath, "utf8"));
@@ -3766,7 +4498,10 @@ app.whenReady().then(async () => {
   // Profile handlers
   ipcMain.handle("profile:get", async () => {
     try {
-      const profilePath = await getUserProfilePath();
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const profilePath = await getUserProfilePath(currentUser.username);
       const markdown = await fs.readFile(profilePath, "utf8");
       const profile = parseUserProfile(markdown);
       return { ok: true, profile };
@@ -3777,7 +4512,10 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("profile:update", async (_event, { updates }) => {
     try {
-      const profilePath = await getUserProfilePath();
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const profilePath = await getUserProfilePath(currentUser.username);
       const markdown = await fs.readFile(profilePath, "utf8");
       const profile = parseUserProfile(markdown);
       Object.assign(profile, updates);
@@ -3791,7 +4529,10 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("profile:needsOnboarding", async () => {
     try {
-      const profilePath = await getUserProfilePath();
+      if (!currentUser?.username) {
+        return { ok: true, needsOnboarding: false };
+      }
+      const profilePath = await getUserProfilePath(currentUser.username);
       const markdown = await fs.readFile(profilePath, "utf8");
       const profile = parseUserProfile(markdown);
       
@@ -3810,7 +4551,10 @@ app.whenReady().then(async () => {
   // Add facts to profile (with conflict resolution)
   ipcMain.handle("profile:addFacts", async (_event, { facts, conflictResolutions }) => {
     try {
-      const profilePath = await getUserProfilePath();
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const profilePath = await getUserProfilePath(currentUser.username);
       const markdown = await fs.readFile(profilePath, "utf8");
       const profile = parseUserProfile(markdown);
       profile.notes = profile.notes || [];
@@ -3852,7 +4596,10 @@ app.whenReady().then(async () => {
   // Get raw profile markdown (for About Me page)
   ipcMain.handle("profile:getMarkdown", async () => {
     try {
-      const profilePath = await getUserProfilePath();
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const profilePath = await getUserProfilePath(currentUser.username);
       const markdown = await fs.readFile(profilePath, "utf8");
       return { ok: true, markdown };
     } catch (err) {
@@ -3864,7 +4611,10 @@ app.whenReady().then(async () => {
   // Save raw profile markdown (for About Me page editor)
   ipcMain.handle("profile:saveMarkdown", async (_event, markdown) => {
     try {
-      const profilePath = await getUserProfilePath();
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const profilePath = await getUserProfilePath(currentUser.username);
       await fs.writeFile(profilePath, markdown, "utf8");
       console.log("[Profile] Saved profile markdown");
       return { ok: true };
@@ -3877,7 +4627,10 @@ app.whenReady().then(async () => {
   // Skills handlers
   ipcMain.handle("skills:list", async () => {
     try {
-      const skills = await loadAllSkills();
+      if (!currentUser?.username) {
+        return { ok: true, skills: [] };
+      }
+      const skills = await loadAllSkills(currentUser.username);
       return { ok: true, skills };
     } catch (err) {
       return { ok: false, error: err.message };
@@ -3886,7 +4639,10 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("skills:get", async (_event, { skillId }) => {
     try {
-      const skillsDir = await getSkillsDir();
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const skillsDir = await getSkillsDir(currentUser.username);
       const filePath = path.join(skillsDir, `${skillId}.md`);
       const content = await fs.readFile(filePath, "utf8");
       const skill = parseSkill(content, `${skillId}.md`);
@@ -3898,7 +4654,10 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("skills:save", async (_event, { skillId, content }) => {
     try {
-      const skillsDir = await getSkillsDir();
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const skillsDir = await getSkillsDir(currentUser.username);
       const filePath = path.join(skillsDir, `${skillId}.md`);
       await fs.writeFile(filePath, content, "utf8");
       const skill = parseSkill(content, `${skillId}.md`);
@@ -3910,7 +4669,10 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("skills:delete", async (_event, { skillId }) => {
     try {
-      const skillsDir = await getSkillsDir();
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const skillsDir = await getSkillsDir(currentUser.username);
       const filePath = path.join(skillsDir, `${skillId}.md`);
       await fs.unlink(filePath);
       return { ok: true };
@@ -3968,7 +4730,7 @@ tool1, tool2
       // Get user profile
       let profile = null;
       try {
-        const profilePath = await getUserProfilePath();
+        const profilePath = await getUserProfilePath(currentUser?.username);
         const markdown = await fs.readFile(profilePath, "utf8");
         profile = parseUserProfile(markdown);
       } catch {
@@ -4000,7 +4762,7 @@ tool1, tool2
       let tomorrowEvents = [];
       
       try {
-        const accessToken = await getGoogleAccessToken();
+        const accessToken = await getGoogleAccessToken(currentUser?.username);
         if (accessToken) {
           // Today's events
           const todayStart = new Date(now);
@@ -4022,7 +4784,7 @@ tool1, tool2
       }
 
       // Get API keys for LLM
-      const settingsPath = await getSettingsPath();
+      const settingsPath = await getSettingsPath(currentUser?.username);
       let apiKeys = {};
       let models = {};
       let activeProvider = "anthropic";
@@ -4213,7 +4975,7 @@ Generate ONLY the welcome message, nothing else.`;
   // Calendar events handler
   ipcMain.handle("calendar:getEvents", async (_event, { date }) => {
     try {
-      const accessToken = await getGoogleAccessToken();
+      const accessToken = await getGoogleAccessToken(currentUser?.username);
       if (!accessToken) {
         return { ok: false, error: "Google not authorized" };
       }
@@ -4234,7 +4996,7 @@ Generate ONLY the welcome message, nothing else.`;
   // Integration test handlers
   ipcMain.handle("integrations:testGoogle", async () => {
     try {
-      const accessToken = await getGoogleAccessToken();
+      const accessToken = await getGoogleAccessToken(currentUser?.username);
       if (!accessToken) {
         return { ok: false, error: "Not authorized" };
       }
@@ -4314,7 +5076,7 @@ Generate ONLY the welcome message, nothing else.`;
   // Weather enable/disable handler
   ipcMain.handle("integrations:setWeatherEnabled", async (_event, { enabled }) => {
     try {
-      const settingsPath = await getSettingsPath();
+      const settingsPath = await getSettingsPath(currentUser?.username);
       let settings = {};
       try {
         settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
@@ -4331,7 +5093,7 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("integrations:getWeatherEnabled", async () => {
     try {
-      const settingsPath = await getSettingsPath();
+      const settingsPath = await getSettingsPath(currentUser?.username);
       const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
       return { ok: true, enabled: settings.weatherEnabled !== false };
     } catch {
@@ -4342,7 +5104,7 @@ Generate ONLY the welcome message, nothing else.`;
   // Browser Automation Settings (CDP)
   ipcMain.handle("integrations:getBrowserEnabled", async () => {
     try {
-      const settingsPath = await getSettingsPath();
+      const settingsPath = await getSettingsPath(currentUser?.username);
       const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
       return { ok: true, enabled: settings.browserEnabled === true };
     } catch {
@@ -4352,7 +5114,7 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("integrations:setBrowserEnabled", async (_event, { enabled }) => {
     try {
-      const settingsPath = await getSettingsPath();
+      const settingsPath = await getSettingsPath(currentUser?.username);
       let settings = {};
       try {
         settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
@@ -4371,7 +5133,10 @@ Generate ONLY the welcome message, nothing else.`;
   // Test CDP browser
   ipcMain.handle("integrations:testBrowser", async () => {
     try {
-      const controller = await getBrowserController();
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const controller = await getBrowserController(currentUser.username);
       const snapshot = await controller.navigate("test", "https://example.com");
       
       // Clean up test session
@@ -4398,7 +5163,10 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("credentials:list", async () => {
     try {
-      const credentials = await loadCredentials();
+      if (!currentUser?.username) {
+        return { ok: true, credentials: [] };
+      }
+      const credentials = await loadCredentials(currentUser.username);
       // Return credentials with passwords masked for display
       const masked = Object.entries(credentials).map(([domain, cred]) => ({
         domain: cred.domain || domain,
@@ -4418,7 +5186,10 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("credentials:get", async (_event, { domain, includePassword = false }) => {
     try {
-      const credential = await getCredentialForDomain(domain);
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const credential = await getCredentialForDomain(domain, currentUser.username);
       if (!credential) {
         return { ok: false, error: "Credential not found" };
       }
@@ -4446,11 +5217,14 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("credentials:save", async (_event, { domain, displayName, username, password, notes }) => {
     try {
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
       if (!domain || domain.trim() === "") {
         return { ok: false, error: "Domain is required" };
       }
       
-      const credentials = await loadCredentials();
+      const credentials = await loadCredentials(currentUser.username);
       const normalizedDomain = domain.toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
       
       const existingCred = credentials[normalizedDomain];
@@ -4465,7 +5239,7 @@ Generate ONLY the welcome message, nothing else.`;
         created: existingCred?.created || new Date().toISOString()
       };
       
-      await saveCredentials(credentials);
+      await saveCredentials(credentials, currentUser.username);
       
       console.log(`[Credentials] Saved credential for ${normalizedDomain}`);
       return { ok: true, domain: normalizedDomain };
@@ -4477,7 +5251,10 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("credentials:delete", async (_event, { domain }) => {
     try {
-      const credentials = await loadCredentials();
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const credentials = await loadCredentials(currentUser.username);
       const normalizedDomain = domain.toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
       
       if (!credentials[normalizedDomain]) {
@@ -4485,7 +5262,7 @@ Generate ONLY the welcome message, nothing else.`;
       }
       
       delete credentials[normalizedDomain];
-      await saveCredentials(credentials);
+      await saveCredentials(credentials, currentUser.username);
       
       console.log(`[Credentials] Deleted credential for ${normalizedDomain}`);
       return { ok: true };
@@ -4497,15 +5274,230 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("credentials:updateLastUsed", async (_event, { domain }) => {
     try {
-      const credentials = await loadCredentials();
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const credentials = await loadCredentials(currentUser.username);
       const normalizedDomain = domain.toLowerCase();
       
       if (credentials[normalizedDomain]) {
         credentials[normalizedDomain].lastUsed = new Date().toISOString();
-        await saveCredentials(credentials);
+        await saveCredentials(credentials, currentUser.username);
       }
       
       return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Shell utilities
+  // ─────────────────────────────────────────────────────────────────────────────
+  
+  ipcMain.handle("shell:openExternal", async (_event, { url }) => {
+    try {
+      const { shell } = require("electron");
+      await shell.openExternal(url);
+      return { ok: true };
+    } catch (err) {
+      console.error("[Shell] Open external error:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // User Authentication System - Multi-user support with local passwords
+  // ─────────────────────────────────────────────────────────────────────────────
+  
+  // currentUser is defined at module scope for cross-function access
+  
+  const getUsersPath = async () => {
+    const baseDir = await getWovlyDir();
+    return path.join(baseDir, "users.json");
+  };
+  
+  const loadUsers = async () => {
+    try {
+      const usersPath = await getUsersPath();
+      const data = await fs.readFile(usersPath, "utf8");
+      return JSON.parse(data);
+    } catch {
+      return {};
+    }
+  };
+  
+  const saveUsers = async (users) => {
+    const usersPath = await getUsersPath();
+    await fs.writeFile(usersPath, JSON.stringify(users, null, 2));
+  };
+  
+  // Simple password hashing (for local use - not cryptographically secure for network)
+  const hashPassword = (password) => {
+    const crypto = require("crypto");
+    return crypto.createHash("sha256").update(password).digest("hex");
+  };
+  
+  // Check if any users exist
+  ipcMain.handle("auth:hasUsers", async () => {
+    try {
+      const users = await loadUsers();
+      return { ok: true, hasUsers: Object.keys(users).length > 0 };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+  
+  // List all usernames (for login screen)
+  ipcMain.handle("auth:listUsers", async () => {
+    try {
+      const users = await loadUsers();
+      const userList = Object.entries(users).map(([username, data]) => ({
+        username,
+        displayName: data.displayName || username,
+        createdAt: data.createdAt
+      }));
+      return { ok: true, users: userList };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+  
+  // Register a new user
+  ipcMain.handle("auth:register", async (_event, { username, password, displayName }) => {
+    try {
+      if (!username || !password) {
+        return { ok: false, error: "Username and password are required" };
+      }
+      
+      const users = await loadUsers();
+      const normalizedUsername = username.toLowerCase().trim();
+      
+      if (users[normalizedUsername]) {
+        return { ok: false, error: "Username already exists" };
+      }
+      
+      users[normalizedUsername] = {
+        username: normalizedUsername,
+        displayName: displayName || username,
+        passwordHash: hashPassword(password),
+        createdAt: new Date().toISOString()
+      };
+      
+      await saveUsers(users);
+      console.log(`[Auth] User registered: ${normalizedUsername}`);
+      
+      return { ok: true, username: normalizedUsername };
+    } catch (err) {
+      console.error("[Auth] Register error:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+  
+  // Login
+  ipcMain.handle("auth:login", async (_event, { username, password }) => {
+    try {
+      if (!username || !password) {
+        return { ok: false, error: "Username and password are required" };
+      }
+      
+      const users = await loadUsers();
+      const normalizedUsername = username.toLowerCase().trim();
+      const user = users[normalizedUsername];
+      
+      if (!user) {
+        return { ok: false, error: "User not found" };
+      }
+      
+      if (user.passwordHash !== hashPassword(password)) {
+        return { ok: false, error: "Incorrect password" };
+      }
+      
+      // Set current user
+      currentUser = {
+        username: normalizedUsername,
+        displayName: user.displayName
+      };
+      
+      // Update last login
+      users[normalizedUsername].lastLogin = new Date().toISOString();
+      await saveUsers(users);
+      
+      console.log(`[Auth] User logged in: ${normalizedUsername}`);
+      
+      // Process old memory files for this user (in background)
+      processOldMemoryFiles(normalizedUsername).catch(err => {
+        console.error("[Memory] Error processing old files:", err.message);
+      });
+      
+      // Resume any pending tasks for this user (in background)
+      resumeTasksOnStartup(normalizedUsername).catch(err => {
+        console.error("[Tasks] Error resuming tasks:", err.message);
+      });
+      
+      return { 
+        ok: true, 
+        user: {
+          username: currentUser.username,
+          displayName: currentUser.displayName
+        }
+      };
+    } catch (err) {
+      console.error("[Auth] Login error:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+  
+  // Logout
+  ipcMain.handle("auth:logout", async () => {
+    try {
+      const username = currentUser?.username;
+      currentUser = null;
+      // Clear user-specific caches
+      if (username) {
+        credentialsCache.delete(username);
+      }
+      contactNameCache.clear();
+      console.log(`[Auth] User logged out: ${username || "unknown"}`);
+      return { ok: true };
+    } catch (err) {
+      console.error("[Auth] Logout error:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+  
+  // Check current session
+  ipcMain.handle("auth:checkSession", async () => {
+    try {
+      if (currentUser) {
+        return { 
+          ok: true, 
+          loggedIn: true, 
+          user: {
+            username: currentUser.username,
+            displayName: currentUser.displayName
+          }
+        };
+      }
+      return { ok: true, loggedIn: false };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+  
+  // Get current user
+  ipcMain.handle("auth:getCurrentUser", async () => {
+    try {
+      if (!currentUser) {
+        return { ok: false, error: "Not logged in" };
+      }
+      return { 
+        ok: true, 
+        user: {
+          username: currentUser.username,
+          displayName: currentUser.displayName
+        }
+      };
     } catch (err) {
       return { ok: false, error: err.message };
     }
@@ -4567,7 +5559,7 @@ Generate ONLY the welcome message, nothing else.`;
 
               if (tokenData.access_token) {
                 // Save tokens
-                const settingsPath = await getSettingsPath();
+                const settingsPath = await getSettingsPath(currentUser?.username);
                 let settings = {};
                 try {
                   settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
@@ -4618,7 +5610,7 @@ Generate ONLY the welcome message, nothing else.`;
   });
 
   ipcMain.handle("integrations:checkGoogleAuth", async () => {
-    const accessToken = await getGoogleAccessToken();
+    const accessToken = await getGoogleAccessToken(currentUser?.username);
     return { ok: true, authorized: !!accessToken };
   });
 
@@ -4843,7 +5835,7 @@ Generate ONLY the welcome message, nothing else.`;
               
               if (tokenData.ok && userToken) {
                 // Save user token (not bot token)
-                const settingsPath = await getSettingsPath();
+                const settingsPath = await getSettingsPath(currentUser?.username);
                 let settings = {};
                 try {
                   settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
@@ -4895,13 +5887,13 @@ Generate ONLY the welcome message, nothing else.`;
   });
 
   ipcMain.handle("integrations:checkSlackAuth", async () => {
-    const accessToken = await getSlackAccessToken();
+    const accessToken = await getSlackAccessToken(currentUser?.username);
     if (!accessToken) {
       return { ok: true, authorized: false };
     }
     
     try {
-      const settingsPath = await getSettingsPath();
+      const settingsPath = await getSettingsPath(currentUser?.username);
       const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
       return { 
         ok: true, 
@@ -4915,7 +5907,7 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("integrations:disconnectSlack", async () => {
     try {
-      const settingsPath = await getSettingsPath();
+      const settingsPath = await getSettingsPath(currentUser?.username);
       let settings = {};
       try {
         settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
@@ -4932,7 +5924,7 @@ Generate ONLY the welcome message, nothing else.`;
 
   // Update the test handler
   ipcMain.handle("integrations:testSlack", async () => {
-    const accessToken = await getSlackAccessToken();
+    const accessToken = await getSlackAccessToken(currentUser?.username);
     if (!accessToken) {
       return { ok: false, error: "Slack not connected" };
     }
@@ -4953,12 +5945,999 @@ Generate ONLY the welcome message, nothing else.`;
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // Telegram IPC Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("telegram:setToken", async (_event, { token }) => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch { /* No existing settings */ }
+      
+      settings.telegramBotToken = token;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      
+      // Verify the token works
+      const response = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+      const data = await response.json();
+      
+      if (data.ok) {
+        return { ok: true, bot: { username: data.result.username, name: data.result.first_name } };
+      }
+      return { ok: false, error: "Invalid bot token" };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("telegram:checkAuth", async () => {
+    const token = await getTelegramToken();
+    return { authorized: !!token };
+  });
+
+  ipcMain.handle("telegram:disconnect", async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch { /* No settings */ }
+      
+      delete settings.telegramBotToken;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("telegram:test", async () => {
+    const token = await getTelegramToken();
+    if (!token) {
+      return { ok: false, error: "Telegram not connected" };
+    }
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+      const data = await response.json();
+      if (data.ok) {
+        return { ok: true, message: `Connected as @${data.result.username}` };
+      }
+      return { ok: false, error: "Token verification failed" };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Discord IPC Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("discord:startOAuth", async (_event, { clientId, clientSecret }) => {
+    return new Promise((resolve) => {
+      const redirectUri = "http://localhost:18923/oauth/callback";
+      const scopes = "identify guilds guilds.members.read messages.read bot";
+      
+      const authUrl = `https://discord.com/api/oauth2/authorize?` +
+        `client_id=${encodeURIComponent(clientId)}` +
+        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+        `&response_type=code` +
+        `&scope=${encodeURIComponent(scopes)}`;
+
+      const server = http.createServer(async (req, res) => {
+        const url = new URL(req.url, `http://localhost:18923`);
+        
+        if (url.pathname === "/oauth/callback") {
+          const code = url.searchParams.get("code");
+          const error = url.searchParams.get("error");
+
+          if (error) {
+            res.writeHead(200, { "Content-Type": "text/html" });
+            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
+            server.close();
+            resolve({ ok: false, error });
+            return;
+          }
+
+          if (code) {
+            try {
+              const tokenResponse = await fetch("https://discord.com/api/oauth2/token", {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: new URLSearchParams({
+                  code,
+                  client_id: clientId,
+                  client_secret: clientSecret,
+                  redirect_uri: redirectUri,
+                  grant_type: "authorization_code"
+                })
+              });
+
+              const tokenData = await tokenResponse.json();
+
+              if (tokenData.access_token) {
+                const settingsPath = await getSettingsPath(currentUser?.username);
+                let settings = {};
+                try {
+                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+                } catch { /* No existing settings */ }
+
+                settings.discordTokens = {
+                  access_token: tokenData.access_token,
+                  refresh_token: tokenData.refresh_token,
+                  expires_at: Date.now() + (tokenData.expires_in * 1000),
+                  client_id: clientId,
+                  client_secret: clientSecret
+                };
+
+                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
+                server.close();
+                resolve({ ok: true });
+              } else {
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
+                server.close();
+                resolve({ ok: false, error: tokenData.error_description || "Token exchange failed" });
+              }
+            } catch (err) {
+              res.writeHead(200, { "Content-Type": "text/html" });
+              res.end("<h1>Error</h1><p>" + err.message + "</p>");
+              server.close();
+              resolve({ ok: false, error: err.message });
+            }
+          }
+        }
+      });
+
+      server.listen(18923, () => {
+        require("electron").shell.openExternal(authUrl);
+      });
+    });
+  });
+
+  ipcMain.handle("discord:checkAuth", async () => {
+    const token = await getDiscordAccessToken();
+    return { authorized: !!token };
+  });
+
+  ipcMain.handle("discord:disconnect", async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch { /* No settings */ }
+      
+      delete settings.discordTokens;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("discord:test", async () => {
+    const token = await getDiscordAccessToken();
+    if (!token) {
+      return { ok: false, error: "Discord not connected" };
+    }
+    try {
+      const response = await fetch("https://discord.com/api/v10/users/@me", {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      const data = await response.json();
+      if (data.username) {
+        return { ok: true, message: `Connected as ${data.username}` };
+      }
+      return { ok: false, error: "Connection test failed" };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // X (Twitter) IPC Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("x:startOAuth", async (_event, { clientId, clientSecret }) => {
+    return new Promise((resolve) => {
+      const redirectUri = "http://localhost:18923/oauth/callback";
+      const scopes = "tweet.read tweet.write users.read dm.read dm.write offline.access";
+      const codeVerifier = require("crypto").randomBytes(32).toString("base64url");
+      const codeChallenge = require("crypto").createHash("sha256").update(codeVerifier).digest("base64url");
+      
+      const authUrl = `https://twitter.com/i/oauth2/authorize?` +
+        `response_type=code` +
+        `&client_id=${encodeURIComponent(clientId)}` +
+        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+        `&scope=${encodeURIComponent(scopes)}` +
+        `&state=state` +
+        `&code_challenge=${codeChallenge}` +
+        `&code_challenge_method=S256`;
+
+      const server = http.createServer(async (req, res) => {
+        const url = new URL(req.url, `http://localhost:18923`);
+        
+        if (url.pathname === "/oauth/callback") {
+          const code = url.searchParams.get("code");
+          const error = url.searchParams.get("error");
+
+          if (error) {
+            res.writeHead(200, { "Content-Type": "text/html" });
+            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
+            server.close();
+            resolve({ ok: false, error });
+            return;
+          }
+
+          if (code) {
+            try {
+              const tokenResponse = await fetch("https://api.twitter.com/2/oauth2/token", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                  "Authorization": `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`
+                },
+                body: new URLSearchParams({
+                  code,
+                  grant_type: "authorization_code",
+                  redirect_uri: redirectUri,
+                  code_verifier: codeVerifier
+                })
+              });
+
+              const tokenData = await tokenResponse.json();
+
+              if (tokenData.access_token) {
+                const settingsPath = await getSettingsPath(currentUser?.username);
+                let settings = {};
+                try {
+                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+                } catch { /* No existing settings */ }
+
+                settings.xTokens = {
+                  access_token: tokenData.access_token,
+                  refresh_token: tokenData.refresh_token,
+                  expires_at: Date.now() + (tokenData.expires_in * 1000),
+                  client_id: clientId,
+                  client_secret: clientSecret
+                };
+
+                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
+                server.close();
+                resolve({ ok: true });
+              } else {
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Token Exchange Failed</h1><p>" + (tokenData.error_description || "Unknown error") + "</p>");
+                server.close();
+                resolve({ ok: false, error: tokenData.error_description || "Token exchange failed" });
+              }
+            } catch (err) {
+              res.writeHead(200, { "Content-Type": "text/html" });
+              res.end("<h1>Error</h1><p>" + err.message + "</p>");
+              server.close();
+              resolve({ ok: false, error: err.message });
+            }
+          }
+        }
+      });
+
+      server.listen(18923, () => {
+        require("electron").shell.openExternal(authUrl);
+      });
+    });
+  });
+
+  ipcMain.handle("x:checkAuth", async () => {
+    const token = await getXAccessToken();
+    return { authorized: !!token };
+  });
+
+  ipcMain.handle("x:disconnect", async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch { /* No settings */ }
+      
+      delete settings.xTokens;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("x:test", async () => {
+    const token = await getXAccessToken();
+    if (!token) {
+      return { ok: false, error: "X not connected" };
+    }
+    try {
+      const response = await fetch("https://api.twitter.com/2/users/me", {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      const data = await response.json();
+      if (data.data?.username) {
+        return { ok: true, message: `Connected as @${data.data.username}` };
+      }
+      return { ok: false, error: "Connection test failed" };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Notion IPC Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("notion:startOAuth", async (_event, { clientId, clientSecret }) => {
+    return new Promise((resolve) => {
+      const redirectUri = "http://localhost:18923/oauth/callback";
+      
+      const authUrl = `https://api.notion.com/v1/oauth/authorize?` +
+        `client_id=${encodeURIComponent(clientId)}` +
+        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+        `&response_type=code` +
+        `&owner=user`;
+
+      const server = http.createServer(async (req, res) => {
+        const url = new URL(req.url, `http://localhost:18923`);
+        
+        if (url.pathname === "/oauth/callback") {
+          const code = url.searchParams.get("code");
+          const error = url.searchParams.get("error");
+
+          if (error) {
+            res.writeHead(200, { "Content-Type": "text/html" });
+            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
+            server.close();
+            resolve({ ok: false, error });
+            return;
+          }
+
+          if (code) {
+            try {
+              const tokenResponse = await fetch("https://api.notion.com/v1/oauth/token", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`
+                },
+                body: JSON.stringify({
+                  grant_type: "authorization_code",
+                  code,
+                  redirect_uri: redirectUri
+                })
+              });
+
+              const tokenData = await tokenResponse.json();
+
+              if (tokenData.access_token) {
+                const settingsPath = await getSettingsPath(currentUser?.username);
+                let settings = {};
+                try {
+                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+                } catch { /* No existing settings */ }
+
+                settings.notionTokens = {
+                  access_token: tokenData.access_token,
+                  workspace_name: tokenData.workspace_name,
+                  workspace_id: tokenData.workspace_id
+                };
+
+                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
+                server.close();
+                resolve({ ok: true, workspace: tokenData.workspace_name });
+              } else {
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
+                server.close();
+                resolve({ ok: false, error: tokenData.error || "Token exchange failed" });
+              }
+            } catch (err) {
+              res.writeHead(200, { "Content-Type": "text/html" });
+              res.end("<h1>Error</h1><p>" + err.message + "</p>");
+              server.close();
+              resolve({ ok: false, error: err.message });
+            }
+          }
+        }
+      });
+
+      server.listen(18923, () => {
+        require("electron").shell.openExternal(authUrl);
+      });
+    });
+  });
+
+  ipcMain.handle("notion:checkAuth", async () => {
+    const token = await getNotionAccessToken();
+    return { authorized: !!token };
+  });
+
+  ipcMain.handle("notion:disconnect", async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch { /* No settings */ }
+      
+      delete settings.notionTokens;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("notion:test", async () => {
+    const token = await getNotionAccessToken();
+    if (!token) {
+      return { ok: false, error: "Notion not connected" };
+    }
+    try {
+      const response = await fetch("https://api.notion.com/v1/users/me", {
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Notion-Version": "2022-06-28"
+        }
+      });
+      const data = await response.json();
+      if (data.name) {
+        return { ok: true, message: `Connected as ${data.name}` };
+      }
+      return { ok: false, error: "Connection test failed" };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // GitHub IPC Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("github:startOAuth", async (_event, { clientId, clientSecret }) => {
+    return new Promise((resolve) => {
+      const redirectUri = "http://localhost:18923/oauth/callback";
+      const scopes = "repo read:user notifications";
+      
+      const authUrl = `https://github.com/login/oauth/authorize?` +
+        `client_id=${encodeURIComponent(clientId)}` +
+        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+        `&scope=${encodeURIComponent(scopes)}`;
+
+      const server = http.createServer(async (req, res) => {
+        const url = new URL(req.url, `http://localhost:18923`);
+        
+        if (url.pathname === "/oauth/callback") {
+          const code = url.searchParams.get("code");
+          const error = url.searchParams.get("error");
+
+          if (error) {
+            res.writeHead(200, { "Content-Type": "text/html" });
+            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
+            server.close();
+            resolve({ ok: false, error });
+            return;
+          }
+
+          if (code) {
+            try {
+              const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Accept": "application/json"
+                },
+                body: JSON.stringify({
+                  client_id: clientId,
+                  client_secret: clientSecret,
+                  code
+                })
+              });
+
+              const tokenData = await tokenResponse.json();
+
+              if (tokenData.access_token) {
+                const settingsPath = await getSettingsPath(currentUser?.username);
+                let settings = {};
+                try {
+                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+                } catch { /* No existing settings */ }
+
+                settings.githubTokens = {
+                  access_token: tokenData.access_token,
+                  token_type: tokenData.token_type,
+                  scope: tokenData.scope
+                };
+
+                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
+                server.close();
+                resolve({ ok: true });
+              } else {
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
+                server.close();
+                resolve({ ok: false, error: tokenData.error_description || "Token exchange failed" });
+              }
+            } catch (err) {
+              res.writeHead(200, { "Content-Type": "text/html" });
+              res.end("<h1>Error</h1><p>" + err.message + "</p>");
+              server.close();
+              resolve({ ok: false, error: err.message });
+            }
+          }
+        }
+      });
+
+      server.listen(18923, () => {
+        require("electron").shell.openExternal(authUrl);
+      });
+    });
+  });
+
+  ipcMain.handle("github:checkAuth", async () => {
+    const token = await getGitHubAccessToken();
+    return { authorized: !!token };
+  });
+
+  ipcMain.handle("github:disconnect", async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch { /* No settings */ }
+      
+      delete settings.githubTokens;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("github:test", async () => {
+    const token = await getGitHubAccessToken();
+    if (!token) {
+      return { ok: false, error: "GitHub not connected" };
+    }
+    try {
+      const response = await fetch("https://api.github.com/user", {
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Accept": "application/vnd.github+json"
+        }
+      });
+      const data = await response.json();
+      if (data.login) {
+        return { ok: true, message: `Connected as @${data.login}` };
+      }
+      return { ok: false, error: "Connection test failed" };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Asana IPC Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("asana:startOAuth", async (_event, { clientId, clientSecret }) => {
+    return new Promise((resolve) => {
+      const redirectUri = "http://localhost:18923/oauth/callback";
+      
+      const authUrl = `https://app.asana.com/-/oauth_authorize?` +
+        `client_id=${encodeURIComponent(clientId)}` +
+        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+        `&response_type=code`;
+
+      const server = http.createServer(async (req, res) => {
+        const url = new URL(req.url, `http://localhost:18923`);
+        
+        if (url.pathname === "/oauth/callback") {
+          const code = url.searchParams.get("code");
+          const error = url.searchParams.get("error");
+
+          if (error) {
+            res.writeHead(200, { "Content-Type": "text/html" });
+            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
+            server.close();
+            resolve({ ok: false, error });
+            return;
+          }
+
+          if (code) {
+            try {
+              const tokenResponse = await fetch("https://app.asana.com/-/oauth_token", {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: new URLSearchParams({
+                  grant_type: "authorization_code",
+                  client_id: clientId,
+                  client_secret: clientSecret,
+                  redirect_uri: redirectUri,
+                  code
+                })
+              });
+
+              const tokenData = await tokenResponse.json();
+
+              if (tokenData.access_token) {
+                const settingsPath = await getSettingsPath(currentUser?.username);
+                let settings = {};
+                try {
+                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+                } catch { /* No existing settings */ }
+
+                settings.asanaTokens = {
+                  access_token: tokenData.access_token,
+                  refresh_token: tokenData.refresh_token,
+                  expires_at: Date.now() + (tokenData.expires_in * 1000),
+                  client_id: clientId,
+                  client_secret: clientSecret
+                };
+
+                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
+                server.close();
+                resolve({ ok: true });
+              } else {
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
+                server.close();
+                resolve({ ok: false, error: tokenData.error || "Token exchange failed" });
+              }
+            } catch (err) {
+              res.writeHead(200, { "Content-Type": "text/html" });
+              res.end("<h1>Error</h1><p>" + err.message + "</p>");
+              server.close();
+              resolve({ ok: false, error: err.message });
+            }
+          }
+        }
+      });
+
+      server.listen(18923, () => {
+        require("electron").shell.openExternal(authUrl);
+      });
+    });
+  });
+
+  ipcMain.handle("asana:checkAuth", async () => {
+    const token = await getAsanaAccessToken();
+    return { authorized: !!token };
+  });
+
+  ipcMain.handle("asana:disconnect", async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch { /* No settings */ }
+      
+      delete settings.asanaTokens;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("asana:test", async () => {
+    const token = await getAsanaAccessToken();
+    if (!token) {
+      return { ok: false, error: "Asana not connected" };
+    }
+    try {
+      const response = await fetch("https://app.asana.com/api/1.0/users/me", {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      const data = await response.json();
+      if (data.data?.name) {
+        return { ok: true, message: `Connected as ${data.data.name}` };
+      }
+      return { ok: false, error: "Connection test failed" };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Reddit IPC Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("reddit:startOAuth", async (_event, { clientId, clientSecret }) => {
+    return new Promise((resolve) => {
+      const redirectUri = "http://localhost:18923/oauth/callback";
+      const scopes = "identity read submit privatemessages history";
+      const state = require("crypto").randomBytes(16).toString("hex");
+      
+      const authUrl = `https://www.reddit.com/api/v1/authorize?` +
+        `client_id=${encodeURIComponent(clientId)}` +
+        `&response_type=code` +
+        `&state=${state}` +
+        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+        `&duration=permanent` +
+        `&scope=${encodeURIComponent(scopes)}`;
+
+      const server = http.createServer(async (req, res) => {
+        const url = new URL(req.url, `http://localhost:18923`);
+        
+        if (url.pathname === "/oauth/callback") {
+          const code = url.searchParams.get("code");
+          const error = url.searchParams.get("error");
+
+          if (error) {
+            res.writeHead(200, { "Content-Type": "text/html" });
+            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
+            server.close();
+            resolve({ ok: false, error });
+            return;
+          }
+
+          if (code) {
+            try {
+              const tokenResponse = await fetch("https://www.reddit.com/api/v1/access_token", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                  "Authorization": `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`
+                },
+                body: new URLSearchParams({
+                  grant_type: "authorization_code",
+                  code,
+                  redirect_uri: redirectUri
+                })
+              });
+
+              const tokenData = await tokenResponse.json();
+
+              if (tokenData.access_token) {
+                const settingsPath = await getSettingsPath(currentUser?.username);
+                let settings = {};
+                try {
+                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+                } catch { /* No existing settings */ }
+
+                settings.redditTokens = {
+                  access_token: tokenData.access_token,
+                  refresh_token: tokenData.refresh_token,
+                  expires_at: Date.now() + (tokenData.expires_in * 1000),
+                  client_id: clientId,
+                  client_secret: clientSecret
+                };
+
+                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
+                server.close();
+                resolve({ ok: true });
+              } else {
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
+                server.close();
+                resolve({ ok: false, error: tokenData.error || "Token exchange failed" });
+              }
+            } catch (err) {
+              res.writeHead(200, { "Content-Type": "text/html" });
+              res.end("<h1>Error</h1><p>" + err.message + "</p>");
+              server.close();
+              resolve({ ok: false, error: err.message });
+            }
+          }
+        }
+      });
+
+      server.listen(18923, () => {
+        require("electron").shell.openExternal(authUrl);
+      });
+    });
+  });
+
+  ipcMain.handle("reddit:checkAuth", async () => {
+    const token = await getRedditAccessToken();
+    return { authorized: !!token };
+  });
+
+  ipcMain.handle("reddit:disconnect", async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch { /* No settings */ }
+      
+      delete settings.redditTokens;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("reddit:test", async () => {
+    const token = await getRedditAccessToken();
+    if (!token) {
+      return { ok: false, error: "Reddit not connected" };
+    }
+    try {
+      const response = await fetch("https://oauth.reddit.com/api/v1/me", {
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "User-Agent": "Wovly/1.0"
+        }
+      });
+      const data = await response.json();
+      if (data.name) {
+        return { ok: true, message: `Connected as u/${data.name}` };
+      }
+      return { ok: false, error: "Connection test failed" };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Spotify IPC Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("spotify:startOAuth", async (_event, { clientId, clientSecret }) => {
+    return new Promise((resolve) => {
+      const redirectUri = "http://localhost:18923/oauth/callback";
+      const scopes = "user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private playlist-read-collaborative";
+      
+      const authUrl = `https://accounts.spotify.com/authorize?` +
+        `client_id=${encodeURIComponent(clientId)}` +
+        `&response_type=code` +
+        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+        `&scope=${encodeURIComponent(scopes)}`;
+
+      const server = http.createServer(async (req, res) => {
+        const url = new URL(req.url, `http://localhost:18923`);
+        
+        if (url.pathname === "/oauth/callback") {
+          const code = url.searchParams.get("code");
+          const error = url.searchParams.get("error");
+
+          if (error) {
+            res.writeHead(200, { "Content-Type": "text/html" });
+            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
+            server.close();
+            resolve({ ok: false, error });
+            return;
+          }
+
+          if (code) {
+            try {
+              const tokenResponse = await fetch("https://accounts.spotify.com/api/token", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                  "Authorization": `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`
+                },
+                body: new URLSearchParams({
+                  grant_type: "authorization_code",
+                  code,
+                  redirect_uri: redirectUri
+                })
+              });
+
+              const tokenData = await tokenResponse.json();
+
+              if (tokenData.access_token) {
+                const settingsPath = await getSettingsPath(currentUser?.username);
+                let settings = {};
+                try {
+                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+                } catch { /* No existing settings */ }
+
+                settings.spotifyTokens = {
+                  access_token: tokenData.access_token,
+                  refresh_token: tokenData.refresh_token,
+                  expires_at: Date.now() + (tokenData.expires_in * 1000),
+                  client_id: clientId,
+                  client_secret: clientSecret
+                };
+
+                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
+                server.close();
+                resolve({ ok: true });
+              } else {
+                res.writeHead(200, { "Content-Type": "text/html" });
+                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
+                server.close();
+                resolve({ ok: false, error: tokenData.error || "Token exchange failed" });
+              }
+            } catch (err) {
+              res.writeHead(200, { "Content-Type": "text/html" });
+              res.end("<h1>Error</h1><p>" + err.message + "</p>");
+              server.close();
+              resolve({ ok: false, error: err.message });
+            }
+          }
+        }
+      });
+
+      server.listen(18923, () => {
+        require("electron").shell.openExternal(authUrl);
+      });
+    });
+  });
+
+  ipcMain.handle("spotify:checkAuth", async () => {
+    const token = await getSpotifyAccessToken();
+    return { authorized: !!token };
+  });
+
+  ipcMain.handle("spotify:disconnect", async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      let settings = {};
+      try {
+        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      } catch { /* No settings */ }
+      
+      delete settings.spotifyTokens;
+      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("spotify:test", async () => {
+    const token = await getSpotifyAccessToken();
+    if (!token) {
+      return { ok: false, error: "Spotify not connected" };
+    }
+    try {
+      const response = await fetch("https://api.spotify.com/v1/me", {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      const data = await response.json();
+      if (data.display_name) {
+        return { ok: true, message: `Connected as ${data.display_name}` };
+      }
+      return { ok: false, error: "Connection test failed" };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // Task IPC Handlers
   // ─────────────────────────────────────────────────────────────────────────────
 
   ipcMain.handle("tasks:create", async (_event, taskData) => {
     try {
-      const task = await createTask(taskData);
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const task = await createTask(taskData, currentUser.username);
       
       // Send initial notification that task is starting
       if (win && win.webContents) {
@@ -4972,7 +6951,7 @@ Generate ONLY the welcome message, nothing else.`;
       // Auto-start the task immediately (same as when created from chat)
       setTimeout(async () => {
         console.log(`[Tasks] Auto-starting task from UI: ${task.id}`);
-        await executeTaskStep(task.id);
+        await executeTaskStep(task.id, currentUser.username);
       }, 100);
       
       return { ok: true, task };
@@ -4983,7 +6962,10 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("tasks:list", async () => {
     try {
-      const tasks = await listTasks();
+      if (!currentUser?.username) {
+        return { ok: true, tasks: [] };
+      }
+      const tasks = await listTasks(currentUser.username);
       return { ok: true, tasks };
     } catch (err) {
       return { ok: false, error: err.message };
@@ -4992,7 +6974,10 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("tasks:get", async (_event, taskId) => {
     try {
-      const task = await getTask(taskId);
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const task = await getTask(taskId, currentUser.username);
       if (!task) {
         return { ok: false, error: "Task not found" };
       }
@@ -5004,7 +6989,10 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("tasks:update", async (_event, { taskId, updates }) => {
     try {
-      const task = await updateTask(taskId, updates);
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const task = await updateTask(taskId, updates, currentUser.username);
       if (task.error) {
         return { ok: false, error: task.error };
       }
@@ -5016,7 +7004,10 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("tasks:cancel", async (_event, taskId) => {
     try {
-      const result = await cancelTask(taskId);
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const result = await cancelTask(taskId, currentUser.username);
       if (result.error) {
         return { ok: false, error: result.error };
       }
@@ -5028,7 +7019,10 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("tasks:hide", async (_event, taskId) => {
     try {
-      const result = await hideTask(taskId);
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const result = await hideTask(taskId, currentUser.username);
       if (result.error) {
         return { ok: false, error: result.error };
       }
@@ -5049,7 +7043,10 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("tasks:getRawMarkdown", async (_event, taskId) => {
     try {
-      const markdown = await getTaskRawMarkdown(taskId);
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const markdown = await getTaskRawMarkdown(taskId, currentUser.username);
       if (markdown.error) {
         return { ok: false, error: markdown.error };
       }
@@ -5061,7 +7058,10 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("tasks:saveRawMarkdown", async (_event, { taskId, markdown }) => {
     try {
-      const result = await saveTaskRawMarkdown(taskId, markdown);
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const result = await saveTaskRawMarkdown(taskId, markdown, currentUser.username);
       if (result.error) {
         return { ok: false, error: result.error };
       }
@@ -5073,7 +7073,10 @@ Generate ONLY the welcome message, nothing else.`;
 
   ipcMain.handle("tasks:execute", async (_event, taskId) => {
     try {
-      const result = await executeTaskStep(taskId);
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      const result = await executeTaskStep(taskId, currentUser.username);
       if (result.error) {
         return { ok: false, error: result.error };
       }
@@ -5090,7 +7093,7 @@ Generate ONLY the welcome message, nothing else.`;
   // Approve and send a pending message from a task
   ipcMain.handle("tasks:approvePendingMessage", async (_event, { taskId, messageId, editedMessage }) => {
     try {
-      const task = await getTask(taskId);
+      const task = await getTask(taskId, currentUser?.username);
       if (!task) {
         return { ok: false, error: "Task not found" };
       }
@@ -5158,7 +7161,75 @@ Generate ONLY the welcome message, nothing else.`;
       // Execute the actual send (bypass confirmation since user just approved)
       console.log(`[Tasks] Sending approved message: ${pendingMsg.toolName} to ${pendingMsg.recipient}`);
       
-      const { executeTool } = await loadIntegrationsAndBuildTools();
+      const { executeTool, slackAccessToken } = await loadIntegrationsAndBuildTools();
+      
+      // For Slack: resolve recipient name to user ID if needed
+      if (pendingMsg.toolName === 'send_slack_message' && toolInput.channel) {
+        const channel = toolInput.channel;
+        // Check if it's already a user/channel ID (starts with U, C, D, or G)
+        if (!/^[UCDG][A-Z0-9]+$/i.test(channel)) {
+          console.log(`[Tasks] Resolving Slack user name "${channel}" to user ID...`);
+          
+          // Check if we have the resolved ID stored in task context
+          // Also check waiting_for_contact context which may have the user ID from initial send
+          let storedUserId = task.contextMemory?.slack_user_id || 
+                             task.contextMemory?.[`slack_user_${channel.toLowerCase()}`];
+          
+          // If waiting_for_contact matches this recipient, check if we have their ID stored
+          const waitingFor = task.contextMemory?.waiting_for_contact;
+          if (!storedUserId && waitingFor) {
+            const waitingForLower = waitingFor.toLowerCase();
+            if (waitingForLower.includes(channel.toLowerCase()) || channel.toLowerCase().includes(waitingForLower.split(' ')[0])) {
+              // Might be the same person - check for stored ID
+              storedUserId = task.contextMemory?.waiting_for_user_id;
+            }
+          }
+          
+          if (storedUserId && /^[UCDG][A-Z0-9]+$/i.test(storedUserId)) {
+            console.log(`[Tasks] Using stored Slack user ID: ${storedUserId}`);
+            toolInput.channel = storedUserId;
+          } else if (slackAccessToken) {
+            // Need to resolve by searching users
+            try {
+              const usersResponse = await fetch(`https://slack.com/api/users.list?limit=200`, {
+                headers: { "Authorization": `Bearer ${slackAccessToken}` }
+              });
+              const usersData = await usersResponse.json();
+              
+              if (usersData.ok && usersData.members) {
+                const searchTerm = channel.toLowerCase();
+                const user = usersData.members.find(m => 
+                  m.name?.toLowerCase() === searchTerm ||
+                  m.real_name?.toLowerCase() === searchTerm ||
+                  m.name?.toLowerCase().includes(searchTerm) ||
+                  m.real_name?.toLowerCase().includes(searchTerm) ||
+                  m.profile?.display_name?.toLowerCase() === searchTerm ||
+                  m.profile?.display_name?.toLowerCase().includes(searchTerm)
+                );
+                
+                if (user) {
+                  console.log(`[Tasks] Resolved "${channel}" to Slack user: ${user.real_name} (${user.id})`);
+                  toolInput.channel = user.id;
+                  
+                  // Store for future use
+                  await updateTask(taskId, {
+                    contextMemory: {
+                      ...task.contextMemory,
+                      slack_user_id: user.id,
+                      [`slack_user_${channel.toLowerCase()}`]: user.id
+                    }
+                  });
+                } else {
+                  console.error(`[Tasks] Could not find Slack user matching "${channel}"`);
+                  return { ok: false, error: `Could not find Slack user "${channel}". Please use their exact Slack username or display name.` };
+                }
+              }
+            } catch (resolveErr) {
+              console.error(`[Tasks] Failed to resolve Slack user:`, resolveErr.message);
+            }
+          }
+        }
+      }
       
       // Temporarily remove the tool from confirmation list to bypass the check
       const toolIndex = TOOLS_REQUIRING_CONFIRMATION.indexOf(pendingMsg.toolName);
@@ -5167,8 +7238,45 @@ Generate ONLY the welcome message, nothing else.`;
       }
       
       let sendResult;
+      let sendSuccess = false;
+      let sendError = null;
+      
       try {
         sendResult = await executeTool(pendingMsg.toolName, toolInput);
+        
+        // Check if the send was actually successful
+        // Different tools return success differently
+        if (sendResult) {
+          if (typeof sendResult === 'object') {
+            // Check various success indicators
+            if (sendResult.ok === true || sendResult.success === true) {
+              sendSuccess = true;
+            } else if (sendResult.error || sendResult.ok === false) {
+              sendError = sendResult.error || sendResult.message || 'Send failed';
+            } else if (sendResult.messageId || sendResult.id || sendResult.ts) {
+              // Slack returns ts, email might return messageId
+              sendSuccess = true;
+            } else {
+              // If no clear error, assume success
+              sendSuccess = true;
+            }
+          } else if (typeof sendResult === 'string') {
+            // String result - check if it contains error indicators
+            if (sendResult.toLowerCase().includes('error') || sendResult.toLowerCase().includes('failed')) {
+              sendError = sendResult;
+            } else {
+              sendSuccess = true;
+            }
+          } else {
+            sendSuccess = true;
+          }
+        }
+        
+        console.log(`[Tasks] Send result: success=${sendSuccess}, error=${sendError}`, sendResult);
+        
+      } catch (err) {
+        sendError = err.message;
+        console.error(`[Tasks] Send failed with exception:`, err.message);
       } finally {
         // Re-add the tool to confirmation list
         if (toolIndex > -1 && !TOOLS_REQUIRING_CONFIRMATION.includes(pendingMsg.toolName)) {
@@ -5176,48 +7284,123 @@ Generate ONLY the welcome message, nothing else.`;
         }
       }
 
-      // Remove the pending message from task
+      // If send failed, keep the message for retry and notify user
+      if (!sendSuccess) {
+        task.lastUpdated = new Date().toISOString();
+        task.executionLog.push({
+          timestamp: new Date().toISOString(),
+          message: `FAILED to send ${pendingMsg.platform} message to ${pendingMsg.recipient}: ${sendError || 'Unknown error'}`
+        });
+        
+        // Save task with the failure logged (but keep pending message for retry)
+        const tasksDir = await getTasksDir(currentUser?.username);
+        const taskPath = path.join(tasksDir, `${taskId}.md`);
+        await fs.writeFile(taskPath, serializeTask(task), "utf8");
+        
+        addTaskUpdate(taskId, `Failed to send message to ${pendingMsg.recipient}: ${sendError}`, {
+          toChat: true,
+          emoji: "❌",
+          taskTitle: task.title
+        });
+        
+        return { ok: false, error: sendError || 'Failed to send message. Please try again.' };
+      }
+
+      // Send succeeded - remove the pending message
       task.pendingMessages.splice(messageIndex, 1);
       
-      // Update task status - if no more pending messages, advance to next step and resume
-      if (task.pendingMessages.length === 0) {
-        task.status = "active"; // Resume task execution
-        
-        // Advance to the next step since the current step's message was sent
-        const currentStep = task.currentStep.step;
-        const nextStep = currentStep + 1;
-        
-        if (nextStep <= task.plan.length) {
-          task.currentStep.step = nextStep;
-          task.currentStep.state = "executing";
-          console.log(`[Tasks] Message sent, advancing from step ${currentStep} to step ${nextStep}`);
-        } else {
-          // This was the last step - mark task as completed
-          task.status = "completed";
-          task.currentStep.state = "completed";
-          console.log(`[Tasks] Message sent on final step, marking task as completed`);
-        }
-      }
+      // Log the successful send
       task.lastUpdated = new Date().toISOString();
       task.executionLog.push({
         timestamp: new Date().toISOString(),
         message: `Sent ${pendingMsg.platform} message to ${pendingMsg.recipient}`
       });
+      
+      // CRITICAL: Do NOT auto-advance to next step just because message was sent
+      // The current step may require waiting for a response
+      // Check if the current step involves waiting for a response
+      const currentStepDesc = task.plan[task.currentStep.step - 1]?.toLowerCase() || '';
+      const isWaitingStep = currentStepDesc.includes('wait') || 
+                           currentStepDesc.includes('response') ||
+                           currentStepDesc.includes('reply') ||
+                           currentStepDesc.includes('follow up') ||
+                           currentStepDesc.includes('until');
+      
+      if (task.pendingMessages.length === 0) {
+        if (isWaitingStep) {
+          // This step requires waiting for a response - don't advance
+          task.status = "waiting";
+          task.currentStep.state = "waiting";
+          
+          // Capture conversation/thread ID from send result for thread-specific reply checking
+          // This ensures we only monitor replies in THIS conversation, not from other threads
+          const conversationId = sendResult?.chatId ||     // iMessage chat_id
+                                 sendResult?.channel ||    // Slack channel
+                                 sendResult?.threadId ||   // Email thread
+                                 null;
+          
+          // Store context about what we're waiting for
+          task.contextMemory = {
+            ...task.contextMemory,
+            waiting_via: pendingMsg.platform,
+            waiting_for_contact: pendingMsg.recipient,
+            last_message_time: new Date().toISOString(),
+            new_reply_detected: false,
+            // Store conversation ID for thread-specific reply checking
+            ...(conversationId ? { conversation_id: conversationId } : {})
+          };
+          
+          console.log(`[Tasks] Message sent for waiting step "${currentStepDesc}" - staying on step ${task.currentStep.step}, waiting for response${conversationId ? ` (conversation: ${conversationId})` : ''}`);
+          
+          task.executionLog.push({
+            timestamp: new Date().toISOString(),
+            message: `Waiting for response from ${pendingMsg.recipient} via ${pendingMsg.platform}`
+          });
+        } else {
+          // Non-waiting step - can advance (e.g., simple notification)
+          task.status = "active";
+          
+          const currentStep = task.currentStep.step;
+          const nextStep = currentStep + 1;
+          
+          if (nextStep <= task.plan.length) {
+            task.currentStep.step = nextStep;
+            task.currentStep.state = "executing";
+            console.log(`[Tasks] Message sent on non-waiting step, advancing from step ${currentStep} to step ${nextStep}`);
+          } else {
+            task.status = "completed";
+            task.currentStep.state = "completed";
+            console.log(`[Tasks] Message sent on final step, marking task as completed`);
+          }
+        }
+      }
 
       // Save task
-      const tasksDir = await getTasksDir();
+      const tasksDir = await getTasksDir(currentUser?.username);
       const taskPath = path.join(tasksDir, `${taskId}.md`);
       await fs.writeFile(taskPath, serializeTask(task), "utf8");
 
-      // Notify UI
-      addTaskUpdate(taskId, `Message sent to ${pendingMsg.recipient}`);
+      // Notify UI - always send to chat for visibility
+      const updateMessage = task.status === "completed"
+        ? `Task completed! Final message sent to ${pendingMsg.recipient}.`
+        : isWaitingStep
+          ? `Message sent to ${pendingMsg.recipient}. Waiting for their response...`
+          : `Message sent to ${pendingMsg.recipient}.`;
       
-      // If task is active, continue execution on the NEXT step
+      const updateEmoji = task.status === "completed" ? "✅" : "📤";
+      
+      addTaskUpdate(taskId, updateMessage, { 
+        toChat: true, 
+        emoji: updateEmoji, 
+        taskTitle: task.title 
+      });
+      
+      // Only continue execution if task is active (not waiting)
       if (task.status === "active") {
         setTimeout(() => executeTaskStep(taskId), 100);
       }
 
-      return { ok: true, sendResult };
+      return { ok: true, sendResult, waiting: task.status === "waiting" };
     } catch (err) {
       console.error(`[Tasks] Error approving message:`, err.message);
       return { ok: false, error: err.message };
@@ -5227,7 +7410,7 @@ Generate ONLY the welcome message, nothing else.`;
   // Reject/discard a pending message
   ipcMain.handle("tasks:rejectPendingMessage", async (_event, { taskId, messageId }) => {
     try {
-      const task = await getTask(taskId);
+      const task = await getTask(taskId, currentUser?.username);
       if (!task) {
         return { ok: false, error: "Task not found" };
       }
@@ -5267,12 +7450,20 @@ Generate ONLY the welcome message, nothing else.`;
       });
 
       // Save task
-      const tasksDir = await getTasksDir();
+      const tasksDir = await getTasksDir(currentUser?.username);
       const taskPath = path.join(tasksDir, `${taskId}.md`);
       await fs.writeFile(taskPath, serializeTask(task), "utf8");
 
-      // Notify UI
-      addTaskUpdate(taskId, `Message discarded (user rejected)`);
+      // Notify UI - send to chat
+      const discardMessage = task.status === "completed"
+        ? `Task completed (message was skipped).`
+        : `Message to ${pendingMsg.recipient} was discarded. Continuing to next step...`;
+      
+      addTaskUpdate(taskId, discardMessage, {
+        toChat: true,
+        emoji: "⏭️",
+        taskTitle: task.title
+      });
       
       // Continue task execution on the next step
       if (task.status === "active") {
@@ -5288,7 +7479,7 @@ Generate ONLY the welcome message, nothing else.`;
   // Set auto-send preference for a task
   ipcMain.handle("tasks:setAutoSend", async (_event, { taskId, autoSend }) => {
     try {
-      const task = await getTask(taskId);
+      const task = await getTask(taskId, currentUser?.username);
       if (!task) {
         return { ok: false, error: "Task not found" };
       }
@@ -5301,7 +7492,7 @@ Generate ONLY the welcome message, nothing else.`;
       });
 
       // Save task
-      const tasksDir = await getTasksDir();
+      const tasksDir = await getTasksDir(currentUser?.username);
       const taskPath = path.join(tasksDir, `${taskId}.md`);
       await fs.writeFile(taskPath, serializeTask(task), "utf8");
 
@@ -5449,10 +7640,49 @@ Generate ONLY the welcome message, nothing else.`;
     };
   });
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Telegram Interface Handlers (Chat via Telegram, similar to WhatsApp)
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("telegramInterface:connect", async () => {
+    try {
+      await connectTelegramInterface();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("telegramInterface:disconnect", async () => {
+    try {
+      await disconnectTelegramInterface();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("telegramInterface:getStatus", async () => {
+    return {
+      ok: true,
+      status: telegramInterfaceStatus
+    };
+  });
+
+  ipcMain.handle("telegramInterface:checkAuth", async () => {
+    // Check if bot token is configured
+    const botToken = await getTelegramToken();
+    return {
+      ok: true,
+      hasBot: !!botToken,
+      connected: telegramInterfaceStatus === "connected"
+    };
+  });
+
   // Clear Google authorization (to force re-auth with new scopes)
   ipcMain.handle("integrations:disconnectGoogle", async () => {
     try {
-      const settingsPath = await getSettingsPath();
+      const settingsPath = await getSettingsPath(currentUser?.username);
       let settings = {};
       try {
         settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
@@ -5621,8 +7851,11 @@ Generate ONLY the welcome message, nothing else.`;
 
   // Memory search execution function
   const executeMemorySearch = async (query, dateRange = "all") => {
-    const dailyDir = await getMemoryDailyDir();
-    const longtermDir = await getMemoryLongtermDir();
+    if (!currentUser?.username) {
+      return { error: "Not logged in" };
+    }
+    const dailyDir = await getMemoryDailyDir(currentUser.username);
+    const longtermDir = await getMemoryLongtermDir(currentUser.username);
     const results = [];
     const queryLower = query.toLowerCase();
 
@@ -5714,6 +7947,133 @@ Generate ONLY the welcome message, nothing else.`;
       totalMatches: results.length,
       results: results.slice(0, 10) // Limit to 10 most recent matching days
     };
+  };
+
+  // Documentation tools - for answering user questions about how to use Wovly
+  const documentationTools = [
+    {
+      name: "fetch_documentation",
+      description: "Fetch Wovly documentation to answer user questions about how to use features. Use when user asks detailed questions about skills, tasks, integrations, settings, troubleshooting, or how to do something specific in Wovly. Examples: 'how do I create a custom skill?', 'explain how tasks work', 'how do I connect Slack?'",
+      input_schema: {
+        type: "object",
+        properties: {
+          topic: { 
+            type: "string", 
+            description: "The topic to look up. Common topics: skills, tasks, integrations, chat, memory, settings, installation, troubleshooting, google-workspace, slack, imessage, whatsapp, browser-automation, credentials, security, faq" 
+          }
+        },
+        required: ["topic"]
+      }
+    }
+  ];
+
+  // Documentation fetch execution function
+  const executeDocumentationFetch = async (topic) => {
+    try {
+      // Fetch the llms.txt index to find the right page
+      const indexRes = await fetch("https://wovly.mintlify.app/llms.txt");
+      if (!indexRes.ok) {
+        return { error: "Could not fetch documentation index" };
+      }
+      const index = await indexRes.text();
+      
+      // Normalize topic for matching
+      const topicLower = topic.toLowerCase().trim();
+      const lines = index.split('\n');
+      
+      // Find matching doc URLs based on topic
+      const matches = [];
+      for (const line of lines) {
+        const lineLower = line.toLowerCase();
+        // Check if the line contains the topic and has a URL
+        if (lineLower.includes(topicLower) && line.includes('https://')) {
+          const urlMatch = line.match(/https:\/\/[^\s\)]+/);
+          if (urlMatch) {
+            matches.push(urlMatch[0]);
+          }
+        }
+      }
+      
+      // If no direct match, try partial matches
+      if (matches.length === 0) {
+        // Map common search terms to doc pages
+        const topicMap = {
+          'skill': 'skills',
+          'task': 'tasks',
+          'integration': 'overview',
+          'google': 'google-workspace',
+          'gmail': 'google-workspace',
+          'calendar': 'google-workspace',
+          'slack': 'slack',
+          'imessage': 'imessage',
+          'text': 'imessage',
+          'sms': 'imessage',
+          'whatsapp': 'whatsapp',
+          'browser': 'browser-automation',
+          'credential': 'credentials',
+          'login': 'credentials',
+          'memory': 'memory',
+          'profile': 'memory',
+          'setting': 'settings',
+          'security': 'security',
+          'privacy': 'security',
+          'faq': 'faq',
+          'help': 'faq',
+          'troubleshoot': 'troubleshooting',
+          'error': 'troubleshooting',
+          'install': 'installation',
+          'setup': 'quickstart',
+          'start': 'quickstart',
+          'voice': 'voice-mimic',
+          'mimic': 'voice-mimic',
+          'style': 'voice-mimic'
+        };
+        
+        // Find the mapped topic
+        for (const [key, value] of Object.entries(topicMap)) {
+          if (topicLower.includes(key)) {
+            // Find the URL containing this value
+            for (const line of lines) {
+              if (line.toLowerCase().includes(value) && line.includes('https://')) {
+                const urlMatch = line.match(/https:\/\/[^\s\)]+/);
+                if (urlMatch) {
+                  matches.push(urlMatch[0]);
+                  break;
+                }
+              }
+            }
+            break;
+          }
+        }
+      }
+      
+      if (matches.length === 0) {
+        // Return the full index so the LLM can help the user
+        return { 
+          found: false, 
+          message: `No specific documentation found for "${topic}". Available topics in the documentation:`,
+          index: index
+        };
+      }
+      
+      // Fetch the first matching doc page
+      const docUrl = matches[0];
+      const docRes = await fetch(docUrl);
+      if (!docRes.ok) {
+        return { error: `Could not fetch documentation page: ${docUrl}` };
+      }
+      const docContent = await docRes.text();
+      
+      return {
+        found: true,
+        topic: topic,
+        url: docUrl,
+        content: docContent
+      };
+    } catch (err) {
+      console.error("[Documentation] Fetch error:", err.message);
+      return { error: `Failed to fetch documentation: ${err.message}` };
+    }
   };
 
   // iMessage tools
@@ -6310,6 +8670,1816 @@ Generate ONLY the welcome message, nothing else.`;
     }
   };
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Telegram Integration
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Get Telegram bot token from settings
+  const getTelegramToken = async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      return settings.telegramBotToken || null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Telegram tools
+  const telegramTools = [
+    {
+      name: "send_telegram_message",
+      description: "Send a message via Telegram bot. Always confirm with user before sending.",
+      input_schema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat ID or username (e.g., @username or numeric chat ID)" },
+          message: { type: "string", description: "Message text to send" }
+        },
+        required: ["chat_id", "message"]
+      }
+    },
+    {
+      name: "get_telegram_updates",
+      description: "Get recent messages received by the Telegram bot.",
+      input_schema: {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "Number of updates to fetch (default 20, max 100)" }
+        },
+        required: []
+      }
+    },
+    {
+      name: "get_telegram_chat_info",
+      description: "Get information about a Telegram chat or user.",
+      input_schema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat ID or username" }
+        },
+        required: ["chat_id"]
+      }
+    }
+  ];
+
+  // Execute Telegram tool
+  const executeTelegramTool = async (toolName, toolInput) => {
+    const botToken = await getTelegramToken();
+    if (!botToken) {
+      return { error: "Telegram not connected. Please set up Telegram in the Integrations page." };
+    }
+
+    const baseUrl = `https://api.telegram.org/bot${botToken}`;
+
+    try {
+      switch (toolName) {
+        case "send_telegram_message": {
+          const response = await fetch(`${baseUrl}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: toolInput.chat_id,
+              text: toolInput.message,
+              parse_mode: "Markdown"
+            })
+          });
+          const data = await response.json();
+          if (!data.ok) {
+            return { error: data.description || "Failed to send message" };
+          }
+          return { success: true, message: `Message sent to ${toolInput.chat_id}`, message_id: data.result.message_id };
+        }
+
+        case "get_telegram_updates": {
+          const limit = Math.min(toolInput.limit || 20, 100);
+          const response = await fetch(`${baseUrl}/getUpdates?limit=${limit}`);
+          const data = await response.json();
+          if (!data.ok) {
+            return { error: data.description || "Failed to get updates" };
+          }
+          return {
+            updates: data.result.map(u => ({
+              update_id: u.update_id,
+              message: u.message ? {
+                message_id: u.message.message_id,
+                from: u.message.from?.first_name || u.message.from?.username,
+                chat_id: u.message.chat.id,
+                chat_type: u.message.chat.type,
+                text: u.message.text,
+                date: new Date(u.message.date * 1000).toISOString()
+              } : null
+            })).filter(u => u.message)
+          };
+        }
+
+        case "get_telegram_chat_info": {
+          const response = await fetch(`${baseUrl}/getChat?chat_id=${encodeURIComponent(toolInput.chat_id)}`);
+          const data = await response.json();
+          if (!data.ok) {
+            return { error: data.description || "Failed to get chat info" };
+          }
+          return {
+            chat: {
+              id: data.result.id,
+              type: data.result.type,
+              title: data.result.title,
+              username: data.result.username,
+              first_name: data.result.first_name,
+              last_name: data.result.last_name,
+              description: data.result.description
+            }
+          };
+        }
+
+        default:
+          return { error: `Unknown Telegram tool: ${toolName}` };
+      }
+    } catch (err) {
+      console.error(`[Telegram] Error executing ${toolName}:`, err.message);
+      return { error: err.message };
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Discord Integration
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Get Discord access token from settings
+  const getDiscordAccessToken = async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      if (!settings.discordTokens) return null;
+      
+      // Check if token needs refresh
+      if (settings.discordTokens.expires_at && Date.now() > settings.discordTokens.expires_at - 60000) {
+        // Refresh the token
+        const refreshed = await refreshDiscordToken(settings.discordTokens);
+        if (refreshed) {
+          settings.discordTokens = refreshed;
+          await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+          return refreshed.access_token;
+        }
+        return null;
+      }
+      return settings.discordTokens.access_token;
+    } catch {
+      return null;
+    }
+  };
+
+  const refreshDiscordToken = async (tokens) => {
+    try {
+      const response = await fetch("https://discord.com/api/oauth2/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: tokens.client_id,
+          client_secret: tokens.client_secret,
+          grant_type: "refresh_token",
+          refresh_token: tokens.refresh_token
+        })
+      });
+      const data = await response.json();
+      if (data.access_token) {
+        return {
+          ...tokens,
+          access_token: data.access_token,
+          refresh_token: data.refresh_token || tokens.refresh_token,
+          expires_at: Date.now() + (data.expires_in * 1000)
+        };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Discord tools
+  const discordTools = [
+    {
+      name: "send_discord_message",
+      description: "Send a message to a Discord channel or DM. Always confirm with user before sending.",
+      input_schema: {
+        type: "object",
+        properties: {
+          channel_id: { type: "string", description: "Channel ID or user ID for DM" },
+          message: { type: "string", description: "Message content to send" }
+        },
+        required: ["channel_id", "message"]
+      }
+    },
+    {
+      name: "get_discord_messages",
+      description: "Get recent messages from a Discord channel.",
+      input_schema: {
+        type: "object",
+        properties: {
+          channel_id: { type: "string", description: "Channel ID" },
+          limit: { type: "number", description: "Number of messages to fetch (default 20, max 100)" }
+        },
+        required: ["channel_id"]
+      }
+    },
+    {
+      name: "list_discord_channels",
+      description: "List channels in a Discord server (guild).",
+      input_schema: {
+        type: "object",
+        properties: {
+          guild_id: { type: "string", description: "Server/Guild ID" }
+        },
+        required: ["guild_id"]
+      }
+    },
+    {
+      name: "list_discord_servers",
+      description: "List Discord servers (guilds) the bot/user has access to.",
+      input_schema: {
+        type: "object",
+        properties: {},
+        required: []
+      }
+    }
+  ];
+
+  // Execute Discord tool
+  const executeDiscordTool = async (toolName, toolInput, accessToken) => {
+    if (!accessToken) {
+      return { error: "Discord not connected. Please set up Discord in the Integrations page." };
+    }
+
+    const baseUrl = "https://discord.com/api/v10";
+    const headers = { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" };
+
+    try {
+      switch (toolName) {
+        case "send_discord_message": {
+          const response = await fetch(`${baseUrl}/channels/${toolInput.channel_id}/messages`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ content: toolInput.message })
+          });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.message || "Failed to send message" };
+          }
+          const data = await response.json();
+          return { success: true, message: `Message sent`, message_id: data.id };
+        }
+
+        case "get_discord_messages": {
+          const limit = Math.min(toolInput.limit || 20, 100);
+          const response = await fetch(`${baseUrl}/channels/${toolInput.channel_id}/messages?limit=${limit}`, { headers });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.message || "Failed to get messages" };
+          }
+          const messages = await response.json();
+          return {
+            messages: messages.map(m => ({
+              id: m.id,
+              content: m.content,
+              author: m.author.username,
+              timestamp: m.timestamp
+            }))
+          };
+        }
+
+        case "list_discord_channels": {
+          const response = await fetch(`${baseUrl}/guilds/${toolInput.guild_id}/channels`, { headers });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.message || "Failed to list channels" };
+          }
+          const channels = await response.json();
+          return {
+            channels: channels.filter(c => c.type === 0 || c.type === 2).map(c => ({
+              id: c.id,
+              name: c.name,
+              type: c.type === 0 ? "text" : "voice"
+            }))
+          };
+        }
+
+        case "list_discord_servers": {
+          const response = await fetch(`${baseUrl}/users/@me/guilds`, { headers });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.message || "Failed to list servers" };
+          }
+          const guilds = await response.json();
+          return {
+            servers: guilds.map(g => ({
+              id: g.id,
+              name: g.name,
+              icon: g.icon
+            }))
+          };
+        }
+
+        default:
+          return { error: `Unknown Discord tool: ${toolName}` };
+      }
+    } catch (err) {
+      console.error(`[Discord] Error executing ${toolName}:`, err.message);
+      return { error: err.message };
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // X (Twitter) Integration
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Get X access token from settings
+  const getXAccessToken = async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      if (!settings.xTokens) return null;
+      
+      // Check if token needs refresh
+      if (settings.xTokens.expires_at && Date.now() > settings.xTokens.expires_at - 60000) {
+        const refreshed = await refreshXToken(settings.xTokens);
+        if (refreshed) {
+          settings.xTokens = refreshed;
+          await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+          return refreshed.access_token;
+        }
+        return null;
+      }
+      return settings.xTokens.access_token;
+    } catch {
+      return null;
+    }
+  };
+
+  const refreshXToken = async (tokens) => {
+    try {
+      const response = await fetch("https://api.twitter.com/2/oauth2/token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Authorization": `Basic ${Buffer.from(`${tokens.client_id}:${tokens.client_secret}`).toString("base64")}`
+        },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: tokens.refresh_token
+        })
+      });
+      const data = await response.json();
+      if (data.access_token) {
+        return {
+          ...tokens,
+          access_token: data.access_token,
+          refresh_token: data.refresh_token || tokens.refresh_token,
+          expires_at: Date.now() + (data.expires_in * 1000)
+        };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  // X tools
+  const xTools = [
+    {
+      name: "post_tweet",
+      description: "Post a tweet to X (Twitter). Always confirm with user before posting.",
+      input_schema: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "Tweet text (max 280 characters)" },
+          reply_to: { type: "string", description: "Tweet ID to reply to (optional)" }
+        },
+        required: ["text"]
+      }
+    },
+    {
+      name: "get_x_timeline",
+      description: "Get recent tweets from your home timeline.",
+      input_schema: {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "Number of tweets to fetch (default 20, max 100)" }
+        },
+        required: []
+      }
+    },
+    {
+      name: "get_x_mentions",
+      description: "Get recent mentions of your account.",
+      input_schema: {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "Number of mentions to fetch (default 20)" }
+        },
+        required: []
+      }
+    },
+    {
+      name: "search_x_tweets",
+      description: "Search for tweets on X.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query" },
+          limit: { type: "number", description: "Number of results (default 20, max 100)" }
+        },
+        required: ["query"]
+      }
+    },
+    {
+      name: "send_x_dm",
+      description: "Send a direct message on X. Always confirm with user before sending.",
+      input_schema: {
+        type: "object",
+        properties: {
+          recipient_id: { type: "string", description: "User ID of the recipient" },
+          message: { type: "string", description: "Message text" }
+        },
+        required: ["recipient_id", "message"]
+      }
+    }
+  ];
+
+  // Execute X tool
+  const executeXTool = async (toolName, toolInput, accessToken) => {
+    if (!accessToken) {
+      return { error: "X (Twitter) not connected. Please set up X in the Integrations page." };
+    }
+
+    const baseUrl = "https://api.twitter.com/2";
+    const headers = { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" };
+
+    try {
+      switch (toolName) {
+        case "post_tweet": {
+          const body = { text: toolInput.text };
+          if (toolInput.reply_to) {
+            body.reply = { in_reply_to_tweet_id: toolInput.reply_to };
+          }
+          const response = await fetch(`${baseUrl}/tweets`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body)
+          });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.detail || err.title || "Failed to post tweet" };
+          }
+          const data = await response.json();
+          return { success: true, tweet_id: data.data.id, message: "Tweet posted successfully" };
+        }
+
+        case "get_x_timeline": {
+          const limit = Math.min(toolInput.limit || 20, 100);
+          const response = await fetch(`${baseUrl}/users/me/timelines/reverse_chronological?max_results=${limit}&tweet.fields=created_at,author_id,text`, { headers });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.detail || "Failed to get timeline" };
+          }
+          const data = await response.json();
+          return {
+            tweets: (data.data || []).map(t => ({
+              id: t.id,
+              text: t.text,
+              created_at: t.created_at,
+              author_id: t.author_id
+            }))
+          };
+        }
+
+        case "get_x_mentions": {
+          // First get user ID
+          const meResponse = await fetch(`${baseUrl}/users/me`, { headers });
+          if (!meResponse.ok) {
+            return { error: "Failed to get user info" };
+          }
+          const meData = await meResponse.json();
+          const userId = meData.data.id;
+          
+          const limit = Math.min(toolInput.limit || 20, 100);
+          const response = await fetch(`${baseUrl}/users/${userId}/mentions?max_results=${limit}&tweet.fields=created_at,author_id,text`, { headers });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.detail || "Failed to get mentions" };
+          }
+          const data = await response.json();
+          return {
+            mentions: (data.data || []).map(t => ({
+              id: t.id,
+              text: t.text,
+              created_at: t.created_at,
+              author_id: t.author_id
+            }))
+          };
+        }
+
+        case "search_x_tweets": {
+          const limit = Math.min(toolInput.limit || 20, 100);
+          const response = await fetch(`${baseUrl}/tweets/search/recent?query=${encodeURIComponent(toolInput.query)}&max_results=${limit}&tweet.fields=created_at,author_id,text`, { headers });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.detail || "Failed to search tweets" };
+          }
+          const data = await response.json();
+          return {
+            tweets: (data.data || []).map(t => ({
+              id: t.id,
+              text: t.text,
+              created_at: t.created_at,
+              author_id: t.author_id
+            }))
+          };
+        }
+
+        case "send_x_dm": {
+          const response = await fetch(`${baseUrl}/dm_conversations/with/${toolInput.recipient_id}/messages`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ text: toolInput.message })
+          });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.detail || "Failed to send DM" };
+          }
+          const data = await response.json();
+          return { success: true, message: "DM sent successfully", dm_id: data.data?.dm_event_id };
+        }
+
+        default:
+          return { error: `Unknown X tool: ${toolName}` };
+      }
+    } catch (err) {
+      console.error(`[X] Error executing ${toolName}:`, err.message);
+      return { error: err.message };
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Notion Integration
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Get Notion access token from settings
+  const getNotionAccessToken = async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      return settings.notionTokens?.access_token || null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Notion tools
+  const notionTools = [
+    {
+      name: "search_notion",
+      description: "Search for pages and databases in Notion.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query" },
+          filter: { type: "string", enum: ["page", "database"], description: "Filter by object type (optional)" }
+        },
+        required: []
+      }
+    },
+    {
+      name: "get_notion_page",
+      description: "Get the content of a Notion page.",
+      input_schema: {
+        type: "object",
+        properties: {
+          page_id: { type: "string", description: "The page ID" }
+        },
+        required: ["page_id"]
+      }
+    },
+    {
+      name: "create_notion_page",
+      description: "Create a new page in Notion.",
+      input_schema: {
+        type: "object",
+        properties: {
+          parent_id: { type: "string", description: "Parent page or database ID" },
+          title: { type: "string", description: "Page title" },
+          content: { type: "string", description: "Page content (plain text)" }
+        },
+        required: ["parent_id", "title"]
+      }
+    },
+    {
+      name: "query_notion_database",
+      description: "Query a Notion database.",
+      input_schema: {
+        type: "object",
+        properties: {
+          database_id: { type: "string", description: "Database ID" },
+          filter: { type: "object", description: "Filter object (optional)" },
+          sorts: { type: "array", description: "Sort array (optional)" }
+        },
+        required: ["database_id"]
+      }
+    },
+    {
+      name: "create_notion_database_item",
+      description: "Add a new item to a Notion database.",
+      input_schema: {
+        type: "object",
+        properties: {
+          database_id: { type: "string", description: "Database ID" },
+          properties: { type: "object", description: "Property values for the new item" }
+        },
+        required: ["database_id", "properties"]
+      }
+    }
+  ];
+
+  // Execute Notion tool
+  const executeNotionTool = async (toolName, toolInput, accessToken) => {
+    if (!accessToken) {
+      return { error: "Notion not connected. Please set up Notion in the Integrations page." };
+    }
+
+    const baseUrl = "https://api.notion.com/v1";
+    const headers = {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      "Notion-Version": "2022-06-28"
+    };
+
+    try {
+      switch (toolName) {
+        case "search_notion": {
+          const body = {};
+          if (toolInput.query) body.query = toolInput.query;
+          if (toolInput.filter) body.filter = { value: toolInput.filter, property: "object" };
+          
+          const response = await fetch(`${baseUrl}/search`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body)
+          });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.message || "Search failed" };
+          }
+          const data = await response.json();
+          return {
+            results: data.results.slice(0, 20).map(r => ({
+              id: r.id,
+              type: r.object,
+              title: r.properties?.title?.title?.[0]?.plain_text || r.properties?.Name?.title?.[0]?.plain_text || "Untitled",
+              url: r.url
+            }))
+          };
+        }
+
+        case "get_notion_page": {
+          // Get page metadata
+          const pageResponse = await fetch(`${baseUrl}/pages/${toolInput.page_id}`, { headers });
+          if (!pageResponse.ok) {
+            const err = await pageResponse.json();
+            return { error: err.message || "Failed to get page" };
+          }
+          const page = await pageResponse.json();
+          
+          // Get page content (blocks)
+          const blocksResponse = await fetch(`${baseUrl}/blocks/${toolInput.page_id}/children?page_size=100`, { headers });
+          const blocks = blocksResponse.ok ? await blocksResponse.json() : { results: [] };
+          
+          return {
+            page: {
+              id: page.id,
+              title: page.properties?.title?.title?.[0]?.plain_text || "Untitled",
+              url: page.url,
+              created_time: page.created_time,
+              last_edited_time: page.last_edited_time
+            },
+            content: blocks.results.map(b => ({
+              type: b.type,
+              text: b[b.type]?.rich_text?.map(t => t.plain_text).join("") || ""
+            })).filter(b => b.text)
+          };
+        }
+
+        case "create_notion_page": {
+          const body = {
+            parent: { page_id: toolInput.parent_id },
+            properties: {
+              title: { title: [{ text: { content: toolInput.title } }] }
+            }
+          };
+          
+          if (toolInput.content) {
+            body.children = [{
+              object: "block",
+              type: "paragraph",
+              paragraph: {
+                rich_text: [{ type: "text", text: { content: toolInput.content } }]
+              }
+            }];
+          }
+          
+          const response = await fetch(`${baseUrl}/pages`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body)
+          });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.message || "Failed to create page" };
+          }
+          const data = await response.json();
+          return { success: true, page_id: data.id, url: data.url };
+        }
+
+        case "query_notion_database": {
+          const body = {};
+          if (toolInput.filter) body.filter = toolInput.filter;
+          if (toolInput.sorts) body.sorts = toolInput.sorts;
+          
+          const response = await fetch(`${baseUrl}/databases/${toolInput.database_id}/query`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body)
+          });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.message || "Query failed" };
+          }
+          const data = await response.json();
+          return {
+            results: data.results.slice(0, 50).map(r => ({
+              id: r.id,
+              properties: Object.fromEntries(
+                Object.entries(r.properties).map(([key, val]) => [
+                  key,
+                  val.title?.[0]?.plain_text || val.rich_text?.[0]?.plain_text || val.number || val.select?.name || val.date?.start || val.checkbox || JSON.stringify(val)
+                ])
+              )
+            }))
+          };
+        }
+
+        case "create_notion_database_item": {
+          const response = await fetch(`${baseUrl}/pages`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              parent: { database_id: toolInput.database_id },
+              properties: toolInput.properties
+            })
+          });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.message || "Failed to create item" };
+          }
+          const data = await response.json();
+          return { success: true, id: data.id, url: data.url };
+        }
+
+        default:
+          return { error: `Unknown Notion tool: ${toolName}` };
+      }
+    } catch (err) {
+      console.error(`[Notion] Error executing ${toolName}:`, err.message);
+      return { error: err.message };
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // GitHub Integration
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Get GitHub access token from settings
+  const getGitHubAccessToken = async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      return settings.githubTokens?.access_token || null;
+    } catch {
+      return null;
+    }
+  };
+
+  // GitHub tools
+  const githubTools = [
+    {
+      name: "list_github_repos",
+      description: "List repositories for the authenticated user.",
+      input_schema: {
+        type: "object",
+        properties: {
+          type: { type: "string", enum: ["all", "owner", "member"], description: "Type of repos (default: all)" },
+          sort: { type: "string", enum: ["created", "updated", "pushed", "full_name"], description: "Sort by" }
+        },
+        required: []
+      }
+    },
+    {
+      name: "get_github_issues",
+      description: "Get issues from a repository.",
+      input_schema: {
+        type: "object",
+        properties: {
+          owner: { type: "string", description: "Repository owner" },
+          repo: { type: "string", description: "Repository name" },
+          state: { type: "string", enum: ["open", "closed", "all"], description: "Issue state (default: open)" }
+        },
+        required: ["owner", "repo"]
+      }
+    },
+    {
+      name: "create_github_issue",
+      description: "Create an issue in a repository.",
+      input_schema: {
+        type: "object",
+        properties: {
+          owner: { type: "string", description: "Repository owner" },
+          repo: { type: "string", description: "Repository name" },
+          title: { type: "string", description: "Issue title" },
+          body: { type: "string", description: "Issue body/description" },
+          labels: { type: "array", items: { type: "string" }, description: "Labels to add" }
+        },
+        required: ["owner", "repo", "title"]
+      }
+    },
+    {
+      name: "get_github_prs",
+      description: "Get pull requests from a repository.",
+      input_schema: {
+        type: "object",
+        properties: {
+          owner: { type: "string", description: "Repository owner" },
+          repo: { type: "string", description: "Repository name" },
+          state: { type: "string", enum: ["open", "closed", "all"], description: "PR state (default: open)" }
+        },
+        required: ["owner", "repo"]
+      }
+    },
+    {
+      name: "search_github_code",
+      description: "Search for code on GitHub.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query (can include qualifiers like repo:owner/name)" }
+        },
+        required: ["query"]
+      }
+    },
+    {
+      name: "get_github_notifications",
+      description: "Get notifications for the authenticated user.",
+      input_schema: {
+        type: "object",
+        properties: {
+          all: { type: "boolean", description: "Show all notifications (default: false, shows only unread)" }
+        },
+        required: []
+      }
+    }
+  ];
+
+  // Execute GitHub tool
+  const executeGitHubTool = async (toolName, toolInput, accessToken) => {
+    if (!accessToken) {
+      return { error: "GitHub not connected. Please set up GitHub in the Integrations page." };
+    }
+
+    const baseUrl = "https://api.github.com";
+    const headers = {
+      "Authorization": `Bearer ${accessToken}`,
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28"
+    };
+
+    try {
+      switch (toolName) {
+        case "list_github_repos": {
+          const params = new URLSearchParams();
+          if (toolInput.type) params.set("type", toolInput.type);
+          if (toolInput.sort) params.set("sort", toolInput.sort);
+          params.set("per_page", "30");
+          
+          const response = await fetch(`${baseUrl}/user/repos?${params}`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to list repos" };
+          }
+          const repos = await response.json();
+          return {
+            repos: repos.map(r => ({
+              name: r.full_name,
+              description: r.description,
+              private: r.private,
+              stars: r.stargazers_count,
+              language: r.language,
+              updated_at: r.updated_at
+            }))
+          };
+        }
+
+        case "get_github_issues": {
+          const state = toolInput.state || "open";
+          const response = await fetch(`${baseUrl}/repos/${toolInput.owner}/${toolInput.repo}/issues?state=${state}&per_page=30`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to get issues" };
+          }
+          const issues = await response.json();
+          return {
+            issues: issues.filter(i => !i.pull_request).map(i => ({
+              number: i.number,
+              title: i.title,
+              state: i.state,
+              author: i.user.login,
+              labels: i.labels.map(l => l.name),
+              created_at: i.created_at
+            }))
+          };
+        }
+
+        case "create_github_issue": {
+          const body = {
+            title: toolInput.title,
+            body: toolInput.body || ""
+          };
+          if (toolInput.labels) body.labels = toolInput.labels;
+          
+          const response = await fetch(`${baseUrl}/repos/${toolInput.owner}/${toolInput.repo}/issues`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body)
+          });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.message || "Failed to create issue" };
+          }
+          const issue = await response.json();
+          return { success: true, number: issue.number, url: issue.html_url };
+        }
+
+        case "get_github_prs": {
+          const state = toolInput.state || "open";
+          const response = await fetch(`${baseUrl}/repos/${toolInput.owner}/${toolInput.repo}/pulls?state=${state}&per_page=30`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to get PRs" };
+          }
+          const prs = await response.json();
+          return {
+            pull_requests: prs.map(pr => ({
+              number: pr.number,
+              title: pr.title,
+              state: pr.state,
+              author: pr.user.login,
+              created_at: pr.created_at,
+              merged: pr.merged_at !== null
+            }))
+          };
+        }
+
+        case "search_github_code": {
+          const response = await fetch(`${baseUrl}/search/code?q=${encodeURIComponent(toolInput.query)}&per_page=20`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to search code" };
+          }
+          const data = await response.json();
+          return {
+            results: data.items.map(i => ({
+              name: i.name,
+              path: i.path,
+              repo: i.repository.full_name,
+              url: i.html_url
+            }))
+          };
+        }
+
+        case "get_github_notifications": {
+          const all = toolInput.all ? "true" : "false";
+          const response = await fetch(`${baseUrl}/notifications?all=${all}&per_page=30`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to get notifications" };
+          }
+          const notifications = await response.json();
+          return {
+            notifications: notifications.map(n => ({
+              id: n.id,
+              reason: n.reason,
+              unread: n.unread,
+              title: n.subject.title,
+              type: n.subject.type,
+              repo: n.repository.full_name,
+              updated_at: n.updated_at
+            }))
+          };
+        }
+
+        default:
+          return { error: `Unknown GitHub tool: ${toolName}` };
+      }
+    } catch (err) {
+      console.error(`[GitHub] Error executing ${toolName}:`, err.message);
+      return { error: err.message };
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Asana Integration
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Get Asana access token from settings
+  const getAsanaAccessToken = async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      if (!settings.asanaTokens) return null;
+      
+      // Check if token needs refresh
+      if (settings.asanaTokens.expires_at && Date.now() > settings.asanaTokens.expires_at - 60000) {
+        const refreshed = await refreshAsanaToken(settings.asanaTokens);
+        if (refreshed) {
+          settings.asanaTokens = refreshed;
+          await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+          return refreshed.access_token;
+        }
+        return null;
+      }
+      return settings.asanaTokens.access_token;
+    } catch {
+      return null;
+    }
+  };
+
+  const refreshAsanaToken = async (tokens) => {
+    try {
+      const response = await fetch("https://app.asana.com/-/oauth_token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          client_id: tokens.client_id,
+          client_secret: tokens.client_secret,
+          refresh_token: tokens.refresh_token
+        })
+      });
+      const data = await response.json();
+      if (data.access_token) {
+        return {
+          ...tokens,
+          access_token: data.access_token,
+          refresh_token: data.refresh_token || tokens.refresh_token,
+          expires_at: Date.now() + (data.expires_in * 1000)
+        };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Asana tools
+  const asanaTools = [
+    {
+      name: "list_asana_workspaces",
+      description: "List Asana workspaces the user has access to.",
+      input_schema: {
+        type: "object",
+        properties: {},
+        required: []
+      }
+    },
+    {
+      name: "list_asana_projects",
+      description: "List projects in an Asana workspace.",
+      input_schema: {
+        type: "object",
+        properties: {
+          workspace_id: { type: "string", description: "Workspace ID" }
+        },
+        required: ["workspace_id"]
+      }
+    },
+    {
+      name: "get_asana_tasks",
+      description: "Get tasks from an Asana project.",
+      input_schema: {
+        type: "object",
+        properties: {
+          project_id: { type: "string", description: "Project ID" },
+          completed: { type: "boolean", description: "Include completed tasks (default: false)" }
+        },
+        required: ["project_id"]
+      }
+    },
+    {
+      name: "create_asana_task",
+      description: "Create a task in Asana.",
+      input_schema: {
+        type: "object",
+        properties: {
+          project_id: { type: "string", description: "Project ID to add the task to" },
+          name: { type: "string", description: "Task name" },
+          notes: { type: "string", description: "Task description/notes" },
+          due_on: { type: "string", description: "Due date (YYYY-MM-DD format)" },
+          assignee: { type: "string", description: "Assignee user ID or email" }
+        },
+        required: ["project_id", "name"]
+      }
+    },
+    {
+      name: "update_asana_task",
+      description: "Update an existing Asana task.",
+      input_schema: {
+        type: "object",
+        properties: {
+          task_id: { type: "string", description: "Task ID" },
+          name: { type: "string", description: "New task name" },
+          notes: { type: "string", description: "New notes" },
+          due_on: { type: "string", description: "New due date" },
+          completed: { type: "boolean", description: "Mark as completed" }
+        },
+        required: ["task_id"]
+      }
+    },
+    {
+      name: "complete_asana_task",
+      description: "Mark an Asana task as complete.",
+      input_schema: {
+        type: "object",
+        properties: {
+          task_id: { type: "string", description: "Task ID to complete" }
+        },
+        required: ["task_id"]
+      }
+    }
+  ];
+
+  // Execute Asana tool
+  const executeAsanaTool = async (toolName, toolInput, accessToken) => {
+    if (!accessToken) {
+      return { error: "Asana not connected. Please set up Asana in the Integrations page." };
+    }
+
+    const baseUrl = "https://app.asana.com/api/1.0";
+    const headers = {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    };
+
+    try {
+      switch (toolName) {
+        case "list_asana_workspaces": {
+          const response = await fetch(`${baseUrl}/workspaces`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to list workspaces" };
+          }
+          const data = await response.json();
+          return {
+            workspaces: data.data.map(w => ({
+              id: w.gid,
+              name: w.name
+            }))
+          };
+        }
+
+        case "list_asana_projects": {
+          const response = await fetch(`${baseUrl}/workspaces/${toolInput.workspace_id}/projects`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to list projects" };
+          }
+          const data = await response.json();
+          return {
+            projects: data.data.map(p => ({
+              id: p.gid,
+              name: p.name
+            }))
+          };
+        }
+
+        case "get_asana_tasks": {
+          const completed = toolInput.completed ? "true" : "false";
+          const response = await fetch(`${baseUrl}/projects/${toolInput.project_id}/tasks?opt_fields=name,notes,due_on,completed,assignee.name&completed_since=${completed === "true" ? "now" : ""}`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to get tasks" };
+          }
+          const data = await response.json();
+          return {
+            tasks: data.data.map(t => ({
+              id: t.gid,
+              name: t.name,
+              notes: t.notes,
+              due_on: t.due_on,
+              completed: t.completed,
+              assignee: t.assignee?.name
+            }))
+          };
+        }
+
+        case "create_asana_task": {
+          const taskData = {
+            name: toolInput.name,
+            projects: [toolInput.project_id]
+          };
+          if (toolInput.notes) taskData.notes = toolInput.notes;
+          if (toolInput.due_on) taskData.due_on = toolInput.due_on;
+          if (toolInput.assignee) taskData.assignee = toolInput.assignee;
+          
+          const response = await fetch(`${baseUrl}/tasks`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ data: taskData })
+          });
+          if (!response.ok) {
+            const err = await response.json();
+            return { error: err.errors?.[0]?.message || "Failed to create task" };
+          }
+          const data = await response.json();
+          return { success: true, task_id: data.data.gid, name: data.data.name };
+        }
+
+        case "update_asana_task": {
+          const taskData = {};
+          if (toolInput.name) taskData.name = toolInput.name;
+          if (toolInput.notes !== undefined) taskData.notes = toolInput.notes;
+          if (toolInput.due_on) taskData.due_on = toolInput.due_on;
+          if (toolInput.completed !== undefined) taskData.completed = toolInput.completed;
+          
+          const response = await fetch(`${baseUrl}/tasks/${toolInput.task_id}`, {
+            method: "PUT",
+            headers,
+            body: JSON.stringify({ data: taskData })
+          });
+          if (!response.ok) {
+            return { error: "Failed to update task" };
+          }
+          return { success: true, message: "Task updated" };
+        }
+
+        case "complete_asana_task": {
+          const response = await fetch(`${baseUrl}/tasks/${toolInput.task_id}`, {
+            method: "PUT",
+            headers,
+            body: JSON.stringify({ data: { completed: true } })
+          });
+          if (!response.ok) {
+            return { error: "Failed to complete task" };
+          }
+          return { success: true, message: "Task marked as complete" };
+        }
+
+        default:
+          return { error: `Unknown Asana tool: ${toolName}` };
+      }
+    } catch (err) {
+      console.error(`[Asana] Error executing ${toolName}:`, err.message);
+      return { error: err.message };
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Reddit Integration
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Get Reddit access token from settings
+  const getRedditAccessToken = async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      if (!settings.redditTokens) return null;
+      
+      // Check if token needs refresh
+      if (settings.redditTokens.expires_at && Date.now() > settings.redditTokens.expires_at - 60000) {
+        const refreshed = await refreshRedditToken(settings.redditTokens);
+        if (refreshed) {
+          settings.redditTokens = refreshed;
+          await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+          return refreshed.access_token;
+        }
+        return null;
+      }
+      return settings.redditTokens.access_token;
+    } catch {
+      return null;
+    }
+  };
+
+  const refreshRedditToken = async (tokens) => {
+    try {
+      const response = await fetch("https://www.reddit.com/api/v1/access_token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Authorization": `Basic ${Buffer.from(`${tokens.client_id}:${tokens.client_secret}`).toString("base64")}`
+        },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: tokens.refresh_token
+        })
+      });
+      const data = await response.json();
+      if (data.access_token) {
+        return {
+          ...tokens,
+          access_token: data.access_token,
+          refresh_token: data.refresh_token || tokens.refresh_token,
+          expires_at: Date.now() + (data.expires_in * 1000)
+        };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Reddit tools
+  const redditTools = [
+    {
+      name: "get_reddit_feed",
+      description: "Get posts from Reddit home feed.",
+      input_schema: {
+        type: "object",
+        properties: {
+          sort: { type: "string", enum: ["hot", "new", "top", "rising"], description: "Sort order (default: hot)" },
+          limit: { type: "number", description: "Number of posts (default 25, max 100)" }
+        },
+        required: []
+      }
+    },
+    {
+      name: "get_subreddit_posts",
+      description: "Get posts from a specific subreddit.",
+      input_schema: {
+        type: "object",
+        properties: {
+          subreddit: { type: "string", description: "Subreddit name (without r/)" },
+          sort: { type: "string", enum: ["hot", "new", "top", "rising"], description: "Sort order" },
+          limit: { type: "number", description: "Number of posts (default 25)" }
+        },
+        required: ["subreddit"]
+      }
+    },
+    {
+      name: "get_reddit_comments",
+      description: "Get comments on a Reddit post.",
+      input_schema: {
+        type: "object",
+        properties: {
+          post_id: { type: "string", description: "Post ID (the thing after t3_)" },
+          subreddit: { type: "string", description: "Subreddit name" },
+          limit: { type: "number", description: "Number of comments (default 25)" }
+        },
+        required: ["post_id", "subreddit"]
+      }
+    },
+    {
+      name: "create_reddit_post",
+      description: "Create a post on Reddit. Always confirm with user before posting.",
+      input_schema: {
+        type: "object",
+        properties: {
+          subreddit: { type: "string", description: "Subreddit to post to" },
+          title: { type: "string", description: "Post title" },
+          text: { type: "string", description: "Post text (for self posts)" },
+          url: { type: "string", description: "URL to link (for link posts)" }
+        },
+        required: ["subreddit", "title"]
+      }
+    },
+    {
+      name: "create_reddit_comment",
+      description: "Add a comment to a Reddit post. Always confirm with user before posting.",
+      input_schema: {
+        type: "object",
+        properties: {
+          parent_id: { type: "string", description: "Parent thing ID (t1_ for comment, t3_ for post)" },
+          text: { type: "string", description: "Comment text" }
+        },
+        required: ["parent_id", "text"]
+      }
+    },
+    {
+      name: "get_reddit_messages",
+      description: "Get Reddit inbox messages.",
+      input_schema: {
+        type: "object",
+        properties: {
+          where: { type: "string", enum: ["inbox", "unread", "sent"], description: "Message location (default: inbox)" }
+        },
+        required: []
+      }
+    }
+  ];
+
+  // Execute Reddit tool
+  const executeRedditTool = async (toolName, toolInput, accessToken) => {
+    if (!accessToken) {
+      return { error: "Reddit not connected. Please set up Reddit in the Integrations page." };
+    }
+
+    const baseUrl = "https://oauth.reddit.com";
+    const headers = {
+      "Authorization": `Bearer ${accessToken}`,
+      "User-Agent": "Wovly/1.0"
+    };
+
+    try {
+      switch (toolName) {
+        case "get_reddit_feed": {
+          const sort = toolInput.sort || "hot";
+          const limit = Math.min(toolInput.limit || 25, 100);
+          const response = await fetch(`${baseUrl}/${sort}?limit=${limit}`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to get feed" };
+          }
+          const data = await response.json();
+          return {
+            posts: data.data.children.map(p => ({
+              id: p.data.id,
+              title: p.data.title,
+              subreddit: p.data.subreddit,
+              author: p.data.author,
+              score: p.data.score,
+              num_comments: p.data.num_comments,
+              url: p.data.url,
+              selftext: p.data.selftext?.slice(0, 500)
+            }))
+          };
+        }
+
+        case "get_subreddit_posts": {
+          const sort = toolInput.sort || "hot";
+          const limit = Math.min(toolInput.limit || 25, 100);
+          const response = await fetch(`${baseUrl}/r/${toolInput.subreddit}/${sort}?limit=${limit}`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to get subreddit posts" };
+          }
+          const data = await response.json();
+          return {
+            posts: data.data.children.map(p => ({
+              id: p.data.id,
+              title: p.data.title,
+              author: p.data.author,
+              score: p.data.score,
+              num_comments: p.data.num_comments,
+              url: p.data.url,
+              selftext: p.data.selftext?.slice(0, 500)
+            }))
+          };
+        }
+
+        case "get_reddit_comments": {
+          const limit = Math.min(toolInput.limit || 25, 100);
+          const response = await fetch(`${baseUrl}/r/${toolInput.subreddit}/comments/${toolInput.post_id}?limit=${limit}`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to get comments" };
+          }
+          const data = await response.json();
+          const comments = data[1]?.data?.children || [];
+          return {
+            comments: comments.filter(c => c.kind === "t1").map(c => ({
+              id: c.data.id,
+              author: c.data.author,
+              body: c.data.body?.slice(0, 500),
+              score: c.data.score,
+              created_utc: c.data.created_utc
+            }))
+          };
+        }
+
+        case "create_reddit_post": {
+          const formData = new URLSearchParams();
+          formData.append("sr", toolInput.subreddit);
+          formData.append("title", toolInput.title);
+          formData.append("kind", toolInput.url ? "link" : "self");
+          if (toolInput.url) formData.append("url", toolInput.url);
+          if (toolInput.text) formData.append("text", toolInput.text);
+          
+          const response = await fetch(`${baseUrl}/api/submit`, {
+            method: "POST",
+            headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
+            body: formData
+          });
+          if (!response.ok) {
+            return { error: "Failed to create post" };
+          }
+          const data = await response.json();
+          if (data.json?.errors?.length > 0) {
+            return { error: data.json.errors[0][1] };
+          }
+          return { success: true, url: data.json?.data?.url, id: data.json?.data?.id };
+        }
+
+        case "create_reddit_comment": {
+          const formData = new URLSearchParams();
+          formData.append("thing_id", toolInput.parent_id);
+          formData.append("text", toolInput.text);
+          
+          const response = await fetch(`${baseUrl}/api/comment`, {
+            method: "POST",
+            headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
+            body: formData
+          });
+          if (!response.ok) {
+            return { error: "Failed to create comment" };
+          }
+          const data = await response.json();
+          if (data.json?.errors?.length > 0) {
+            return { error: data.json.errors[0][1] };
+          }
+          return { success: true, message: "Comment posted" };
+        }
+
+        case "get_reddit_messages": {
+          const where = toolInput.where || "inbox";
+          const response = await fetch(`${baseUrl}/message/${where}`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to get messages" };
+          }
+          const data = await response.json();
+          return {
+            messages: data.data.children.map(m => ({
+              id: m.data.id,
+              subject: m.data.subject,
+              author: m.data.author,
+              body: m.data.body?.slice(0, 500),
+              created_utc: m.data.created_utc,
+              new: m.data.new
+            }))
+          };
+        }
+
+        default:
+          return { error: `Unknown Reddit tool: ${toolName}` };
+      }
+    } catch (err) {
+      console.error(`[Reddit] Error executing ${toolName}:`, err.message);
+      return { error: err.message };
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Spotify Integration
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Get Spotify access token from settings
+  const getSpotifyAccessToken = async () => {
+    try {
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      if (!settings.spotifyTokens) return null;
+      
+      // Check if token needs refresh
+      if (settings.spotifyTokens.expires_at && Date.now() > settings.spotifyTokens.expires_at - 60000) {
+        const refreshed = await refreshSpotifyToken(settings.spotifyTokens);
+        if (refreshed) {
+          settings.spotifyTokens = refreshed;
+          await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+          return refreshed.access_token;
+        }
+        return null;
+      }
+      return settings.spotifyTokens.access_token;
+    } catch {
+      return null;
+    }
+  };
+
+  const refreshSpotifyToken = async (tokens) => {
+    try {
+      const response = await fetch("https://accounts.spotify.com/api/token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Authorization": `Basic ${Buffer.from(`${tokens.client_id}:${tokens.client_secret}`).toString("base64")}`
+        },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: tokens.refresh_token
+        })
+      });
+      const data = await response.json();
+      if (data.access_token) {
+        return {
+          ...tokens,
+          access_token: data.access_token,
+          expires_at: Date.now() + (data.expires_in * 1000)
+        };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Spotify tools
+  const spotifyTools = [
+    {
+      name: "get_spotify_now_playing",
+      description: "Get the currently playing track on Spotify.",
+      input_schema: {
+        type: "object",
+        properties: {},
+        required: []
+      }
+    },
+    {
+      name: "spotify_play",
+      description: "Start or resume playback on Spotify. Requires Spotify Premium.",
+      input_schema: {
+        type: "object",
+        properties: {
+          uri: { type: "string", description: "Spotify URI to play (optional, resumes current if not specified)" }
+        },
+        required: []
+      }
+    },
+    {
+      name: "spotify_pause",
+      description: "Pause Spotify playback. Requires Spotify Premium.",
+      input_schema: {
+        type: "object",
+        properties: {},
+        required: []
+      }
+    },
+    {
+      name: "spotify_next",
+      description: "Skip to next track on Spotify. Requires Spotify Premium.",
+      input_schema: {
+        type: "object",
+        properties: {},
+        required: []
+      }
+    },
+    {
+      name: "spotify_previous",
+      description: "Go to previous track on Spotify. Requires Spotify Premium.",
+      input_schema: {
+        type: "object",
+        properties: {},
+        required: []
+      }
+    },
+    {
+      name: "search_spotify",
+      description: "Search for tracks, artists, albums, or playlists on Spotify.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query" },
+          type: { type: "string", enum: ["track", "artist", "album", "playlist"], description: "Type to search for (default: track)" },
+          limit: { type: "number", description: "Number of results (default 10, max 50)" }
+        },
+        required: ["query"]
+      }
+    },
+    {
+      name: "get_spotify_playlists",
+      description: "Get the user's Spotify playlists.",
+      input_schema: {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "Number of playlists (default 20, max 50)" }
+        },
+        required: []
+      }
+    }
+  ];
+
+  // Execute Spotify tool
+  const executeSpotifyTool = async (toolName, toolInput, accessToken) => {
+    if (!accessToken) {
+      return { error: "Spotify not connected. Please set up Spotify in the Integrations page." };
+    }
+
+    const baseUrl = "https://api.spotify.com/v1";
+    const headers = {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    };
+
+    try {
+      switch (toolName) {
+        case "get_spotify_now_playing": {
+          const response = await fetch(`${baseUrl}/me/player/currently-playing`, { headers });
+          if (response.status === 204) {
+            return { playing: false, message: "Nothing currently playing" };
+          }
+          if (!response.ok) {
+            return { error: "Failed to get now playing" };
+          }
+          const data = await response.json();
+          return {
+            playing: data.is_playing,
+            track: {
+              name: data.item?.name,
+              artist: data.item?.artists?.map(a => a.name).join(", "),
+              album: data.item?.album?.name,
+              duration_ms: data.item?.duration_ms,
+              progress_ms: data.progress_ms
+            }
+          };
+        }
+
+        case "spotify_play": {
+          const body = toolInput.uri ? { uris: [toolInput.uri] } : undefined;
+          const response = await fetch(`${baseUrl}/me/player/play`, {
+            method: "PUT",
+            headers,
+            body: body ? JSON.stringify(body) : undefined
+          });
+          if (response.status === 204 || response.ok) {
+            return { success: true, message: "Playback started" };
+          }
+          const err = await response.json();
+          return { error: err.error?.message || "Failed to start playback" };
+        }
+
+        case "spotify_pause": {
+          const response = await fetch(`${baseUrl}/me/player/pause`, {
+            method: "PUT",
+            headers
+          });
+          if (response.status === 204 || response.ok) {
+            return { success: true, message: "Playback paused" };
+          }
+          return { error: "Failed to pause playback" };
+        }
+
+        case "spotify_next": {
+          const response = await fetch(`${baseUrl}/me/player/next`, {
+            method: "POST",
+            headers
+          });
+          if (response.status === 204 || response.ok) {
+            return { success: true, message: "Skipped to next track" };
+          }
+          return { error: "Failed to skip track" };
+        }
+
+        case "spotify_previous": {
+          const response = await fetch(`${baseUrl}/me/player/previous`, {
+            method: "POST",
+            headers
+          });
+          if (response.status === 204 || response.ok) {
+            return { success: true, message: "Went to previous track" };
+          }
+          return { error: "Failed to go to previous track" };
+        }
+
+        case "search_spotify": {
+          const type = toolInput.type || "track";
+          const limit = Math.min(toolInput.limit || 10, 50);
+          const response = await fetch(`${baseUrl}/search?q=${encodeURIComponent(toolInput.query)}&type=${type}&limit=${limit}`, { headers });
+          if (!response.ok) {
+            return { error: "Search failed" };
+          }
+          const data = await response.json();
+          const key = `${type}s`;
+          return {
+            results: (data[key]?.items || []).map(item => ({
+              name: item.name,
+              uri: item.uri,
+              ...(type === "track" ? { artist: item.artists?.map(a => a.name).join(", "), album: item.album?.name } : {}),
+              ...(type === "artist" ? { genres: item.genres, followers: item.followers?.total } : {}),
+              ...(type === "album" ? { artist: item.artists?.map(a => a.name).join(", "), release_date: item.release_date } : {}),
+              ...(type === "playlist" ? { owner: item.owner?.display_name, tracks: item.tracks?.total } : {})
+            }))
+          };
+        }
+
+        case "get_spotify_playlists": {
+          const limit = Math.min(toolInput.limit || 20, 50);
+          const response = await fetch(`${baseUrl}/me/playlists?limit=${limit}`, { headers });
+          if (!response.ok) {
+            return { error: "Failed to get playlists" };
+          }
+          const data = await response.json();
+          return {
+            playlists: data.items.map(p => ({
+              id: p.id,
+              name: p.name,
+              uri: p.uri,
+              tracks: p.tracks?.total,
+              public: p.public
+            }))
+          };
+        }
+
+        default:
+          return { error: `Unknown Spotify tool: ${toolName}` };
+      }
+    } catch (err) {
+      console.error(`[Spotify] Error executing ${toolName}:`, err.message);
+      return { error: err.message };
+    }
+  };
+
   // Task tools - for creating and managing background tasks
   const taskTools = [
     {
@@ -6322,8 +10492,8 @@ Generate ONLY the welcome message, nothing else.`;
           originalRequest: { type: "string", description: "The user's original request verbatim - copy exactly what they said" },
           messagingChannel: { 
             type: "string", 
-            enum: ["imessage", "email", "slack"],
-            description: "REQUIRED: Which messaging channel to use. Detect from keywords in user's request: 'text'/'message'/'sms' = imessage, 'email'/'mail' = email, 'slack' = slack" 
+            enum: ["imessage", "email", "slack", "telegram", "discord", "x"],
+            description: "REQUIRED: Which messaging channel to use. Detect from keywords in user's request: 'text'/'message'/'sms' = imessage, 'email'/'mail' = email, 'slack' = slack, 'telegram' = telegram, 'discord' = discord, 'tweet'/'x'/'twitter' = x" 
           },
           plan: { 
             type: "array", 
@@ -6390,7 +10560,7 @@ Generate ONLY the welcome message, nothing else.`;
           };
         }
         case "list_tasks": {
-          const tasks = await listTasks();
+          const tasks = await listTasks(currentUser?.username);
           return {
             tasks: tasks.map(t => ({
               id: t.id,
@@ -6633,7 +10803,7 @@ Generate ONLY the welcome message, nothing else.`;
   // Execute profile tool
   const executeProfileTool = async (toolName, toolInput) => {
     try {
-      const profilePath = await getUserProfilePath();
+      const profilePath = await getUserProfilePath(currentUser?.username);
       const markdown = await fs.readFile(profilePath, "utf8");
       const profile = parseUserProfile(markdown);
 
@@ -7035,7 +11205,7 @@ Generate ONLY the welcome message, nothing else.`;
               end tell
             `;
 
-            exec(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, { timeout: 15000 }, (error, stdout) => {
+            exec(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, { timeout: 15000 }, async (error, stdout) => {
               if (error) {
                 console.error(`[iMessage] Send failed: ${error.message}`);
                 resolve({ error: `Failed to send message: ${error.message}` });
@@ -7043,10 +11213,18 @@ Generate ONLY the welcome message, nothing else.`;
                 resolve({ error: `Could not find a conversation with "${recipient}". They may not be in your Messages contacts.` });
               } else {
                 console.log(`[iMessage] Message sent successfully to ${recipient}`);
+                
+                // Capture the chat_id for this conversation so we can track replies in THIS thread only
+                const chatId = await getIMessageChatId(recipient);
+                if (chatId) {
+                  console.log(`[iMessage] Captured chat_id ${chatId} for conversation with ${recipient}`);
+                }
+                
                 resolve({ 
                   success: true, 
                   message: `Message sent to ${originalRecipient}${originalRecipient !== recipient ? ` (${recipient})` : ""}`,
-                  sentTo: recipient
+                  sentTo: recipient,
+                  chatId: chatId  // Include chat_id for thread-specific reply tracking
                 });
               }
             });
@@ -7068,7 +11246,7 @@ Generate ONLY the welcome message, nothing else.`;
   setTaskExecutor(async (taskId) => {
     console.log(`[Tasks] Executing step for task: ${taskId}`);
     
-    const task = await getTask(taskId);
+    const task = await getTask(taskId, currentUser?.username);
     if (!task) {
       console.error(`[Tasks] Task ${taskId} not found`);
       return { error: "Task not found" };
@@ -7081,7 +11259,7 @@ Generate ONLY the welcome message, nothing else.`;
     }
 
     // Get settings for API keys
-    const settingsPath = await getSettingsPath();
+    const settingsPath = await getSettingsPath(currentUser?.username);
     let apiKeys = {};
     try {
       const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
@@ -7146,7 +11324,10 @@ Generate ONLY the welcome message, nothing else.`;
     const channelTools = {
       imessage: "send_imessage (for text/SMS)",
       email: "send_email (for email/Gmail)",
-      slack: "send_slack_message (for Slack)"
+      slack: "send_slack_message (for Slack)",
+      telegram: "send_telegram_message (for Telegram)",
+      discord: "send_discord_message (for Discord)",
+      x: "post_tweet or send_x_dm (for X/Twitter)"
     };
     
     // Check for skill constraints
@@ -7181,18 +11362,26 @@ ${task.executionLog.slice(-3).map(e => `- ${e.message}`).join("\n") || "Task jus
 
 INSTRUCTIONS:
 1. Execute the CURRENT STEP using the available tools
-2. After completing the step's action, ALWAYS call update_task_state to:
-   - Log what you did in logMessage - BE DETAILED AND USER-FRIENDLY. The user sees this in chat!
-   - Set nextStatus: "waiting" if waiting for a response, "active" to continue immediately, "completed" if all done
-   - Set nextStep to current step + 1 if advancing
-   - Set pollIntervalMs if waiting (e.g., 60000 = 1 minute - lightweight checks are free)
-   - Save any important info in contextUpdates
+2. ***MANDATORY*** After completing the step's action, you MUST call update_task_state with:
+   - logMessage: A DETAILED summary of what you found/did. This is shown to the user!
+   - nextStatus: "waiting" if waiting for a response, "active" to continue, "completed" if all done
+   - nextStep: current step + 1 if advancing
+   - pollIntervalMs: if waiting (e.g., 60000 = 1 minute)
+   - contextUpdates: Save any important info for later steps
+
+*** YOU MUST ALWAYS CALL update_task_state - DO NOT END WITHOUT IT ***
 
 CRITICAL - User Notifications:
 - The logMessage you provide in update_task_state is shown directly to the user in the chat
 - ALWAYS write logMessage as if speaking to the user: "I sent an email to X asking about Y" or "I found the calendar link in Chris's message: [link]"
 - Include relevant details, quotes from messages, or findings that the user would want to know
 - If you have a question for the user or need their input, include it in the logMessage
+
+CRITICAL - ANALYSIS STEPS (filtering, checking, analyzing):
+- When analyzing emails/messages: Report what you found! "I reviewed 5 emails: 2 were spam (newsletter, promotion), 3 were legitimate (from Alice about project X, from Bob asking about Y, from Carol with meeting request)"
+- When filtering: Explain your decisions! "Filtered out 3 spam emails. Kept 2 that need attention: Email from John about deadline, Email from Sarah requesting feedback"
+- DO NOT just read content and move on - SUMMARIZE your findings for the user
+- Save important findings in contextUpdates for later steps
 
 3. CRITICAL - When SENDING a message and waiting for a reply:
    - Set contextUpdates.waiting_via = the messaging channel you used:
@@ -7205,11 +11394,15 @@ CRITICAL - User Notifications:
    - Set nextStatus: "waiting" to wait for the reply
 
 4. IMPORTANT - Use the MESSAGING CHANNEL specified above (if any):
-   - If MESSAGING CHANNEL says IMESSAGE → use send_imessage (NEVER send_email)
-   - If MESSAGING CHANNEL says EMAIL → use send_email (NEVER send_imessage)
-   - If MESSAGING CHANNEL says SLACK → use send_slack_message
-   - Use the SAME channel throughout the entire task
+   - If MESSAGING CHANNEL says IMESSAGE → use send_imessage (NEVER send_email or send_slack_message)
+   - If MESSAGING CHANNEL says EMAIL → use send_email (NEVER send_imessage or send_slack_message)
+   - If MESSAGING CHANNEL says SLACK → use send_slack_message (NEVER send_imessage or send_email)
+   - If MESSAGING CHANNEL says TELEGRAM → use send_telegram_message
+   - If MESSAGING CHANNEL says DISCORD → use send_discord_message
+   - If MESSAGING CHANNEL says X → use send_x_dm for DMs or post_tweet for public tweets
+   - Use the SAME channel throughout the entire task - NEVER switch channels
    - IGNORE any defaults - strictly follow the MESSAGING CHANNEL
+   - CRITICAL: Even if you know the contact on another platform, DO NOT use it. Stay on the specified channel.
 
 5. CRITICAL - REPLY DETECTED: If the SAVED CONTEXT shows "new_reply_detected: true":
    *** A REPLY HAS BEEN RECEIVED - YOU MUST PROCESS IT NOW ***
@@ -7354,8 +11547,8 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
     try {
       let currentMessages = [...messages];
       
-      // Agentic loop - up to 5 iterations
-      for (let iteration = 0; iteration < 5; iteration++) {
+      // Agentic loop - up to 15 iterations (enough for complex multi-step actions)
+      for (let iteration = 0; iteration < 15; iteration++) {
         console.log(`[Tasks] Executor iteration ${iteration + 1} for task ${taskId}`);
         
         const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -7384,14 +11577,23 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
         // Check for tool use
         const toolUseBlocks = result.content.filter(b => b.type === "tool_use");
         
+        // Log any text content (LLM reasoning) - this helps debug what the LLM is thinking
+        const textContent = result.content.find(b => b.type === "text")?.text || "";
+        if (textContent) {
+          console.log(`[Tasks] LLM reasoning: ${textContent.slice(0, 300)}${textContent.length > 300 ? '...' : ''}`);
+        }
+        
         if (toolUseBlocks.length === 0) {
           // No tools called - check if we got a text response
-          const textContent = result.content.find(b => b.type === "text")?.text || "";
-          console.log(`[Tasks] No tools called, text response: ${textContent.slice(0, 100)}`);
+          console.log(`[Tasks] No tools called, LLM response: ${textContent.slice(0, 200)}`);
           
-          await updateTask(taskId, {
-            logEntry: `Execution completed without state update: ${textContent.slice(0, 100)}`
-          });
+          // If the LLM gave a meaningful response without calling update_task_state,
+          // save it to the execution log so the user can see it
+          if (textContent.length > 10) {
+            await updateTask(taskId, {
+              logEntry: `Analysis: ${textContent.slice(0, 500)}`
+            });
+          }
           break;
         }
 
@@ -7425,6 +11627,66 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
 
             if (input.contextUpdates) {
               updates.contextMemory = { ...task.contextMemory, ...input.contextUpdates };
+              
+              // Check if the LLM drafted a message ready for approval
+              // This happens when contextUpdates includes ready_for_user_approval: true and drafted_reply
+              if (input.contextUpdates.ready_for_user_approval && input.contextUpdates.drafted_reply) {
+                console.log(`[Tasks] LLM drafted a message ready for approval, creating pendingMessage`);
+                
+                // Determine the platform and recipient from context
+                // IMPORTANT: Use task.messagingChannel as primary source (set at task creation)
+                const platform = task.messagingChannel || input.contextUpdates.messaging_channel || task.contextMemory?.messaging_channel || 'imessage';
+                const recipient = input.contextUpdates.actionable_message_from || task.contextMemory?.actionable_message_from || 'recipient';
+                
+                // Map platform to tool name
+                const platformToTool = {
+                  imessage: 'send_imessage',
+                  email: 'send_email',
+                  slack: 'send_slack_message',
+                  telegram: 'send_telegram_message',
+                  discord: 'send_discord_message',
+                  x: 'send_x_dm'
+                };
+                
+                // Create pending message entry
+                const pendingMessage = {
+                  id: `pending-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                  toolName: platformToTool[platform] || 'send_imessage',
+                  platform: platform === 'imessage' ? 'iMessage' : platform.charAt(0).toUpperCase() + platform.slice(1),
+                  recipient: recipient,
+                  subject: '',
+                  message: input.contextUpdates.drafted_reply,
+                  created: new Date().toISOString(),
+                  toolInput: JSON.stringify({
+                    recipient: recipient,
+                    message: input.contextUpdates.drafted_reply
+                  })
+                };
+                
+                // Initialize pendingMessages if needed
+                if (!task.pendingMessages) {
+                  task.pendingMessages = [];
+                }
+                
+                // Add to pending messages
+                task.pendingMessages.push(pendingMessage);
+                updates.pendingMessages = task.pendingMessages;
+                updates.status = "waiting_approval";
+                
+                // Clear the context flags so we don't create duplicate pending messages
+                updates.contextMemory.ready_for_user_approval = false;
+                updates.contextMemory.draft_pending_id = pendingMessage.id;
+                
+                console.log(`[Tasks] Created pending message: ${pendingMessage.id} for ${recipient} via ${platform}`);
+                
+                // Notify UI about the pending message
+                if (win && !win.isDestroyed()) {
+                  win.webContents.send('task:pendingMessage', {
+                    taskId,
+                    message: pendingMessage
+                  });
+                }
+              }
             }
 
             // Handle plan modification if provided
@@ -7475,6 +11737,12 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
                 notificationEmoji = "❓";
                 const question = input.clarificationQuestion || "I need more information to continue.";
                 notificationMessage = `${input.logMessage}\n\n**Question:** ${question}\n\nPlease reply in the chat to continue the task.`;
+              }
+              // Waiting for user approval of drafted message
+              else if (input.nextStatus === "waiting_approval" || updates.status === "waiting_approval") {
+                notificationEmoji = "📨";
+                const recipient = input.contextUpdates?.actionable_message_from || task.contextMemory?.actionable_message_from || "contact";
+                notificationMessage = `${input.logMessage}\n\n**Action Required:** I've drafted a reply to ${recipient}. Please review and approve or edit the message in the Tasks panel.`;
               }
               // Waiting for reply - brief update  
               else if (input.nextStatus === "waiting") {
@@ -7555,12 +11823,57 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
         currentMessages.push({ role: "user", content: toolResults });
       }
 
-      // If we exited without updating state, mark as needing attention
-      await updateTask(taskId, {
-        logEntry: "Execution completed but state was not explicitly updated"
-      });
+      // If we exited without updating state, the LLM completed the step but forgot to call update_task_state
+      // Auto-advance to the next step to keep the task moving
+      console.log(`[Tasks] LLM completed without calling update_task_state - auto-advancing task ${taskId}`);
       
-      return { success: false, message: "Max iterations reached without state update" };
+      const currentStep = task.currentStep.step;
+      const nextStep = currentStep + 1;
+      
+      if (nextStep <= task.plan.length) {
+        // Advance to next step
+        await updateTask(taskId, {
+          currentStep: { step: nextStep, state: "executing" },
+          status: "active",
+          logEntry: `Step ${currentStep} completed (auto-advanced). Moving to step ${nextStep}: ${task.plan[nextStep - 1]}`
+        });
+        
+        console.log(`[Tasks] Auto-advanced from step ${currentStep} to step ${nextStep}`);
+        
+        // Notify user
+        if (win && !win.isDestroyed()) {
+          const notificationMessage = `Step ${currentStep} completed. Moving to step ${nextStep}: ${task.plan[nextStep - 1]}`;
+          addTaskUpdate(taskId, notificationMessage, {
+            toChat: true,
+            emoji: "📝",
+            taskTitle: task.title
+          });
+        }
+        
+        // Continue to next step after a short delay
+        setTimeout(() => executeTaskStep(taskId), 500);
+        return { success: true, autoAdvanced: true };
+      } else {
+        // This was the last step - mark task as completed
+        await updateTask(taskId, {
+          status: "completed",
+          currentStep: { ...task.currentStep, state: "completed" },
+          logEntry: `Task completed (all ${task.plan.length} steps finished)`
+        });
+        
+        console.log(`[Tasks] Task ${taskId} completed (auto-completed after last step)`);
+        
+        // Notify user of completion
+        if (win && !win.isDestroyed()) {
+          addTaskUpdate(taskId, `Task completed! All ${task.plan.length} steps finished.`, {
+            toChat: true,
+            emoji: "✅",
+            taskTitle: task.title
+          });
+        }
+        
+        return { success: true, completed: true };
+      }
 
     } catch (err) {
       console.error(`[Tasks] Execution error for ${taskId}:`, err.message);
@@ -7582,6 +11895,132 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
     openai: "gpt-4o-mini",
     google: "gemini-1.5-flash"
   };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Skill Generation - Create skills from natural language descriptions
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Generate a skill from a natural language description
+   * @param {string} userRequest - User's request describing the skill
+   * @param {Object} apiKeys - Available API keys
+   * @param {string} activeProvider - The active LLM provider
+   * @returns {Object} Skill object with name, description, keywords, procedure, constraints, tools
+   */
+  async function generateSkillFromDescription(userRequest, apiKeys, activeProvider) {
+    const prompt = `You are helping create a skill (a reusable procedure) for an AI assistant called Wovly.
+
+USER REQUEST:
+"${userRequest}"
+
+Based on this request, generate a skill with the following structure. Be specific and actionable.
+
+Available tools the skill can use:
+- send_email: Send emails via Gmail
+- list_emails: Search/list emails
+- get_email_content: Read email content
+- send_imessage: Send text messages via iMessage/SMS
+- get_recent_messages: Get recent iMessage conversations
+- send_slack_message: Send Slack messages
+- get_slack_messages: Get Slack messages
+- search_calendar: Search calendar events
+- create_calendar_event: Create calendar events
+- update_task_state: Update task progress
+- browser tools: navigate_to, page_snapshot, browser_click, browser_type, etc.
+
+Respond with ONLY valid JSON (no markdown, no backticks):
+{
+  "name": "Short descriptive name (e.g., 'Email Thread Monitoring', 'Daily Standup Reminder')",
+  "description": "2-3 sentence description of what this skill does and when it should be triggered",
+  "keywords": ["keyword1", "keyword2", "keyword3", "keyword4"],
+  "procedure": [
+    "Step 1: Specific action to take",
+    "Step 2: Another specific action",
+    "Step 3: Continue with the workflow",
+    "Step 4: Handle outcomes/responses",
+    "Step 5: Complete or repeat as needed"
+  ],
+  "constraints": [
+    "Important rule or limitation",
+    "Another constraint to follow"
+  ],
+  "tools": ["tool1", "tool2"]
+}`;
+
+    try {
+      let response;
+      
+      if (activeProvider === "anthropic" && apiKeys.anthropic) {
+        response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKeys.anthropic,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 1024,
+            messages: [{ role: "user", content: prompt }]
+          })
+        });
+        
+        if (!response.ok) {
+          throw new Error(`Anthropic API error: ${await response.text()}`);
+        }
+        
+        const data = await response.json();
+        const text = data.content[0]?.text || "";
+        return JSON.parse(text);
+        
+      } else if (apiKeys.openai) {
+        response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKeys.openai}`
+          },
+          body: JSON.stringify({
+            model: "gpt-4o",
+            messages: [{ role: "user", content: prompt }],
+            response_format: { type: "json_object" }
+          })
+        });
+        
+        if (!response.ok) {
+          throw new Error(`OpenAI API error: ${await response.text()}`);
+        }
+        
+        const data = await response.json();
+        const text = data.choices[0]?.message?.content || "";
+        return JSON.parse(text);
+        
+      } else if (apiKeys.google) {
+        response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKeys.google}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseMimeType: "application/json" }
+          })
+        });
+        
+        if (!response.ok) {
+          throw new Error(`Google API error: ${await response.text()}`);
+        }
+        
+        const data = await response.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        return JSON.parse(text);
+        
+      } else {
+        return { error: "No API key available for skill generation" };
+      }
+    } catch (err) {
+      console.error("[Skills] Error generating skill:", err.message);
+      return { error: err.message };
+    }
+  }
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Input Type Detection - Classify input as query/command/information
@@ -8939,7 +13378,10 @@ ${formatDecomposedSteps(steps)}
    */
   const executeCdpBrowserTool = async (toolName, toolInput) => {
     try {
-      const controller = await getBrowserController();
+      if (!currentUser?.username) {
+        return { error: "Not logged in - browser automation requires authentication" };
+      }
+      const controller = await getBrowserController(currentUser.username);
       const sessionId = toolInput.sessionId || "default";
       
       switch (toolName) {
@@ -9157,6 +13599,15 @@ ${formatDecomposedSteps(steps)}
       weatherEnabled = true,
       iMessageEnabled = false,
       browserEnabled = false, // CDP browser automation
+      // New integrations
+      telegramToken = null,
+      discordAccessToken = null,
+      xAccessToken = null,
+      notionAccessToken = null,
+      githubAccessToken = null,
+      asanaAccessToken = null,
+      redditAccessToken = null,
+      spotifyAccessToken = null,
       includeProfileTools = true,
       includeTaskTools = true,
       includeMemoryTools = true,
@@ -9169,10 +13620,23 @@ ${formatDecomposedSteps(steps)}
     if (includeProfileTools) tools.push(...profileTools);
     if (includeTaskTools) tools.push(...taskTools);
     if (includeMemoryTools) tools.push(...memoryTools);
+    
+    // Documentation tools - always available for help questions
+    tools.push(...documentationTools);
     if (googleAccessToken) tools.push(...googleWorkspaceTools);
     if (iMessageEnabled) tools.push(...iMessageTools);
     if (weatherEnabled) tools.push(...weatherTools);
     if (slackAccessToken) tools.push(...slackTools);
+    
+    // New integrations
+    if (telegramToken) tools.push(...telegramTools);
+    if (discordAccessToken) tools.push(...discordTools);
+    if (xAccessToken) tools.push(...xTools);
+    if (notionAccessToken) tools.push(...notionTools);
+    if (githubAccessToken) tools.push(...githubTools);
+    if (asanaAccessToken) tools.push(...asanaTools);
+    if (redditAccessToken) tools.push(...redditTools);
+    if (spotifyAccessToken) tools.push(...spotifyTools);
     
     // Browser tools (CDP-based direct control)
     if (browserEnabled) {
@@ -9232,6 +13696,10 @@ ${formatDecomposedSteps(steps)}
       if (memoryTools.find(t => t.name === toolName)) {
         return await executeMemorySearch(toolInput.query, toolInput.date_range);
       }
+      // Documentation tools
+      if (documentationTools.find(t => t.name === toolName)) {
+        return await executeDocumentationFetch(toolInput.topic);
+      }
       // Google tools
       if (googleAccessToken && googleWorkspaceTools.find(t => t.name === toolName)) {
         return await executeGoogleTool(toolName, toolInput, googleAccessToken);
@@ -9247,6 +13715,39 @@ ${formatDecomposedSteps(steps)}
       // Slack tools
       if (slackAccessToken && slackTools.find(t => t.name === toolName)) {
         return await executeSlackTool(toolName, toolInput, slackAccessToken);
+      }
+      
+      // Telegram tools
+      if (telegramToken && telegramTools.find(t => t.name === toolName)) {
+        return await executeTelegramTool(toolName, toolInput);
+      }
+      // Discord tools
+      if (discordAccessToken && discordTools.find(t => t.name === toolName)) {
+        return await executeDiscordTool(toolName, toolInput, discordAccessToken);
+      }
+      // X (Twitter) tools
+      if (xAccessToken && xTools.find(t => t.name === toolName)) {
+        return await executeXTool(toolName, toolInput, xAccessToken);
+      }
+      // Notion tools
+      if (notionAccessToken && notionTools.find(t => t.name === toolName)) {
+        return await executeNotionTool(toolName, toolInput, notionAccessToken);
+      }
+      // GitHub tools
+      if (githubAccessToken && githubTools.find(t => t.name === toolName)) {
+        return await executeGitHubTool(toolName, toolInput, githubAccessToken);
+      }
+      // Asana tools
+      if (asanaAccessToken && asanaTools.find(t => t.name === toolName)) {
+        return await executeAsanaTool(toolName, toolInput, asanaAccessToken);
+      }
+      // Reddit tools
+      if (redditAccessToken && redditTools.find(t => t.name === toolName)) {
+        return await executeRedditTool(toolName, toolInput, redditAccessToken);
+      }
+      // Spotify tools
+      if (spotifyAccessToken && spotifyTools.find(t => t.name === toolName)) {
+        return await executeSpotifyTool(toolName, toolInput, spotifyAccessToken);
       }
       
       // Browser tools (CDP-based)
@@ -9265,12 +13766,12 @@ ${formatDecomposedSteps(steps)}
    * @returns {Object} { tools, executeTool, googleAccessToken, slackAccessToken, weatherEnabled, iMessageEnabled, browserEnabled }
    */
   const loadIntegrationsAndBuildTools = async (options = {}) => {
-    const settingsPath = await getSettingsPath();
+    const settingsPath = await getSettingsPath(currentUser?.username);
     
     // Load Google token
     let googleAccessToken = null;
     try {
-      googleAccessToken = await getGoogleAccessToken();
+      googleAccessToken = await getGoogleAccessToken(currentUser?.username);
     } catch {
       // No Google
     }
@@ -9278,7 +13779,7 @@ ${formatDecomposedSteps(steps)}
     // Load Slack token
     let slackAccessToken = null;
     try {
-      slackAccessToken = await getSlackAccessToken();
+      slackAccessToken = await getSlackAccessToken(currentUser?.username);
     } catch {
       // No Slack
     }
@@ -9313,12 +13814,62 @@ ${formatDecomposedSteps(steps)}
       // Default disabled
     }
 
+    // Load new integration tokens
+    let telegramToken = null;
+    let discordAccessToken = null;
+    let xAccessToken = null;
+    let notionAccessToken = null;
+    let githubAccessToken = null;
+    let asanaAccessToken = null;
+    let redditAccessToken = null;
+    let spotifyAccessToken = null;
+    
+    try {
+      telegramToken = await getTelegramToken();
+    } catch { /* No Telegram */ }
+    
+    try {
+      discordAccessToken = await getDiscordAccessToken();
+    } catch { /* No Discord */ }
+    
+    try {
+      xAccessToken = await getXAccessToken();
+    } catch { /* No X */ }
+    
+    try {
+      notionAccessToken = await getNotionAccessToken();
+    } catch { /* No Notion */ }
+    
+    try {
+      githubAccessToken = await getGitHubAccessToken();
+    } catch { /* No GitHub */ }
+    
+    try {
+      asanaAccessToken = await getAsanaAccessToken();
+    } catch { /* No Asana */ }
+    
+    try {
+      redditAccessToken = await getRedditAccessToken();
+    } catch { /* No Reddit */ }
+    
+    try {
+      spotifyAccessToken = await getSpotifyAccessToken();
+    } catch { /* No Spotify */ }
+
     const { tools, executeTool } = buildToolsAndExecutor({
       googleAccessToken,
       slackAccessToken,
       weatherEnabled,
       iMessageEnabled,
       browserEnabled: browserIsEnabled,
+      telegramToken,
+      discordAccessToken,
+      xAccessToken,
+      notionAccessToken,
+      githubAccessToken,
+      asanaAccessToken,
+      redditAccessToken,
+      spotifyAccessToken,
       ...options
     });
 
@@ -9329,7 +13880,15 @@ ${formatDecomposedSteps(steps)}
       slackAccessToken,
       weatherEnabled,
       iMessageEnabled,
-      browserEnabled: browserIsEnabled
+      browserEnabled: browserIsEnabled,
+      telegramToken,
+      discordAccessToken,
+      xAccessToken,
+      notionAccessToken,
+      githubAccessToken,
+      asanaAccessToken,
+      redditAccessToken,
+      spotifyAccessToken
     };
   };
 
@@ -9370,11 +13929,21 @@ ${formatDecomposedSteps(steps)}
     enabled: process.platform === "darwin",
     
     sendMessage: async (recipient, message) => {
-      return await executeIMessageTool("send_imessage", { recipient, message });
+      const result = await executeIMessageTool("send_imessage", { recipient, message });
+      // After sending, get the chat_id so we can track replies in this specific conversation
+      if (result.success && result.sentTo) {
+        const chatId = await getIMessageChatId(result.sentTo);
+        if (chatId) {
+          result.chatId = chatId;
+          console.log(`[iMessage] Captured chat_id ${chatId} for conversation with ${result.sentTo}`);
+        }
+      }
+      return result;
     },
     
-    checkForNewMessages: async (contact, afterTimestamp) => {
-      return await checkForNewIMessages(contact, afterTimestamp);
+    checkForNewMessages: async (contact, afterTimestamp, accessToken, chatId) => {
+      // Pass chatId to filter to the specific conversation thread
+      return await checkForNewIMessages(contact, afterTimestamp, chatId);
     },
     
     getMessages: async (contact, options) => {
@@ -9394,15 +13963,22 @@ ${formatDecomposedSteps(steps)}
     enabled: true,  // Will check for token at execution time
     
     sendMessage: async (recipient, message, _subject, accessToken) => {
-      return await executeSlackTool("send_slack_message", { 
+      const result = await executeSlackTool("send_slack_message", { 
         channel: recipient, 
         text: message 
       }, accessToken);
+      // Return the channel ID for conversation tracking
+      if (result && !result.error) {
+        result.channel = result.channel || recipient;
+      }
+      return result;
     },
     
-    checkForNewMessages: async (contact, afterTimestamp, accessToken) => {
+    checkForNewMessages: async (contact, afterTimestamp, accessToken, channelId) => {
       if (!accessToken) return { hasNew: false, reason: "no access token" };
-      return await checkForNewSlackMessages(contact, afterTimestamp, accessToken);
+      // Use channelId if provided, otherwise fall back to contact (they're usually the same for Slack)
+      const targetChannel = channelId || contact;
+      return await checkForNewSlackMessages(targetChannel, afterTimestamp, accessToken);
     },
     
     getMessages: async (contact, options, accessToken) => {
@@ -9414,6 +13990,139 @@ ${formatDecomposedSteps(steps)}
     
     resolveContact: async (name, accessToken) => {
       return await executeSlackTool("search_slack_users", { query: name }, accessToken);
+    }
+  });
+
+  // Register Telegram integration
+  registerMessagingIntegration({
+    id: "telegram",
+    name: "Telegram",
+    keywords: ["telegram", "tg"],
+    enabled: true,
+    
+    sendMessage: async (recipient, message) => {
+      const result = await executeTelegramTool("send_telegram_message", { 
+        chat_id: recipient, 
+        message 
+      });
+      if (result && !result.error) {
+        result.chat_id = recipient;
+      }
+      return result;
+    },
+    
+    checkForNewMessages: async (contact, afterTimestamp) => {
+      const token = await getTelegramToken();
+      if (!token) return { hasNew: false, reason: "no bot token" };
+      
+      try {
+        const response = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=-20`);
+        const data = await response.json();
+        if (!data.ok) return { hasNew: false, reason: data.description };
+        
+        const cutoffTime = new Date(afterTimestamp).getTime() / 1000;
+        const newMessages = data.result.filter(u => 
+          u.message && 
+          u.message.date > cutoffTime &&
+          (String(u.message.chat.id) === String(contact) || 
+           u.message.chat.username === contact ||
+           u.message.from?.username === contact)
+        );
+        
+        return {
+          hasNew: newMessages.length > 0,
+          count: newMessages.length,
+          messages: newMessages.map(u => ({
+            text: u.message.text,
+            from: u.message.from?.first_name || u.message.from?.username,
+            date: new Date(u.message.date * 1000).toISOString()
+          }))
+        };
+      } catch (err) {
+        return { hasNew: false, reason: err.message };
+      }
+    },
+    
+    getMessages: async (contact) => {
+      return await executeTelegramTool("get_telegram_updates", { limit: 20 });
+    }
+  });
+
+  // Register Discord integration
+  registerMessagingIntegration({
+    id: "discord",
+    name: "Discord",
+    keywords: ["discord"],
+    enabled: true,
+    
+    sendMessage: async (recipient, message, _subject, accessToken) => {
+      const result = await executeDiscordTool("send_discord_message", { 
+        channel_id: recipient, 
+        message 
+      }, accessToken);
+      if (result && !result.error) {
+        result.channel_id = recipient;
+      }
+      return result;
+    },
+    
+    checkForNewMessages: async (contact, afterTimestamp, accessToken, channelId) => {
+      if (!accessToken) return { hasNew: false, reason: "no access token" };
+      
+      try {
+        const targetChannel = channelId || contact;
+        const result = await executeDiscordTool("get_discord_messages", { 
+          channel_id: targetChannel, 
+          limit: 20 
+        }, accessToken);
+        
+        if (result.error) return { hasNew: false, reason: result.error };
+        
+        const cutoffTime = new Date(afterTimestamp).getTime();
+        const newMessages = (result.messages || []).filter(m => 
+          new Date(m.timestamp).getTime() > cutoffTime
+        );
+        
+        return {
+          hasNew: newMessages.length > 0,
+          count: newMessages.length,
+          messages: newMessages
+        };
+      } catch (err) {
+        return { hasNew: false, reason: err.message };
+      }
+    },
+    
+    getMessages: async (contact, options, accessToken) => {
+      return await executeDiscordTool("get_discord_messages", { 
+        channel_id: contact, 
+        ...options 
+      }, accessToken);
+    }
+  });
+
+  // Register X (Twitter) integration for DMs
+  registerMessagingIntegration({
+    id: "x",
+    name: "X (Twitter)",
+    keywords: ["x", "twitter", "tweet", "dm"],
+    enabled: true,
+    
+    sendMessage: async (recipient, message, _subject, accessToken) => {
+      const result = await executeXTool("send_x_dm", { 
+        recipient_id: recipient, 
+        message 
+      }, accessToken);
+      return result;
+    },
+    
+    checkForNewMessages: async () => {
+      // X API doesn't support polling for DMs easily
+      return { hasNew: false, reason: "X DM polling not supported" };
+    },
+    
+    getMessages: async () => {
+      return { error: "X message retrieval not implemented" };
     }
   });
 
@@ -9432,7 +14141,13 @@ ${formatDecomposedSteps(steps)}
    * @returns {Object} Result with ok, response, and optional decomposition/classification
    */
   async function processChatQuery(messages, options = {}) {
-    const { skipDecomposition = false, stepContext = null } = options;
+    const { skipDecomposition = false, stepContext = null, workflowContext = null } = options;
+    
+    // Check if user is responding to an active workflow (e.g., clarification for task creation)
+    const isRespondingToWorkflow = workflowContext?.type === 'clarifying_for_task';
+    if (isRespondingToWorkflow) {
+      console.log("[Workflow] User is responding to clarification - will skip info detection");
+    }
     
     // Check if there's a task waiting for user input
     // If so, route the user's message to that task
@@ -9466,7 +14181,7 @@ ${formatDecomposedSteps(steps)}
       };
     }
     
-    const settingsPath = await getSettingsPath();
+    const settingsPath = await getSettingsPath(currentUser?.username);
     let apiKeys = {};
     let models = {};
     let activeProvider = "anthropic";
@@ -9486,13 +14201,66 @@ ${formatDecomposedSteps(steps)}
     // userMessage already declared at the top of this function
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Skill Creation Detection - Check if user wants to create a new skill
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    const skillCreationMatch = userMessage.toLowerCase().match(/^(create|make|add|new)\s+(a\s+)?skill\s+(called|named|for|that|to|:|\s)/i);
+    if (skillCreationMatch) {
+      console.log("[Skills] Detected skill creation request");
+      
+      try {
+        // Generate the skill using LLM
+        const generatedSkill = await generateSkillFromDescription(userMessage, apiKeys, activeProvider);
+        
+        if (generatedSkill.error) {
+          return { ok: false, error: generatedSkill.error };
+        }
+        
+        // Generate a skill ID from the name
+        const skillId = generatedSkill.name
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-|-$/g, '')
+          .slice(0, 50);
+        
+        // Serialize to markdown
+        const skillMarkdown = serializeSkill(generatedSkill);
+        
+        // Save the skill
+        const skillsDir = await getSkillsDir(currentUser?.username);
+        const skillPath = path.join(skillsDir, `${skillId}.md`);
+        await fs.writeFile(skillPath, skillMarkdown, "utf8");
+        
+        console.log(`[Skills] Created new skill: ${skillId}`);
+        
+        // Format response with skill details
+        const response = `I've created a new skill: **${generatedSkill.name}**\n\n` +
+          `**Description:** ${generatedSkill.description}\n\n` +
+          `**Keywords:** ${generatedSkill.keywords.join(', ')}\n\n` +
+          `**Procedure:**\n${generatedSkill.procedure.map((step, i) => `${i + 1}. ${step}`).join('\n')}\n\n` +
+          `**Constraints:**\n${generatedSkill.constraints.map(c => `- ${c}`).join('\n')}\n\n` +
+          `**Tools:** ${generatedSkill.tools.join(', ')}\n\n` +
+          `The skill has been saved and is now available. You can view and edit it in the Skills page.`;
+        
+        return {
+          ok: true,
+          response,
+          skillCreated: { id: skillId, name: generatedSkill.name }
+        };
+      } catch (err) {
+        console.error("[Skills] Error creating skill:", err.message);
+        return { ok: false, error: `Failed to create skill: ${err.message}` };
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Pre-load Context (needed for Query Understanding and Chat)
     // ─────────────────────────────────────────────────────────────────────────
     
     // Get user profile for context
     let profile = null;
     try {
-      const profilePath = await getUserProfilePath();
+      const profilePath = await getUserProfilePath(currentUser?.username);
       const markdown = await fs.readFile(profilePath, "utf8");
       profile = parseUserProfile(markdown);
     } catch {
@@ -9502,7 +14270,9 @@ ${formatDecomposedSteps(steps)}
     // Load conversation context (historical memory)
     let conversationContext = { todayMessages: "", yesterdayMessages: "", recentSummaries: "" };
     try {
-      conversationContext = await loadConversationContext();
+      if (currentUser?.username) {
+        conversationContext = await loadConversationContext(currentUser.username);
+      }
     } catch (err) {
       console.error("[Memory] Error loading conversation context:", err.message);
     }
@@ -9510,7 +14280,7 @@ ${formatDecomposedSteps(steps)}
     // Get calendar events for today (if Google is connected) - helps with time references
     let todayCalendarEvents = [];
     try {
-      const accessToken = await getGoogleAccessToken();
+      const accessToken = await getGoogleAccessToken(currentUser?.username);
       if (accessToken) {
         const today = new Date();
         const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0, 0);
@@ -9525,6 +14295,9 @@ ${formatDecomposedSteps(steps)}
     // Input Type Detection - Check if this is an informational statement
     // ─────────────────────────────────────────────────────────────────────────
     
+    // Track facts detected during workflow for deferred prompting
+    let detectedFactsDuringWorkflow = [];
+    
     if (!skipDecomposition && userMessage.length > 10) {
       try {
         console.log("[InputType] Detecting input type...");
@@ -9537,46 +14310,54 @@ ${formatDecomposedSteps(steps)}
           const factsResult = await extractFacts(userMessage, apiKeys, activeProvider);
           
           if (factsResult.facts && factsResult.facts.length > 0) {
-            // Load existing profile notes for conflict detection
-            let existingNotes = [];
-            try {
-              const profilePath = await getUserProfilePath();
-              const markdown = await fs.readFile(profilePath, "utf8");
-              const existingProfile = parseUserProfile(markdown);
-              existingNotes = existingProfile.notes || [];
-            } catch { /* No profile yet */ }
-            
-            // Check for conflicts with existing notes
-            const conflictResult = await detectFactConflicts(
-              factsResult.facts, existingNotes, apiKeys, activeProvider
-            );
-            
-            // Format response message
-            let responseMessage = "I noticed you're sharing some important information. Would you like me to save this to your profile?\n\n";
-            responseMessage += "**Facts to save:**\n";
-            factsResult.facts.forEach((fact, i) => {
-              responseMessage += `• ${fact.summary}\n`;
-            });
-            
-            if (conflictResult.conflicts && conflictResult.conflicts.length > 0) {
-              responseMessage += "\n**⚠️ Conflicts detected:**\n";
-              conflictResult.conflicts.forEach(conflict => {
-                responseMessage += `\n• ${conflict.conflictDescription}\n`;
-                responseMessage += `  - Previously: "${conflict.existingNote}"\n`;
-                responseMessage += `  - Now: "${conflict.newFact}"\n`;
+            // If responding to a workflow, capture facts silently for later instead of interrupting
+            if (isRespondingToWorkflow) {
+              console.log("[InputType] User is in workflow - capturing facts silently for later");
+              detectedFactsDuringWorkflow = factsResult.facts;
+              // Don't return - continue with normal processing
+            } else {
+              // Normal flow: prompt user to save facts
+              // Load existing profile notes for conflict detection
+              let existingNotes = [];
+              try {
+                const profilePath = await getUserProfilePath(currentUser?.username);
+                const markdown = await fs.readFile(profilePath, "utf8");
+                const existingProfile = parseUserProfile(markdown);
+                existingNotes = existingProfile.notes || [];
+              } catch { /* No profile yet */ }
+              
+              // Check for conflicts with existing notes
+              const conflictResult = await detectFactConflicts(
+                factsResult.facts, existingNotes, apiKeys, activeProvider
+              );
+              
+              // Format response message
+              let responseMessage = "I noticed you're sharing some important information. Would you like me to save this to your profile?\n\n";
+              responseMessage += "**Facts to save:**\n";
+              factsResult.facts.forEach((fact, i) => {
+                responseMessage += `• ${fact.summary}\n`;
               });
+              
+              if (conflictResult.conflicts && conflictResult.conflicts.length > 0) {
+                responseMessage += "\n**⚠️ Conflicts detected:**\n";
+                conflictResult.conflicts.forEach(conflict => {
+                  responseMessage += `\n• ${conflict.conflictDescription}\n`;
+                  responseMessage += `  - Previously: "${conflict.existingNote}"\n`;
+                  responseMessage += `  - Now: "${conflict.newFact}"\n`;
+                });
+              }
+              
+              // Return with confirmation prompt
+              return {
+                ok: true,
+                response: responseMessage,
+                informationType: true,
+                facts: factsResult.facts,
+                conflicts: conflictResult.conflicts || [],
+                nonConflictingIndexes: conflictResult.nonConflictingFactIndexes || [],
+                originalInput: userMessage
+              };
             }
-            
-            // Return with confirmation prompt
-            return {
-              ok: true,
-              response: responseMessage,
-              informationType: true,
-              facts: factsResult.facts,
-              conflicts: conflictResult.conflicts || [],
-              nonConflictingIndexes: conflictResult.nonConflictingFactIndexes || [],
-              originalInput: userMessage
-            };
           }
         }
       } catch (err) {
@@ -9714,8 +14495,8 @@ ${formatDecomposedSteps(steps)}
       console.log(`[StyleContext] Detected messaging to "${detectedRecipient}" via ${detectedPlatform}`);
       
       try {
-        const googleAccessToken = await getGoogleAccessToken();
-        const slackAccessToken = await getSlackAccessToken().catch(() => null);
+        const googleAccessToken = await getGoogleAccessToken(currentUser?.username);
+        const slackAccessToken = await getSlackAccessToken(currentUser?.username).catch(() => null);
         
         // Get current Slack user ID if needed
         let slackUserId = null;
@@ -9788,8 +14569,8 @@ ${formatDecomposedSteps(steps)}
           console.log("[QueryDecomposition] Complex query detected, decomposing...");
           
           // Build tools list for decomposition
-          const accessToken = await getGoogleAccessToken();
-          const slackToken = await getSlackAccessToken().catch(() => null);
+          const accessToken = await getGoogleAccessToken(currentUser?.username);
+          const slackToken = await getSlackAccessToken(currentUser?.username).catch(() => null);
           const hasBrowser = await (async () => {
             try {
               const s = JSON.parse(await fs.readFile(settingsPath, "utf8"));
@@ -9830,7 +14611,9 @@ ${formatDecomposedSteps(steps)}
                 response: `I've analyzed your request and broken it down into ${queryDecomposition.steps.length} steps:\n\n**${queryDecomposition.title}**\n\n${stepsDisplay}\n\n${taskReason}\n\nWould you like me to create a background task to handle this? It will run autonomously and notify you of progress.`,
                 decomposition: queryDecomposition,
                 classification: queryClassification,
-                suggestTask: true
+                suggestTask: true,
+                // Include any facts detected during workflow for deferred saving
+                ...(detectedFactsDuringWorkflow.length > 0 ? { detectedFacts: detectedFactsDuringWorkflow } : {})
               };
             }
           }
@@ -9848,14 +14631,14 @@ ${formatDecomposedSteps(steps)}
     // Profile and conversation context already loaded above (for Query Understanding)
     
     // Check Google auth (may have been checked for calendar, but need fresh token)
-    const accessToken = await getGoogleAccessToken();
+    const accessToken = await getGoogleAccessToken(currentUser?.username);
     const hasGoogleTools = !!accessToken;
     const hasIMessageTools = process.platform === "darwin";
 
     // Load skills and find best match for user's message
     let matchedSkill = null;
     try {
-      const skills = await loadAllSkills();
+      const skills = await loadAllSkills(currentUser?.username);
       if (skills.length > 0 && userMessage) {
         matchedSkill = await findBestSkill(userMessage, skills);
       }
@@ -9882,7 +14665,26 @@ ${formatDecomposedSteps(steps)}
 - NEVER include actual passwords in your responses
 - If login is required, check if credentials are available (listed below) and use them automatically
 - If no credentials exist for a site, tell the user: "I don't have saved credentials for this site. Please add them in the Credentials page of the app, then try again."
-- If a user tries to share a password in chat, STOP them and redirect to the Credentials page`;
+- If a user tries to share a password in chat, STOP them and redirect to the Credentials page
+
+## WOVLY QUICK REFERENCE (for answering "how do I use this?" questions)
+Wovly is your autonomous communication agent - a privacy-focused AI assistant that manages your inbox, replies, and follow-ups across Email, Slack, and iMessage.
+
+**Key Features:**
+- **Chat** (this interface): Talk to me naturally to send messages, check emails, schedule meetings, search the web, and more
+- **Skills**: Reusable workflows and templates (email drafting, scheduling, research). View and create custom ones in the Skills page
+- **Tasks**: Autonomous background workflows that run over time - great for scheduling negotiations, follow-ups, and multi-step coordination. I'll offer to create one when your request needs it
+- **Memory & Profile**: I remember our conversations and learn about you. Update your profile in the About Me page
+- **Integrations**: Connect Google (Gmail/Calendar), Slack, iMessage, WhatsApp, Telegram, Discord, and more in the Integrations page
+- **Voice Mimic**: I learn your communication style for each recipient so messages sound like you
+- **Browser Automation**: I can browse websites, fill forms, and research on your behalf
+
+**Quick Tips:**
+- Just ask naturally: "email jeff about the meeting", "what's on my calendar tomorrow", "text sarah happy birthday"
+- For scheduling/follow-ups, I'll suggest creating a Task to handle the back-and-forth
+- Use the fetch_documentation tool if users ask detailed "how to" questions
+
+For detailed documentation, use the fetch_documentation tool to look up specific topics.`;
 
     if (profile) {
       systemPrompt += `\n\nUser Profile:\n- Name: ${profile.firstName} ${profile.lastName}\n- Occupation: ${profile.occupation || "Not specified"}\n- City: ${profile.city || "Not specified"}\n- Home Life: ${profile.homeLife || "Not specified"}`;
@@ -10007,14 +14809,15 @@ No prior message history found with "${conversationStyleContext.recipient}". Usi
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // WhatsApp Message Processor - Same tools as main chat
+  // External Message Processor - Same tools as main chat
+  // Shared by WhatsApp, Telegram, and other chat interfaces
   // ─────────────────────────────────────────────────────────────────────────────
   
-  setWhatsAppMessageProcessor(async (text, senderId) => {
-    console.log(`[WhatsApp] Processing message with full tool access: "${text.substring(0, 50)}..."`);
+  setExternalMessageProcessor(async (text, senderId, source = "WhatsApp") => {
+    console.log(`[${source}] Processing message with full tool access: "${text.substring(0, 50)}..."`);
     
     try {
-      const settingsPath = await getSettingsPath();
+      const settingsPath = await getSettingsPath(currentUser?.username);
       let apiKeys = {};
       let models = {};
       let activeProvider = "anthropic";
@@ -10035,7 +14838,7 @@ No prior message history found with "${conversationStyleContext.recipient}". Usi
       // Get user profile for context
       let profile = null;
       try {
-        const profilePath = await getUserProfilePath();
+        const profilePath = await getUserProfilePath(currentUser?.username);
         const markdown = await fs.readFile(profilePath, "utf8");
         profile = parseUserProfile(markdown);
       } catch {
@@ -10046,13 +14849,13 @@ No prior message history found with "${conversationStyleContext.recipient}". Usi
       const { tools, executeTool, googleAccessToken, slackAccessToken, weatherEnabled, iMessageEnabled } = 
         await loadIntegrationsAndBuildTools({
           includeProfileTools: true,
-          includeTaskTools: false, // Don't create tasks from WhatsApp
+          includeTaskTools: false, // Don't create tasks from external interfaces
           includeMemoryTools: true
         });
 
-      // Build system prompt for WhatsApp context
-      let systemPrompt = `You are Wovly, a helpful AI assistant responding via WhatsApp. 
-Keep responses concise and conversational - WhatsApp messages should be brief and to the point.
+      // Build system prompt for external chat context
+      let systemPrompt = `You are Wovly, a helpful AI assistant responding via ${source}. 
+Keep responses concise and conversational - ${source} messages should be brief and to the point.
 You have FULL access to the user's tools including calendar, email, contacts, etc.`;
 
       if (profile) {
@@ -10224,10 +15027,10 @@ You have FULL access to the user's tools including calendar, email, contacts, et
   });
 
   // Chat handler with agentic workflow
-  ipcMain.handle("chat:send", async (_event, { messages, skipDecomposition = false, stepContext = null }) => {
+  ipcMain.handle("chat:send", async (_event, { messages, skipDecomposition = false, stepContext = null, workflowContext = null }) => {
     try {
       // Use the shared processing function
-      const processResult = await processChatQuery(messages, { skipDecomposition, stepContext });
+      const processResult = await processChatQuery(messages, { skipDecomposition, stepContext, workflowContext });
       
       // If decomposition returned a task suggestion, return it directly
       if (processResult.suggestTask) {
@@ -10250,7 +15053,7 @@ You have FULL access to the user's tools including calendar, email, contacts, et
       
       // Build on the system prompt from processChatQuery
       let systemPrompt = baseSystemPrompt;
-      const settingsPath = await getSettingsPath();
+      const settingsPath = await getSettingsPath(currentUser?.username);
 
       // Weather system prompt (added before checking if enabled)
       systemPrompt += `\n\nYou have access to weather tools. You can look up weather forecasts, current conditions, and find location coordinates. Use these when the user asks about weather.`;
@@ -10270,7 +15073,7 @@ You have FULL access to the user's tools including calendar, email, contacts, et
       let slackAccessToken = null;
       let hasSlackTools = false;
       try {
-        slackAccessToken = await getSlackAccessToken();
+        slackAccessToken = await getSlackAccessToken(currentUser?.username);
         hasSlackTools = !!slackAccessToken;
       } catch {
         // No Slack
@@ -10802,10 +15605,10 @@ Be concise. Execute the step and provide the answer.` }
           const { accessToken } = contextResult;
           
           // Get Slack token
-          const slackAccessToken = await getSlackAccessToken().catch(() => null);
+          const slackAccessToken = await getSlackAccessToken(currentUser?.username).catch(() => null);
           
           // Get settings for weather and browser
-          const settingsPath = await getSettingsPath();
+          const settingsPath = await getSettingsPath(currentUser?.username);
           let weatherEnabled = true;
           let hasBrowserTools = false;
           try {

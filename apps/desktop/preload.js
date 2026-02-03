@@ -6,7 +6,7 @@ contextBridge.exposeInMainWorld("wovly", {
     set: (settings) => ipcRenderer.invoke("settings:set", { settings })
   },
   chat: {
-    send: (messages) => ipcRenderer.invoke("chat:send", { messages }),
+    send: (messages, workflowContext = null) => ipcRenderer.invoke("chat:send", { messages, workflowContext }),
     executeInline: (decomposition, originalMessage) => ipcRenderer.invoke("chat:executeInline", { decomposition, originalMessage }),
     // Subscribe to new messages (from WhatsApp sync)
     onNewMessage: (callback) => {
@@ -56,6 +56,62 @@ contextBridge.exposeInMainWorld("wovly", {
     setBrowserEnabled: (enabled) => ipcRenderer.invoke("integrations:setBrowserEnabled", { enabled }),
     testBrowser: () => ipcRenderer.invoke("integrations:testBrowser")
   },
+  // Telegram integration
+  telegram: {
+    setToken: (token) => ipcRenderer.invoke("telegram:setToken", { token }),
+    checkAuth: () => ipcRenderer.invoke("telegram:checkAuth"),
+    disconnect: () => ipcRenderer.invoke("telegram:disconnect"),
+    test: () => ipcRenderer.invoke("telegram:test")
+  },
+  // Discord integration
+  discord: {
+    startOAuth: (clientId, clientSecret) => ipcRenderer.invoke("discord:startOAuth", { clientId, clientSecret }),
+    checkAuth: () => ipcRenderer.invoke("discord:checkAuth"),
+    disconnect: () => ipcRenderer.invoke("discord:disconnect"),
+    test: () => ipcRenderer.invoke("discord:test")
+  },
+  // X (Twitter) integration
+  x: {
+    startOAuth: (clientId, clientSecret) => ipcRenderer.invoke("x:startOAuth", { clientId, clientSecret }),
+    checkAuth: () => ipcRenderer.invoke("x:checkAuth"),
+    disconnect: () => ipcRenderer.invoke("x:disconnect"),
+    test: () => ipcRenderer.invoke("x:test")
+  },
+  // Notion integration
+  notion: {
+    startOAuth: (clientId, clientSecret) => ipcRenderer.invoke("notion:startOAuth", { clientId, clientSecret }),
+    checkAuth: () => ipcRenderer.invoke("notion:checkAuth"),
+    disconnect: () => ipcRenderer.invoke("notion:disconnect"),
+    test: () => ipcRenderer.invoke("notion:test")
+  },
+  // GitHub integration
+  github: {
+    startOAuth: (clientId, clientSecret) => ipcRenderer.invoke("github:startOAuth", { clientId, clientSecret }),
+    checkAuth: () => ipcRenderer.invoke("github:checkAuth"),
+    disconnect: () => ipcRenderer.invoke("github:disconnect"),
+    test: () => ipcRenderer.invoke("github:test")
+  },
+  // Asana integration
+  asana: {
+    startOAuth: (clientId, clientSecret) => ipcRenderer.invoke("asana:startOAuth", { clientId, clientSecret }),
+    checkAuth: () => ipcRenderer.invoke("asana:checkAuth"),
+    disconnect: () => ipcRenderer.invoke("asana:disconnect"),
+    test: () => ipcRenderer.invoke("asana:test")
+  },
+  // Reddit integration
+  reddit: {
+    startOAuth: (clientId, clientSecret) => ipcRenderer.invoke("reddit:startOAuth", { clientId, clientSecret }),
+    checkAuth: () => ipcRenderer.invoke("reddit:checkAuth"),
+    disconnect: () => ipcRenderer.invoke("reddit:disconnect"),
+    test: () => ipcRenderer.invoke("reddit:test")
+  },
+  // Spotify integration
+  spotify: {
+    startOAuth: (clientId, clientSecret) => ipcRenderer.invoke("spotify:startOAuth", { clientId, clientSecret }),
+    checkAuth: () => ipcRenderer.invoke("spotify:checkAuth"),
+    disconnect: () => ipcRenderer.invoke("spotify:disconnect"),
+    test: () => ipcRenderer.invoke("spotify:test")
+  },
   profile: {
     get: () => ipcRenderer.invoke("profile:get"),
     update: (updates) => ipcRenderer.invoke("profile:update", { updates }),
@@ -70,7 +126,7 @@ contextBridge.exposeInMainWorld("wovly", {
   welcome: {
     generate: () => ipcRenderer.invoke("welcome:generate")
   },
-  // Chat Interfaces (WhatsApp, etc.)
+  // Chat Interfaces (WhatsApp, Telegram, etc.)
   whatsapp: {
     connect: () => ipcRenderer.invoke("whatsapp:connect"),
     disconnect: () => ipcRenderer.invoke("whatsapp:disconnect"),
@@ -84,6 +140,19 @@ contextBridge.exposeInMainWorld("wovly", {
       const handler = (_event, data) => callback(data);
       ipcRenderer.on("whatsapp:status", handler);
       return () => ipcRenderer.removeListener("whatsapp:status", handler);
+    }
+  },
+  // Telegram Chat Interface (talk to Wovly via Telegram bot)
+  telegramInterface: {
+    connect: () => ipcRenderer.invoke("telegramInterface:connect"),
+    disconnect: () => ipcRenderer.invoke("telegramInterface:disconnect"),
+    getStatus: () => ipcRenderer.invoke("telegramInterface:getStatus"),
+    checkAuth: () => ipcRenderer.invoke("telegramInterface:checkAuth"),
+    // Subscribe to status updates
+    onStatus: (callback) => {
+      const handler = (_event, data) => callback(data);
+      ipcRenderer.on("telegram:interfaceStatus", handler);
+      return () => ipcRenderer.removeListener("telegram:interfaceStatus", handler);
     }
   },
   // Tasks - autonomous background tasks
@@ -132,5 +201,19 @@ contextBridge.exposeInMainWorld("wovly", {
     get: (domain, includePassword = false) => ipcRenderer.invoke("credentials:get", { domain, includePassword }),
     save: (credential) => ipcRenderer.invoke("credentials:save", credential),
     delete: (domain) => ipcRenderer.invoke("credentials:delete", { domain })
+  },
+  // Shell utilities
+  shell: {
+    openExternal: (url) => ipcRenderer.invoke("shell:openExternal", { url })
+  },
+  // Authentication
+  auth: {
+    hasUsers: () => ipcRenderer.invoke("auth:hasUsers"),
+    listUsers: () => ipcRenderer.invoke("auth:listUsers"),
+    register: (username, password, displayName) => ipcRenderer.invoke("auth:register", { username, password, displayName }),
+    login: (username, password) => ipcRenderer.invoke("auth:login", { username, password }),
+    logout: () => ipcRenderer.invoke("auth:logout"),
+    checkSession: () => ipcRenderer.invoke("auth:checkSession"),
+    getCurrentUser: () => ipcRenderer.invoke("auth:getCurrentUser")
   }
 });

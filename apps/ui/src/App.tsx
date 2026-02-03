@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef, Fragment } from "react";
-import { WovlyIcon, GoogleIcon, IMessageIcon, WeatherIcon, SlackIcon, WhatsAppIcon, TelegramIcon, DiscordIcon, ClaudeIcon, OpenAIIcon, GeminiIcon, PlaywrightIcon, ChatIcon, TasksIcon, SkillsIcon, AboutMeIcon, InterfacesIcon, IntegrationsIcon, SettingsIcon, CredentialsIcon } from "./icons";
+import { WovlyIcon, GoogleIcon, IMessageIcon, WeatherIcon, SlackIcon, WhatsAppIcon, TelegramIcon, DiscordIcon, ClaudeIcon, OpenAIIcon, GeminiIcon, PlaywrightIcon, NotionIcon, GitHubIcon, AsanaIcon, RedditIcon, SpotifyIcon, DocsIcon, LogoutIcon, ChatIcon, TasksIcon, SkillsIcon, AboutMeIcon, InterfacesIcon, IntegrationsIcon, SettingsIcon, CredentialsIcon } from "./icons";
 
 type NavItem = "chat" | "tasks" | "skills" | "about-me" | "interfaces" | "integrations" | "credentials" | "settings";
 
@@ -215,7 +215,12 @@ function AgendaPanel() {
       }
       
       setLoading(true);
-      const dateStr = currentDate.toISOString().split("T")[0];
+      // Use local date format (YYYY-MM-DD) instead of toISOString() which converts to UTC
+      // toISOString() can shift the date by a day depending on timezone
+      const year = currentDate.getFullYear();
+      const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+      const day = String(currentDate.getDate()).padStart(2, '0');
+      const dateStr = `${year}-${month}-${day}`;
       const result = await window.wovly.calendar.getEvents(dateStr);
       
       if (result.ok && result.events) {
@@ -404,6 +409,16 @@ type PendingFactConfirmation = {
   conflictResolutions: { [key: number]: boolean }; // newFactIndex -> keepNew (true) or keepExisting (false)
 };
 
+// Workflow state to prevent ad-hoc features from interrupting active workflows
+type WorkflowState = {
+  type: 'clarifying_for_task' | 'confirming_facts' | 'inline_execution' | null;
+  context?: {
+    original_query?: string;
+    clarification_questions?: string[];
+    detected_facts?: ExtractedFact[];  // Store facts detected during workflow for later
+  };
+};
+
 function ChatPanel({
   messages,
   setMessages,
@@ -428,6 +443,9 @@ function ChatPanel({
   // Fact confirmation state (for informational statements)
   const [pendingFactConfirmation, setPendingFactConfirmation] = useState<PendingFactConfirmation | null>(null);
   const [isSavingFacts, setIsSavingFacts] = useState(false);
+  
+  // Workflow state - tracks active workflows to prevent interruption by ad-hoc features
+  const [activeWorkflow, setActiveWorkflow] = useState<WorkflowState>({ type: null });
 
   // Auto-scroll
   useEffect(() => {
@@ -558,7 +576,13 @@ function ChatPanel({
         content: m.content
       }));
 
-      const result = await window.wovly.chat.send(chatHistory) as {
+      // Pass workflow context to backend so it can skip info detection during clarification
+      const workflowContext = activeWorkflow.type ? {
+        type: activeWorkflow.type,
+        original_query: activeWorkflow.context?.original_query
+      } : null;
+
+      const result = await window.wovly.chat.send(chatHistory, workflowContext) as {
         ok: boolean;
         response?: string;
         error?: string;
@@ -569,14 +593,18 @@ function ChatPanel({
         suggestTask?: boolean;
         decomposition?: DecompositionResult;
         clarification_needed?: boolean;
+        clarification_questions?: Array<{ question: string }>;
+        original_query?: string;
         executedInline?: boolean;
+        detectedFacts?: ExtractedFact[];  // Facts detected during clarification (captured silently)
       };
 
       if (result.ok && result.response) {
         const responseText = result.response;
         
         // Check if this is an informational statement that needs confirmation
-        if (result.informationType && result.facts && result.facts.length > 0) {
+        // Only show fact confirmation if NOT in an active workflow (to avoid interruption)
+        if (result.informationType && result.facts && result.facts.length > 0 && !activeWorkflow.type) {
           // Initialize conflict resolutions - default to keeping new facts
           const initialResolutions: { [key: number]: boolean } = {};
           (result.conflicts || []).forEach((conflict) => {
@@ -594,6 +622,43 @@ function ChatPanel({
         // Check if this is a task suggestion from query decomposition
         if (result.suggestTask && result.decomposition) {
           setPendingDecomposition(result.decomposition as DecompositionResult);
+          
+          // Clear clarification workflow since we now have a task suggestion
+          if (activeWorkflow.type === 'clarifying_for_task') {
+            // If facts were detected during clarification, store them for later
+            const detectedFacts = result.detectedFacts || activeWorkflow.context?.detected_facts;
+            if (detectedFacts && detectedFacts.length > 0) {
+              // Store facts in decomposition context for prompting after task creation
+              setActiveWorkflow({ 
+                type: null, 
+                context: { detected_facts: detectedFacts } 
+              });
+            } else {
+              setActiveWorkflow({ type: null });
+            }
+          }
+        }
+        
+        // Handle clarification response - set workflow state
+        if (result.clarification_needed) {
+          setActiveWorkflow({
+            type: 'clarifying_for_task',
+            context: {
+              original_query: result.original_query || userMessage.content,
+              clarification_questions: result.clarification_questions?.map(q => q.question) || []
+            }
+          });
+        }
+        
+        // If facts were silently detected during workflow, store them for later
+        if (result.detectedFacts && result.detectedFacts.length > 0 && activeWorkflow.type) {
+          setActiveWorkflow(prev => ({
+            ...prev,
+            context: {
+              ...prev.context,
+              detected_facts: [...(prev.context?.detected_facts || []), ...result.detectedFacts!]
+            }
+          }));
         }
         
         // Determine the source type based on response flags
@@ -644,10 +709,15 @@ function ChatPanel({
       const taskType = pendingDecomposition.task_type || "discrete";
       const isContinuous = taskType === "continuous";
       
+      // Find the most recent USER message from the app (not task status updates or other sources)
+      // This ensures we capture the actual user request, not a task notification that came in between
+      const userMessages = messages.filter(m => m.role === "user" && (m.source === "app" || !m.source));
+      const originalUserRequest = userMessages[userMessages.length - 1]?.content || pendingDecomposition.title;
+      
       // Create task with the decomposition plan
       const taskResult = await window.wovly.tasks.create({
         title: pendingDecomposition.title,
-        originalRequest: messages[messages.length - 2]?.content || pendingDecomposition.title, // Get the user's original message
+        originalRequest: originalUserRequest,
         plan: pendingDecomposition.steps.map(s => s.action),
         taskType: taskType,
         // For continuous tasks, pass monitoring info
@@ -672,6 +742,22 @@ function ChatPanel({
           source: "task"
         }]);
         setPendingDecomposition(null);
+        
+        // Check if we have deferred facts from the clarification workflow
+        const deferredFacts = activeWorkflow.context?.detected_facts;
+        if (deferredFacts && deferredFacts.length > 0) {
+          // Prompt user to save facts that were detected during task creation
+          const initialResolutions: { [key: number]: boolean } = {};
+          setPendingFactConfirmation({
+            facts: deferredFacts,
+            conflicts: [], // No conflict check for deferred facts (simplification)
+            originalInput: "",
+            conflictResolutions: initialResolutions
+          });
+        }
+        
+        // Clear workflow state
+        setActiveWorkflow({ type: null });
       } else {
         setError(taskResult.error || "Failed to create task");
       }
@@ -685,6 +771,8 @@ function ChatPanel({
   // Cancel the task suggestion entirely (close button)
   const handleCancelTaskSuggestion = () => {
     setPendingDecomposition(null);
+    // Clear workflow state and any deferred facts
+    setActiveWorkflow({ type: null });
     // Just return to normal chat mode - no action needed
   };
 
@@ -692,14 +780,20 @@ function ChatPanel({
   const handleDismissTaskSuggestion = async () => {
     if (!pendingDecomposition || !window.wovly) {
       setPendingDecomposition(null);
+      setActiveWorkflow({ type: null });
       return;
     }
     
-    // Get the original user message (the one before the decomposition response)
-    const originalMessage = messages[messages.length - 2]?.content || "";
+    // Find the most recent USER message from the app (not task status updates or other sources)
+    const userMessages = messages.filter(m => m.role === "user" && (m.source === "app" || !m.source));
+    const originalMessage = userMessages[userMessages.length - 1]?.content || "";
     const decomposition = pendingDecomposition;
     
+    // Store any deferred facts before clearing
+    const deferredFacts = activeWorkflow.context?.detected_facts;
+    
     setPendingDecomposition(null);
+    setActiveWorkflow({ type: 'inline_execution' }); // Mark as inline execution workflow
     setIsLoading(true);
     
     try {
@@ -715,6 +809,17 @@ function ChatPanel({
           content: responseContent,
           source: "decomposed" as const
         }]);
+        
+        // After inline execution completes, prompt for deferred facts if any
+        if (deferredFacts && deferredFacts.length > 0) {
+          const initialResolutions: { [key: number]: boolean } = {};
+          setPendingFactConfirmation({
+            facts: deferredFacts,
+            conflicts: [],
+            originalInput: "",
+            conflictResolutions: initialResolutions
+          });
+        }
       } else if (result.error) {
         setError(result.error);
       }
@@ -722,6 +827,7 @@ function ChatPanel({
       setError(err instanceof Error ? err.message : "Failed to execute steps");
     } finally {
       setIsLoading(false);
+      setActiveWorkflow({ type: null }); // Clear workflow after inline execution
     }
   };
 
@@ -1657,6 +1763,983 @@ function WhatsAppSetupModal({
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Telegram Setup Modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+function TelegramSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete: () => void }) {
+  const [step, setStep] = useState(1);
+  const [token, setToken] = useState("");
+  const [authStatus, setAuthStatus] = useState<"idle" | "connecting" | "success" | "error">("idle");
+  const [authError, setAuthError] = useState("");
+
+  const handleConnect = async () => {
+    if (!token) return;
+    
+    setAuthStatus("connecting");
+    setAuthError("");
+
+    try {
+      const result = await window.wovly.telegram.setToken(token);
+      if (result.ok) {
+        setAuthStatus("success");
+        setTimeout(onComplete, 1500);
+      } else {
+        setAuthStatus("error");
+        setAuthError(result.error || "Connection failed");
+      }
+    } catch (err) {
+      setAuthStatus("error");
+      setAuthError(err instanceof Error ? err.message : "Connection failed");
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Connect Telegram</h2>
+          <button className="close-btn" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          {step === 1 && (
+            <>
+              <h3>Step 1: Create a Telegram Bot</h3>
+              <ol>
+                <li>Open Telegram and search for <strong>@BotFather</strong></li>
+                <li>Send the command <code>/newbot</code></li>
+                <li>Follow the prompts to name your bot</li>
+                <li>Copy the bot token provided by BotFather</li>
+              </ol>
+              <button className="primary" onClick={() => setStep(2)}>Next</button>
+            </>
+          )}
+
+          {step === 2 && (
+            <>
+              <h3>Step 2: Enter Bot Token</h3>
+              <p>Paste the bot token you received from @BotFather:</p>
+              
+              <div className="form-group">
+                <label>Bot Token:</label>
+                <input
+                  type="password"
+                  value={token}
+                  onChange={e => setToken(e.target.value)}
+                  placeholder="123456789:ABCdefGHIjklmNOPqrs..."
+                />
+              </div>
+
+              {authStatus === "idle" && (
+                <button className="primary" onClick={handleConnect} disabled={!token}>
+                  Connect
+                </button>
+              )}
+              
+              {authStatus === "connecting" && (
+                <p className="info-text">Connecting to Telegram...</p>
+              )}
+              
+              {authStatus === "success" && (
+                <p className="success-text">✓ Connected successfully!</p>
+              )}
+              
+              {authStatus === "error" && (
+                <>
+                  <p className="error-text">✗ {authError}</p>
+                  <button className="primary" onClick={handleConnect}>Try Again</button>
+                </>
+              )}
+
+              <button className="secondary" onClick={() => setStep(1)}>Back</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Discord Setup Modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+function DiscordSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete: () => void }) {
+  const [step, setStep] = useState(1);
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [authStatus, setAuthStatus] = useState<"idle" | "authorizing" | "success" | "error">("idle");
+  const [authError, setAuthError] = useState("");
+
+  const handleAuthorize = async () => {
+    if (!clientId || !clientSecret) return;
+    
+    setAuthStatus("authorizing");
+    setAuthError("");
+
+    try {
+      const result = await window.wovly.discord.startOAuth(clientId, clientSecret);
+      if (result.ok) {
+        setAuthStatus("success");
+        setTimeout(onComplete, 1500);
+      } else {
+        setAuthStatus("error");
+        setAuthError(result.error || "Authorization failed");
+      }
+    } catch (err) {
+      setAuthStatus("error");
+      setAuthError(err instanceof Error ? err.message : "Authorization failed");
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Connect Discord</h2>
+          <button className="close-btn" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          {step === 1 && (
+            <>
+              <h3>Step 1: Create a Discord Application</h3>
+              <ol>
+                <li>Go to <a href="https://discord.com/developers/applications" target="_blank" rel="noreferrer">Discord Developer Portal</a></li>
+                <li>Click "New Application"</li>
+                <li>Name your application</li>
+              </ol>
+              <button className="primary" onClick={() => setStep(2)}>Next</button>
+            </>
+          )}
+
+          {step === 2 && (
+            <>
+              <h3>Step 2: Create a Bot</h3>
+              <ol>
+                <li>Go to the "Bot" section in the left menu</li>
+                <li>Click "Add Bot"</li>
+                <li>Enable "Message Content Intent" under Privileged Gateway Intents</li>
+              </ol>
+              <button className="secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="primary" onClick={() => setStep(3)}>Next</button>
+            </>
+          )}
+
+          {step === 3 && (
+            <>
+              <h3>Step 3: Configure OAuth2</h3>
+              <ol>
+                <li>Go to the "OAuth2" section</li>
+                <li>Add this redirect URI:
+                  <div className="code-block">http://localhost:18923/oauth/callback</div>
+                </li>
+                <li>Copy the Client ID and Client Secret</li>
+              </ol>
+              <button className="secondary" onClick={() => setStep(2)}>Back</button>
+              <button className="primary" onClick={() => setStep(4)}>Next</button>
+            </>
+          )}
+
+          {step === 4 && (
+            <>
+              <h3>Step 4: Enter Credentials</h3>
+              
+              <div className="form-group">
+                <label>Client ID:</label>
+                <input
+                  type="text"
+                  value={clientId}
+                  onChange={e => setClientId(e.target.value)}
+                  placeholder="Your client ID"
+                />
+              </div>
+              
+              <div className="form-group">
+                <label>Client Secret:</label>
+                <input
+                  type="password"
+                  value={clientSecret}
+                  onChange={e => setClientSecret(e.target.value)}
+                  placeholder="Your client secret"
+                />
+              </div>
+
+              {authStatus === "idle" && (
+                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                  Authorize with Discord
+                </button>
+              )}
+              
+              {authStatus === "authorizing" && (
+                <p className="info-text">Opening browser for authorization...</p>
+              )}
+              
+              {authStatus === "success" && (
+                <p className="success-text">✓ Authorization successful!</p>
+              )}
+              
+              {authStatus === "error" && (
+                <>
+                  <p className="error-text">✗ {authError}</p>
+                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                </>
+              )}
+
+              <button className="secondary" onClick={() => setStep(3)}>Back</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// X (Twitter) Setup Modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+function XSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete: () => void }) {
+  const [step, setStep] = useState(1);
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [authStatus, setAuthStatus] = useState<"idle" | "authorizing" | "success" | "error">("idle");
+  const [authError, setAuthError] = useState("");
+
+  const handleAuthorize = async () => {
+    if (!clientId || !clientSecret) return;
+    
+    setAuthStatus("authorizing");
+    setAuthError("");
+
+    try {
+      const result = await window.wovly.x.startOAuth(clientId, clientSecret);
+      if (result.ok) {
+        setAuthStatus("success");
+        setTimeout(onComplete, 1500);
+      } else {
+        setAuthStatus("error");
+        setAuthError(result.error || "Authorization failed");
+      }
+    } catch (err) {
+      setAuthStatus("error");
+      setAuthError(err instanceof Error ? err.message : "Authorization failed");
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Connect X (Twitter)</h2>
+          <button className="close-btn" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          {step === 1 && (
+            <>
+              <h3>Step 1: Create Developer Account</h3>
+              <ol>
+                <li>Go to <a href="https://developer.x.com" target="_blank" rel="noreferrer">X Developer Portal</a></li>
+                <li>Sign up for a developer account</li>
+                <li>Create a new Project and App</li>
+              </ol>
+              <button className="primary" onClick={() => setStep(2)}>Next</button>
+            </>
+          )}
+
+          {step === 2 && (
+            <>
+              <h3>Step 2: Configure App Settings</h3>
+              <ol>
+                <li>Go to "User authentication settings"</li>
+                <li>Enable OAuth 2.0</li>
+                <li>Set App permissions to "Read and write"</li>
+                <li>Add callback URL:
+                  <div className="code-block">http://localhost:18923/oauth/callback</div>
+                </li>
+              </ol>
+              <button className="secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="primary" onClick={() => setStep(3)}>Next</button>
+            </>
+          )}
+
+          {step === 3 && (
+            <>
+              <h3>Step 3: Get Credentials</h3>
+              <ol>
+                <li>Go to "Keys and tokens" tab</li>
+                <li>Copy Client ID (OAuth 2.0)</li>
+                <li>Generate and copy Client Secret</li>
+              </ol>
+              <button className="secondary" onClick={() => setStep(2)}>Back</button>
+              <button className="primary" onClick={() => setStep(4)}>Next</button>
+            </>
+          )}
+
+          {step === 4 && (
+            <>
+              <h3>Step 4: Enter Credentials</h3>
+              <p className="info-text">Note: Free tier has limits (500 posts/100 reads per month)</p>
+              
+              <div className="form-group">
+                <label>Client ID:</label>
+                <input
+                  type="text"
+                  value={clientId}
+                  onChange={e => setClientId(e.target.value)}
+                  placeholder="Your OAuth 2.0 client ID"
+                />
+              </div>
+              
+              <div className="form-group">
+                <label>Client Secret:</label>
+                <input
+                  type="password"
+                  value={clientSecret}
+                  onChange={e => setClientSecret(e.target.value)}
+                  placeholder="Your client secret"
+                />
+              </div>
+
+              {authStatus === "idle" && (
+                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                  Authorize with X
+                </button>
+              )}
+              
+              {authStatus === "authorizing" && (
+                <p className="info-text">Opening browser for authorization...</p>
+              )}
+              
+              {authStatus === "success" && (
+                <p className="success-text">✓ Authorization successful!</p>
+              )}
+              
+              {authStatus === "error" && (
+                <>
+                  <p className="error-text">✗ {authError}</p>
+                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                </>
+              )}
+
+              <button className="secondary" onClick={() => setStep(3)}>Back</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Notion Setup Modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+function NotionSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete: () => void }) {
+  const [step, setStep] = useState(1);
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [authStatus, setAuthStatus] = useState<"idle" | "authorizing" | "success" | "error">("idle");
+  const [authError, setAuthError] = useState("");
+
+  const handleAuthorize = async () => {
+    if (!clientId || !clientSecret) return;
+    
+    setAuthStatus("authorizing");
+    setAuthError("");
+
+    try {
+      const result = await window.wovly.notion.startOAuth(clientId, clientSecret);
+      if (result.ok) {
+        setAuthStatus("success");
+        setTimeout(onComplete, 1500);
+      } else {
+        setAuthStatus("error");
+        setAuthError(result.error || "Authorization failed");
+      }
+    } catch (err) {
+      setAuthStatus("error");
+      setAuthError(err instanceof Error ? err.message : "Authorization failed");
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Connect Notion</h2>
+          <button className="close-btn" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          {step === 1 && (
+            <>
+              <h3>Step 1: Create Integration</h3>
+              <ol>
+                <li>Go to <a href="https://www.notion.so/my-integrations" target="_blank" rel="noreferrer">Notion Integrations</a></li>
+                <li>Click "New integration"</li>
+                <li>Name it and select your workspace</li>
+                <li>Set capabilities (Read/Update/Insert content)</li>
+              </ol>
+              <button className="primary" onClick={() => setStep(2)}>Next</button>
+            </>
+          )}
+
+          {step === 2 && (
+            <>
+              <h3>Step 2: Enable OAuth (Public Integration)</h3>
+              <ol>
+                <li>Go to the "Distribution" tab</li>
+                <li>Enable public integration</li>
+                <li>Add redirect URI:
+                  <div className="code-block">http://localhost:18923/oauth/callback</div>
+                </li>
+                <li>Copy OAuth client ID and secret</li>
+              </ol>
+              <button className="secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="primary" onClick={() => setStep(3)}>Next</button>
+            </>
+          )}
+
+          {step === 3 && (
+            <>
+              <h3>Step 3: Enter Credentials</h3>
+              <p className="info-text">Note: You'll need to share pages with the integration in Notion</p>
+              
+              <div className="form-group">
+                <label>OAuth Client ID:</label>
+                <input
+                  type="text"
+                  value={clientId}
+                  onChange={e => setClientId(e.target.value)}
+                  placeholder="Your OAuth client ID"
+                />
+              </div>
+              
+              <div className="form-group">
+                <label>OAuth Client Secret:</label>
+                <input
+                  type="password"
+                  value={clientSecret}
+                  onChange={e => setClientSecret(e.target.value)}
+                  placeholder="Your OAuth client secret"
+                />
+              </div>
+
+              {authStatus === "idle" && (
+                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                  Authorize with Notion
+                </button>
+              )}
+              
+              {authStatus === "authorizing" && (
+                <p className="info-text">Opening browser for authorization...</p>
+              )}
+              
+              {authStatus === "success" && (
+                <p className="success-text">✓ Authorization successful!</p>
+              )}
+              
+              {authStatus === "error" && (
+                <>
+                  <p className="error-text">✗ {authError}</p>
+                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                </>
+              )}
+
+              <button className="secondary" onClick={() => setStep(2)}>Back</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GitHub Setup Modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+function GitHubSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete: () => void }) {
+  const [step, setStep] = useState(1);
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [authStatus, setAuthStatus] = useState<"idle" | "authorizing" | "success" | "error">("idle");
+  const [authError, setAuthError] = useState("");
+
+  const handleAuthorize = async () => {
+    if (!clientId || !clientSecret) return;
+    
+    setAuthStatus("authorizing");
+    setAuthError("");
+
+    try {
+      const result = await window.wovly.github.startOAuth(clientId, clientSecret);
+      if (result.ok) {
+        setAuthStatus("success");
+        setTimeout(onComplete, 1500);
+      } else {
+        setAuthStatus("error");
+        setAuthError(result.error || "Authorization failed");
+      }
+    } catch (err) {
+      setAuthStatus("error");
+      setAuthError(err instanceof Error ? err.message : "Authorization failed");
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Connect GitHub</h2>
+          <button className="close-btn" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          {step === 1 && (
+            <>
+              <h3>Step 1: Create OAuth App</h3>
+              <ol>
+                <li>Go to <a href="https://github.com/settings/developers" target="_blank" rel="noreferrer">GitHub Developer Settings</a></li>
+                <li>Click "New OAuth App"</li>
+                <li>Fill in application name and homepage URL</li>
+              </ol>
+              <button className="primary" onClick={() => setStep(2)}>Next</button>
+            </>
+          )}
+
+          {step === 2 && (
+            <>
+              <h3>Step 2: Configure OAuth</h3>
+              <ol>
+                <li>Set Authorization callback URL:
+                  <div className="code-block">http://localhost:18923/oauth/callback</div>
+                </li>
+                <li>Register the application</li>
+                <li>Copy Client ID</li>
+                <li>Generate and copy Client Secret</li>
+              </ol>
+              <button className="secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="primary" onClick={() => setStep(3)}>Next</button>
+            </>
+          )}
+
+          {step === 3 && (
+            <>
+              <h3>Step 3: Enter Credentials</h3>
+              
+              <div className="form-group">
+                <label>Client ID:</label>
+                <input
+                  type="text"
+                  value={clientId}
+                  onChange={e => setClientId(e.target.value)}
+                  placeholder="Your client ID"
+                />
+              </div>
+              
+              <div className="form-group">
+                <label>Client Secret:</label>
+                <input
+                  type="password"
+                  value={clientSecret}
+                  onChange={e => setClientSecret(e.target.value)}
+                  placeholder="Your client secret"
+                />
+              </div>
+
+              {authStatus === "idle" && (
+                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                  Authorize with GitHub
+                </button>
+              )}
+              
+              {authStatus === "authorizing" && (
+                <p className="info-text">Opening browser for authorization...</p>
+              )}
+              
+              {authStatus === "success" && (
+                <p className="success-text">✓ Authorization successful!</p>
+              )}
+              
+              {authStatus === "error" && (
+                <>
+                  <p className="error-text">✗ {authError}</p>
+                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                </>
+              )}
+
+              <button className="secondary" onClick={() => setStep(2)}>Back</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Asana Setup Modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+function AsanaSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete: () => void }) {
+  const [step, setStep] = useState(1);
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [authStatus, setAuthStatus] = useState<"idle" | "authorizing" | "success" | "error">("idle");
+  const [authError, setAuthError] = useState("");
+
+  const handleAuthorize = async () => {
+    if (!clientId || !clientSecret) return;
+    
+    setAuthStatus("authorizing");
+    setAuthError("");
+
+    try {
+      const result = await window.wovly.asana.startOAuth(clientId, clientSecret);
+      if (result.ok) {
+        setAuthStatus("success");
+        setTimeout(onComplete, 1500);
+      } else {
+        setAuthStatus("error");
+        setAuthError(result.error || "Authorization failed");
+      }
+    } catch (err) {
+      setAuthStatus("error");
+      setAuthError(err instanceof Error ? err.message : "Authorization failed");
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Connect Asana</h2>
+          <button className="close-btn" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          {step === 1 && (
+            <>
+              <h3>Step 1: Create App</h3>
+              <ol>
+                <li>Go to <a href="https://app.asana.com/0/my-apps" target="_blank" rel="noreferrer">Asana Developer Console</a></li>
+                <li>Click "Create New App"</li>
+                <li>Name your application</li>
+              </ol>
+              <button className="primary" onClick={() => setStep(2)}>Next</button>
+            </>
+          )}
+
+          {step === 2 && (
+            <>
+              <h3>Step 2: Configure OAuth</h3>
+              <ol>
+                <li>Go to the "OAuth" tab</li>
+                <li>Add redirect URL:
+                  <div className="code-block">http://localhost:18923/oauth/callback</div>
+                </li>
+                <li>Copy Client ID and Client Secret</li>
+              </ol>
+              <button className="secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="primary" onClick={() => setStep(3)}>Next</button>
+            </>
+          )}
+
+          {step === 3 && (
+            <>
+              <h3>Step 3: Enter Credentials</h3>
+              
+              <div className="form-group">
+                <label>Client ID:</label>
+                <input
+                  type="text"
+                  value={clientId}
+                  onChange={e => setClientId(e.target.value)}
+                  placeholder="Your client ID"
+                />
+              </div>
+              
+              <div className="form-group">
+                <label>Client Secret:</label>
+                <input
+                  type="password"
+                  value={clientSecret}
+                  onChange={e => setClientSecret(e.target.value)}
+                  placeholder="Your client secret"
+                />
+              </div>
+
+              {authStatus === "idle" && (
+                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                  Authorize with Asana
+                </button>
+              )}
+              
+              {authStatus === "authorizing" && (
+                <p className="info-text">Opening browser for authorization...</p>
+              )}
+              
+              {authStatus === "success" && (
+                <p className="success-text">✓ Authorization successful!</p>
+              )}
+              
+              {authStatus === "error" && (
+                <>
+                  <p className="error-text">✗ {authError}</p>
+                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                </>
+              )}
+
+              <button className="secondary" onClick={() => setStep(2)}>Back</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reddit Setup Modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+function RedditSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete: () => void }) {
+  const [step, setStep] = useState(1);
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [authStatus, setAuthStatus] = useState<"idle" | "authorizing" | "success" | "error">("idle");
+  const [authError, setAuthError] = useState("");
+
+  const handleAuthorize = async () => {
+    if (!clientId || !clientSecret) return;
+    
+    setAuthStatus("authorizing");
+    setAuthError("");
+
+    try {
+      const result = await window.wovly.reddit.startOAuth(clientId, clientSecret);
+      if (result.ok) {
+        setAuthStatus("success");
+        setTimeout(onComplete, 1500);
+      } else {
+        setAuthStatus("error");
+        setAuthError(result.error || "Authorization failed");
+      }
+    } catch (err) {
+      setAuthStatus("error");
+      setAuthError(err instanceof Error ? err.message : "Authorization failed");
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Connect Reddit</h2>
+          <button className="close-btn" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          {step === 1 && (
+            <>
+              <h3>Step 1: Create App</h3>
+              <ol>
+                <li>Go to <a href="https://www.reddit.com/prefs/apps" target="_blank" rel="noreferrer">Reddit App Preferences</a></li>
+                <li>Click "create another app..."</li>
+                <li>Select "web app" type</li>
+                <li>Set redirect URI:
+                  <div className="code-block">http://localhost:18923/oauth/callback</div>
+                </li>
+              </ol>
+              <button className="primary" onClick={() => setStep(2)}>Next</button>
+            </>
+          )}
+
+          {step === 2 && (
+            <>
+              <h3>Step 2: Get Credentials</h3>
+              <ol>
+                <li>Copy the Client ID (shown under the app name)</li>
+                <li>Copy the Client Secret</li>
+              </ol>
+              <button className="secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="primary" onClick={() => setStep(3)}>Next</button>
+            </>
+          )}
+
+          {step === 3 && (
+            <>
+              <h3>Step 3: Enter Credentials</h3>
+              
+              <div className="form-group">
+                <label>Client ID:</label>
+                <input
+                  type="text"
+                  value={clientId}
+                  onChange={e => setClientId(e.target.value)}
+                  placeholder="Your client ID"
+                />
+              </div>
+              
+              <div className="form-group">
+                <label>Client Secret:</label>
+                <input
+                  type="password"
+                  value={clientSecret}
+                  onChange={e => setClientSecret(e.target.value)}
+                  placeholder="Your client secret"
+                />
+              </div>
+
+              {authStatus === "idle" && (
+                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                  Authorize with Reddit
+                </button>
+              )}
+              
+              {authStatus === "authorizing" && (
+                <p className="info-text">Opening browser for authorization...</p>
+              )}
+              
+              {authStatus === "success" && (
+                <p className="success-text">✓ Authorization successful!</p>
+              )}
+              
+              {authStatus === "error" && (
+                <>
+                  <p className="error-text">✗ {authError}</p>
+                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                </>
+              )}
+
+              <button className="secondary" onClick={() => setStep(2)}>Back</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Spotify Setup Modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+function SpotifySetupModal({ onClose, onComplete }: { onClose: () => void; onComplete: () => void }) {
+  const [step, setStep] = useState(1);
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [authStatus, setAuthStatus] = useState<"idle" | "authorizing" | "success" | "error">("idle");
+  const [authError, setAuthError] = useState("");
+
+  const handleAuthorize = async () => {
+    if (!clientId || !clientSecret) return;
+    
+    setAuthStatus("authorizing");
+    setAuthError("");
+
+    try {
+      const result = await window.wovly.spotify.startOAuth(clientId, clientSecret);
+      if (result.ok) {
+        setAuthStatus("success");
+        setTimeout(onComplete, 1500);
+      } else {
+        setAuthStatus("error");
+        setAuthError(result.error || "Authorization failed");
+      }
+    } catch (err) {
+      setAuthStatus("error");
+      setAuthError(err instanceof Error ? err.message : "Authorization failed");
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Connect Spotify</h2>
+          <button className="close-btn" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          {step === 1 && (
+            <>
+              <h3>Step 1: Create App</h3>
+              <ol>
+                <li>Go to <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noreferrer">Spotify Developer Dashboard</a></li>
+                <li>Click "Create app"</li>
+                <li>Name your app and add a description</li>
+              </ol>
+              <button className="primary" onClick={() => setStep(2)}>Next</button>
+            </>
+          )}
+
+          {step === 2 && (
+            <>
+              <h3>Step 2: Configure Settings</h3>
+              <ol>
+                <li>Go to app settings</li>
+                <li>Add redirect URI:
+                  <div className="code-block">http://localhost:18923/oauth/callback</div>
+                </li>
+                <li>Copy Client ID and Client Secret</li>
+              </ol>
+              <button className="secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="primary" onClick={() => setStep(3)}>Next</button>
+            </>
+          )}
+
+          {step === 3 && (
+            <>
+              <h3>Step 3: Enter Credentials</h3>
+              <p className="info-text">Note: Playback control requires Spotify Premium</p>
+              
+              <div className="form-group">
+                <label>Client ID:</label>
+                <input
+                  type="text"
+                  value={clientId}
+                  onChange={e => setClientId(e.target.value)}
+                  placeholder="Your client ID"
+                />
+              </div>
+              
+              <div className="form-group">
+                <label>Client Secret:</label>
+                <input
+                  type="password"
+                  value={clientSecret}
+                  onChange={e => setClientSecret(e.target.value)}
+                  placeholder="Your client secret"
+                />
+              </div>
+
+              {authStatus === "idle" && (
+                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                  Authorize with Spotify
+                </button>
+              )}
+              
+              {authStatus === "authorizing" && (
+                <p className="info-text">Opening browser for authorization...</p>
+              )}
+              
+              {authStatus === "success" && (
+                <p className="success-text">✓ Authorization successful!</p>
+              )}
+              
+              {authStatus === "error" && (
+                <>
+                  <p className="error-text">✗ {authError}</p>
+                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                </>
+              )}
+
+              <button className="secondary" onClick={() => setStep(2)}>Back</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tasks Page
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2568,14 +3651,24 @@ tool1, tool2`}</pre>
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Interfaces Page (WhatsApp, future: iMessage, Telegram, Discord)
+// Interfaces Page (WhatsApp, Telegram, future: Discord)
 // ─────────────────────────────────────────────────────────────────────────────
+
+type TelegramInterfaceStatus = "disconnected" | "connecting" | "connected";
 
 function InterfacesPage() {
   const [whatsappConnected, setWhatsappConnected] = useState(false);
   const [whatsappStatus, setWhatsappStatus] = useState<WhatsAppStatus>("disconnected");
   const [showWhatsAppSetup, setShowWhatsAppSetup] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
+
+  // Telegram Interface state
+  const [telegramInterfaceConnected, setTelegramInterfaceConnected] = useState(false);
+  const [telegramInterfaceStatus, setTelegramInterfaceStatus] = useState<TelegramInterfaceStatus>("disconnected");
+  const [telegramHasBot, setTelegramHasBot] = useState(false);
+  const [telegramConnecting, setTelegramConnecting] = useState(false);
+  const [telegramDisconnecting, setTelegramDisconnecting] = useState(false);
+  const [telegramError, setTelegramError] = useState("");
 
   useEffect(() => {
     // Check WhatsApp auth status
@@ -2585,16 +3678,33 @@ function InterfacesPage() {
       if (result.ok) {
         setWhatsappConnected(result.connected);
       }
+
+      // Check Telegram interface status
+      const telegramResult = await window.wovly.telegramInterface?.checkAuth();
+      if (telegramResult?.ok) {
+        setTelegramHasBot(telegramResult.hasBot);
+        setTelegramInterfaceConnected(telegramResult.connected);
+      }
     };
     checkStatus();
 
-    // Subscribe to status updates
-    const unsubscribe = window.wovly.whatsapp.onStatus((data) => {
+    // Subscribe to WhatsApp status updates
+    const unsubscribeWhatsApp = window.wovly.whatsapp.onStatus((data) => {
       setWhatsappStatus(data.status);
       setWhatsappConnected(data.status === "connected");
     });
 
-    return unsubscribe;
+    // Subscribe to Telegram interface status updates
+    const unsubscribeTelegram = window.wovly.telegramInterface?.onStatus((data) => {
+      setTelegramInterfaceStatus(data.status);
+      setTelegramInterfaceConnected(data.status === "connected");
+      setTelegramConnecting(false);
+    });
+
+    return () => {
+      unsubscribeWhatsApp();
+      unsubscribeTelegram?.();
+    };
   }, []);
 
   const handleDisconnect = async () => {
@@ -2609,6 +3719,33 @@ function InterfacesPage() {
 
   const handleReconnect = async () => {
     await window.wovly.whatsapp.connect();
+  };
+
+  // Telegram Interface handlers
+  const handleTelegramConnect = async () => {
+    setTelegramConnecting(true);
+    setTelegramError("");
+    try {
+      const result = await window.wovly.telegramInterface.connect();
+      if (!result.ok) {
+        setTelegramError(result.error || "Failed to connect");
+        setTelegramConnecting(false);
+      }
+      // Status will be updated via the onStatus subscription
+    } catch (err) {
+      setTelegramError(err instanceof Error ? err.message : "Connection failed");
+      setTelegramConnecting(false);
+    }
+  };
+
+  const handleTelegramDisconnect = async () => {
+    if (!confirm("Disconnect Telegram chat interface?")) {
+      return;
+    }
+    setTelegramDisconnecting(true);
+    await window.wovly.telegramInterface.disconnect();
+    setTelegramInterfaceConnected(false);
+    setTelegramDisconnecting(false);
   };
 
   return (
@@ -2658,17 +3795,55 @@ function InterfacesPage() {
         </div>
       </div>
 
-      {/* Telegram - Coming Soon */}
-      <div className="interface-row disabled">
+      {/* Telegram */}
+      <div className="interface-row">
         <div className="interface-icon telegram">
           <TelegramIcon size={32} />
         </div>
         <div className="interface-info">
           <h3>Telegram</h3>
-          <p>Chat with Wovly via Telegram</p>
+          <p>Chat with Wovly via your Telegram bot</p>
+          {!telegramHasBot && (
+            <span className="interface-detail warning">Set up a Telegram bot in Integrations first</span>
+          )}
+          {telegramInterfaceConnected && (
+            <span className="interface-detail">Messages to your bot will be answered by Wovly</span>
+          )}
+          {telegramError && (
+            <span className="interface-detail error">{telegramError}</span>
+          )}
         </div>
         <div className="interface-status">
-          <span className="status coming-soon">Coming soon</span>
+          {telegramInterfaceConnected ? (
+            <>
+              <span className="status connected">Connected</span>
+              <button 
+                className="danger small" 
+                onClick={handleTelegramDisconnect}
+                disabled={telegramDisconnecting}
+              >
+                {telegramDisconnecting ? "..." : "Disconnect"}
+              </button>
+            </>
+          ) : telegramConnecting || telegramInterfaceStatus === "connecting" ? (
+            <>
+              <span className="status connecting">Connecting...</span>
+            </>
+          ) : telegramHasBot ? (
+            <>
+              <span className="status disconnected">Not listening</span>
+              <button className="primary small" onClick={handleTelegramConnect}>
+                Start Listening
+              </button>
+            </>
+          ) : (
+            <>
+              <span className="status disconnected">No bot configured</span>
+              <button className="secondary small" disabled>
+                Setup bot first
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -2741,6 +3916,47 @@ function IntegrationsPage() {
   const [testingBrowser, setTestingBrowser] = useState(false);
   const [browserTestResult, setBrowserTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
 
+  // New integrations state
+  const [telegramConnected, setTelegramConnected] = useState(false);
+  const [showTelegramSetup, setShowTelegramSetup] = useState(false);
+  const [testingTelegram, setTestingTelegram] = useState(false);
+  const [telegramTestResult, setTelegramTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
+
+  const [discordConnected, setDiscordConnected] = useState(false);
+  const [showDiscordSetup, setShowDiscordSetup] = useState(false);
+  const [testingDiscord, setTestingDiscord] = useState(false);
+  const [discordTestResult, setDiscordTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
+
+  const [xConnected, setXConnected] = useState(false);
+  const [showXSetup, setShowXSetup] = useState(false);
+  const [testingX, setTestingX] = useState(false);
+  const [xTestResult, setXTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
+
+  const [notionConnected, setNotionConnected] = useState(false);
+  const [showNotionSetup, setShowNotionSetup] = useState(false);
+  const [testingNotion, setTestingNotion] = useState(false);
+  const [notionTestResult, setNotionTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
+
+  const [githubConnected, setGithubConnected] = useState(false);
+  const [showGithubSetup, setShowGithubSetup] = useState(false);
+  const [testingGithub, setTestingGithub] = useState(false);
+  const [githubTestResult, setGithubTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
+
+  const [asanaConnected, setAsanaConnected] = useState(false);
+  const [showAsanaSetup, setShowAsanaSetup] = useState(false);
+  const [testingAsana, setTestingAsana] = useState(false);
+  const [asanaTestResult, setAsanaTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
+
+  const [redditConnected, setRedditConnected] = useState(false);
+  const [showRedditSetup, setShowRedditSetup] = useState(false);
+  const [testingReddit, setTestingReddit] = useState(false);
+  const [redditTestResult, setRedditTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
+
+  const [spotifyConnected, setSpotifyConnected] = useState(false);
+  const [showSpotifySetup, setShowSpotifySetup] = useState(false);
+  const [testingSpotify, setTestingSpotify] = useState(false);
+  const [spotifyTestResult, setSpotifyTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
+
   useEffect(() => {
     const checkConnections = async () => {
       if (!window.wovly) return;
@@ -2765,6 +3981,31 @@ function IntegrationsPage() {
       if (browserResult?.ok) {
         setBrowserEnabled(browserResult.enabled);
       }
+
+      // Check new integrations
+      const telegramResult = await window.wovly.telegram?.checkAuth();
+      if (telegramResult?.authorized) setTelegramConnected(true);
+
+      const discordResult = await window.wovly.discord?.checkAuth();
+      if (discordResult?.authorized) setDiscordConnected(true);
+
+      const xResult = await window.wovly.x?.checkAuth();
+      if (xResult?.authorized) setXConnected(true);
+
+      const notionResult = await window.wovly.notion?.checkAuth();
+      if (notionResult?.authorized) setNotionConnected(true);
+
+      const githubResult = await window.wovly.github?.checkAuth();
+      if (githubResult?.authorized) setGithubConnected(true);
+
+      const asanaResult = await window.wovly.asana?.checkAuth();
+      if (asanaResult?.authorized) setAsanaConnected(true);
+
+      const redditResult = await window.wovly.reddit?.checkAuth();
+      if (redditResult?.authorized) setRedditConnected(true);
+
+      const spotifyResult = await window.wovly.spotify?.checkAuth();
+      if (spotifyResult?.authorized) setSpotifyConnected(true);
     };
     checkConnections();
   }, []);
@@ -2836,6 +4077,127 @@ function IntegrationsPage() {
     } else {
       setBrowserTestResult({ ok: false, message: result?.error || "Failed to toggle" });
     }
+  };
+
+  // New integration handlers
+  const handleTestTelegram = async () => {
+    setTestingTelegram(true);
+    setTelegramTestResult(null);
+    const result = await window.wovly.telegram.test();
+    setTelegramTestResult(result);
+    setTestingTelegram(false);
+  };
+
+  const handleDisconnectTelegram = async () => {
+    if (!confirm("Disconnect Telegram?")) return;
+    await window.wovly.telegram.disconnect();
+    setTelegramConnected(false);
+    setTelegramTestResult(null);
+  };
+
+  const handleTestDiscord = async () => {
+    setTestingDiscord(true);
+    setDiscordTestResult(null);
+    const result = await window.wovly.discord.test();
+    setDiscordTestResult(result);
+    setTestingDiscord(false);
+  };
+
+  const handleDisconnectDiscord = async () => {
+    if (!confirm("Disconnect Discord?")) return;
+    await window.wovly.discord.disconnect();
+    setDiscordConnected(false);
+    setDiscordTestResult(null);
+  };
+
+  const handleTestX = async () => {
+    setTestingX(true);
+    setXTestResult(null);
+    const result = await window.wovly.x.test();
+    setXTestResult(result);
+    setTestingX(false);
+  };
+
+  const handleDisconnectX = async () => {
+    if (!confirm("Disconnect X?")) return;
+    await window.wovly.x.disconnect();
+    setXConnected(false);
+    setXTestResult(null);
+  };
+
+  const handleTestNotion = async () => {
+    setTestingNotion(true);
+    setNotionTestResult(null);
+    const result = await window.wovly.notion.test();
+    setNotionTestResult(result);
+    setTestingNotion(false);
+  };
+
+  const handleDisconnectNotion = async () => {
+    if (!confirm("Disconnect Notion?")) return;
+    await window.wovly.notion.disconnect();
+    setNotionConnected(false);
+    setNotionTestResult(null);
+  };
+
+  const handleTestGithub = async () => {
+    setTestingGithub(true);
+    setGithubTestResult(null);
+    const result = await window.wovly.github.test();
+    setGithubTestResult(result);
+    setTestingGithub(false);
+  };
+
+  const handleDisconnectGithub = async () => {
+    if (!confirm("Disconnect GitHub?")) return;
+    await window.wovly.github.disconnect();
+    setGithubConnected(false);
+    setGithubTestResult(null);
+  };
+
+  const handleTestAsana = async () => {
+    setTestingAsana(true);
+    setAsanaTestResult(null);
+    const result = await window.wovly.asana.test();
+    setAsanaTestResult(result);
+    setTestingAsana(false);
+  };
+
+  const handleDisconnectAsana = async () => {
+    if (!confirm("Disconnect Asana?")) return;
+    await window.wovly.asana.disconnect();
+    setAsanaConnected(false);
+    setAsanaTestResult(null);
+  };
+
+  const handleTestReddit = async () => {
+    setTestingReddit(true);
+    setRedditTestResult(null);
+    const result = await window.wovly.reddit.test();
+    setRedditTestResult(result);
+    setTestingReddit(false);
+  };
+
+  const handleDisconnectReddit = async () => {
+    if (!confirm("Disconnect Reddit?")) return;
+    await window.wovly.reddit.disconnect();
+    setRedditConnected(false);
+    setRedditTestResult(null);
+  };
+
+  const handleTestSpotify = async () => {
+    setTestingSpotify(true);
+    setSpotifyTestResult(null);
+    const result = await window.wovly.spotify.test();
+    setSpotifyTestResult(result);
+    setTestingSpotify(false);
+  };
+
+  const handleDisconnectSpotify = async () => {
+    if (!confirm("Disconnect Spotify?")) return;
+    await window.wovly.spotify.disconnect();
+    setSpotifyConnected(false);
+    setSpotifyTestResult(null);
   };
 
   return (
@@ -2990,6 +4352,262 @@ function IntegrationsPage() {
         )}
       </div>
 
+      {/* Telegram */}
+      <div className="integration-row">
+        <div className="integration-icon">
+          <TelegramIcon size={32} />
+        </div>
+        <div className="integration-info">
+          <h3>Telegram</h3>
+          <p>Send and receive messages via Telegram bot</p>
+        </div>
+        <div className="integration-status">
+          {telegramConnected ? (
+            <>
+              <span className="status connected">Connected</span>
+              <button className="secondary small" onClick={handleTestTelegram} disabled={testingTelegram}>
+                {testingTelegram ? "Testing..." : "Test"}
+              </button>
+              <button className="danger small" onClick={handleDisconnectTelegram}>Disconnect</button>
+            </>
+          ) : (
+            <>
+              <span className="status disconnected">Not connected</span>
+              <button className="primary small" onClick={() => setShowTelegramSetup(true)}>Setup</button>
+            </>
+          )}
+        </div>
+        {telegramTestResult && (
+          <div className={`test-result ${telegramTestResult.ok ? "success" : "error"}`}>
+            {telegramTestResult.ok ? `✓ ${telegramTestResult.message}` : `✗ ${telegramTestResult.message}`}
+          </div>
+        )}
+      </div>
+
+      {/* Discord */}
+      <div className="integration-row">
+        <div className="integration-icon">
+          <DiscordIcon size={32} />
+        </div>
+        <div className="integration-info">
+          <h3>Discord</h3>
+          <p>Send messages to Discord servers and DMs</p>
+        </div>
+        <div className="integration-status">
+          {discordConnected ? (
+            <>
+              <span className="status connected">Connected</span>
+              <button className="secondary small" onClick={handleTestDiscord} disabled={testingDiscord}>
+                {testingDiscord ? "Testing..." : "Test"}
+              </button>
+              <button className="danger small" onClick={handleDisconnectDiscord}>Disconnect</button>
+            </>
+          ) : (
+            <>
+              <span className="status disconnected">Not connected</span>
+              <button className="primary small" onClick={() => setShowDiscordSetup(true)}>Setup</button>
+            </>
+          )}
+        </div>
+        {discordTestResult && (
+          <div className={`test-result ${discordTestResult.ok ? "success" : "error"}`}>
+            {discordTestResult.ok ? `✓ ${discordTestResult.message}` : `✗ ${discordTestResult.message}`}
+          </div>
+        )}
+      </div>
+
+      {/* X (Twitter) */}
+      <div className="integration-row">
+        <div className="integration-icon">
+          <span style={{ fontSize: "24px", fontWeight: "bold" }}>𝕏</span>
+        </div>
+        <div className="integration-info">
+          <h3>X (Twitter)</h3>
+          <p>Post tweets, read timeline, send DMs</p>
+        </div>
+        <div className="integration-status">
+          {xConnected ? (
+            <>
+              <span className="status connected">Connected</span>
+              <button className="secondary small" onClick={handleTestX} disabled={testingX}>
+                {testingX ? "Testing..." : "Test"}
+              </button>
+              <button className="danger small" onClick={handleDisconnectX}>Disconnect</button>
+            </>
+          ) : (
+            <>
+              <span className="status disconnected">Not connected</span>
+              <button className="primary small" onClick={() => setShowXSetup(true)}>Setup</button>
+            </>
+          )}
+        </div>
+        {xTestResult && (
+          <div className={`test-result ${xTestResult.ok ? "success" : "error"}`}>
+            {xTestResult.ok ? `✓ ${xTestResult.message}` : `✗ ${xTestResult.message}`}
+          </div>
+        )}
+      </div>
+
+      {/* Notion */}
+      <div className="integration-row">
+        <div className="integration-icon">
+          <NotionIcon size={32} />
+        </div>
+        <div className="integration-info">
+          <h3>Notion</h3>
+          <p>Search, read, and create pages and databases</p>
+        </div>
+        <div className="integration-status">
+          {notionConnected ? (
+            <>
+              <span className="status connected">Connected</span>
+              <button className="secondary small" onClick={handleTestNotion} disabled={testingNotion}>
+                {testingNotion ? "Testing..." : "Test"}
+              </button>
+              <button className="danger small" onClick={handleDisconnectNotion}>Disconnect</button>
+            </>
+          ) : (
+            <>
+              <span className="status disconnected">Not connected</span>
+              <button className="primary small" onClick={() => setShowNotionSetup(true)}>Setup</button>
+            </>
+          )}
+        </div>
+        {notionTestResult && (
+          <div className={`test-result ${notionTestResult.ok ? "success" : "error"}`}>
+            {notionTestResult.ok ? `✓ ${notionTestResult.message}` : `✗ ${notionTestResult.message}`}
+          </div>
+        )}
+      </div>
+
+      {/* GitHub */}
+      <div className="integration-row">
+        <div className="integration-icon">
+          <GitHubIcon size={32} />
+        </div>
+        <div className="integration-info">
+          <h3>GitHub</h3>
+          <p>Repos, issues, PRs, and notifications</p>
+        </div>
+        <div className="integration-status">
+          {githubConnected ? (
+            <>
+              <span className="status connected">Connected</span>
+              <button className="secondary small" onClick={handleTestGithub} disabled={testingGithub}>
+                {testingGithub ? "Testing..." : "Test"}
+              </button>
+              <button className="danger small" onClick={handleDisconnectGithub}>Disconnect</button>
+            </>
+          ) : (
+            <>
+              <span className="status disconnected">Not connected</span>
+              <button className="primary small" onClick={() => setShowGithubSetup(true)}>Setup</button>
+            </>
+          )}
+        </div>
+        {githubTestResult && (
+          <div className={`test-result ${githubTestResult.ok ? "success" : "error"}`}>
+            {githubTestResult.ok ? `✓ ${githubTestResult.message}` : `✗ ${githubTestResult.message}`}
+          </div>
+        )}
+      </div>
+
+      {/* Asana */}
+      <div className="integration-row">
+        <div className="integration-icon">
+          <AsanaIcon size={32} />
+        </div>
+        <div className="integration-info">
+          <h3>Asana</h3>
+          <p>Task management and project tracking</p>
+        </div>
+        <div className="integration-status">
+          {asanaConnected ? (
+            <>
+              <span className="status connected">Connected</span>
+              <button className="secondary small" onClick={handleTestAsana} disabled={testingAsana}>
+                {testingAsana ? "Testing..." : "Test"}
+              </button>
+              <button className="danger small" onClick={handleDisconnectAsana}>Disconnect</button>
+            </>
+          ) : (
+            <>
+              <span className="status disconnected">Not connected</span>
+              <button className="primary small" onClick={() => setShowAsanaSetup(true)}>Setup</button>
+            </>
+          )}
+        </div>
+        {asanaTestResult && (
+          <div className={`test-result ${asanaTestResult.ok ? "success" : "error"}`}>
+            {asanaTestResult.ok ? `✓ ${asanaTestResult.message}` : `✗ ${asanaTestResult.message}`}
+          </div>
+        )}
+      </div>
+
+      {/* Reddit */}
+      <div className="integration-row">
+        <div className="integration-icon">
+          <RedditIcon size={32} />
+        </div>
+        <div className="integration-info">
+          <h3>Reddit</h3>
+          <p>Browse, post, and comment on Reddit</p>
+        </div>
+        <div className="integration-status">
+          {redditConnected ? (
+            <>
+              <span className="status connected">Connected</span>
+              <button className="secondary small" onClick={handleTestReddit} disabled={testingReddit}>
+                {testingReddit ? "Testing..." : "Test"}
+              </button>
+              <button className="danger small" onClick={handleDisconnectReddit}>Disconnect</button>
+            </>
+          ) : (
+            <>
+              <span className="status disconnected">Not connected</span>
+              <button className="primary small" onClick={() => setShowRedditSetup(true)}>Setup</button>
+            </>
+          )}
+        </div>
+        {redditTestResult && (
+          <div className={`test-result ${redditTestResult.ok ? "success" : "error"}`}>
+            {redditTestResult.ok ? `✓ ${redditTestResult.message}` : `✗ ${redditTestResult.message}`}
+          </div>
+        )}
+      </div>
+
+      {/* Spotify */}
+      <div className="integration-row">
+        <div className="integration-icon">
+          <SpotifyIcon size={32} />
+        </div>
+        <div className="integration-info">
+          <h3>Spotify</h3>
+          <p>Playback control and music search</p>
+        </div>
+        <div className="integration-status">
+          {spotifyConnected ? (
+            <>
+              <span className="status connected">Connected</span>
+              <button className="secondary small" onClick={handleTestSpotify} disabled={testingSpotify}>
+                {testingSpotify ? "Testing..." : "Test"}
+              </button>
+              <button className="danger small" onClick={handleDisconnectSpotify}>Disconnect</button>
+            </>
+          ) : (
+            <>
+              <span className="status disconnected">Not connected</span>
+              <button className="primary small" onClick={() => setShowSpotifySetup(true)}>Setup</button>
+            </>
+          )}
+        </div>
+        {spotifyTestResult && (
+          <div className={`test-result ${spotifyTestResult.ok ? "success" : "error"}`}>
+            {spotifyTestResult.ok ? `✓ ${spotifyTestResult.message}` : `✗ ${spotifyTestResult.message}`}
+          </div>
+        )}
+      </div>
+
       {showGoogleSetup && (
         <GoogleSetupModal
           onClose={() => setShowGoogleSetup(false)}
@@ -3016,6 +4634,86 @@ function IntegrationsPage() {
                 setSlackTeam(result.team.name);
               }
             });
+          }}
+        />
+      )}
+
+      {showTelegramSetup && (
+        <TelegramSetupModal
+          onClose={() => setShowTelegramSetup(false)}
+          onComplete={() => {
+            setTelegramConnected(true);
+            setShowTelegramSetup(false);
+          }}
+        />
+      )}
+
+      {showDiscordSetup && (
+        <DiscordSetupModal
+          onClose={() => setShowDiscordSetup(false)}
+          onComplete={() => {
+            setDiscordConnected(true);
+            setShowDiscordSetup(false);
+          }}
+        />
+      )}
+
+      {showXSetup && (
+        <XSetupModal
+          onClose={() => setShowXSetup(false)}
+          onComplete={() => {
+            setXConnected(true);
+            setShowXSetup(false);
+          }}
+        />
+      )}
+
+      {showNotionSetup && (
+        <NotionSetupModal
+          onClose={() => setShowNotionSetup(false)}
+          onComplete={() => {
+            setNotionConnected(true);
+            setShowNotionSetup(false);
+          }}
+        />
+      )}
+
+      {showGithubSetup && (
+        <GitHubSetupModal
+          onClose={() => setShowGithubSetup(false)}
+          onComplete={() => {
+            setGithubConnected(true);
+            setShowGithubSetup(false);
+          }}
+        />
+      )}
+
+      {showAsanaSetup && (
+        <AsanaSetupModal
+          onClose={() => setShowAsanaSetup(false)}
+          onComplete={() => {
+            setAsanaConnected(true);
+            setShowAsanaSetup(false);
+          }}
+        />
+      )}
+
+      {showRedditSetup && (
+        <RedditSetupModal
+          onClose={() => setShowRedditSetup(false)}
+          onComplete={() => {
+            setRedditConnected(true);
+            setShowRedditSetup(false);
+          }}
+        />
+      )}
+
+      {showSpotifySetup && (
+        <SpotifySetupModal
+          onClose={() => setShowSpotifySetup(false)}
+          onComplete={() => {
+            setSpotifyConnected(true);
+            setShowSpotifySetup(false);
           }}
         />
       )}
@@ -3702,124 +5400,426 @@ function MessageConfirmationModal({
 }) {
   const { preview } = confirmation;
   
+  const getPlatformColor = () => {
+    switch (confirmation.toolName) {
+      case 'send_email': return '#EA4335';
+      case 'send_imessage': return '#34C759';
+      case 'send_slack_message': return '#4A154B';
+      case 'send_telegram_message': return '#0088cc';
+      case 'send_discord_message': return '#5865F2';
+      default: return '#6366f1';
+    }
+  };
+  
   const getPlatformIcon = () => {
     switch (confirmation.toolName) {
-      case 'send_email': return '📧';
-      case 'send_imessage': return '💬';
-      case 'send_slack_message': return '💼';
-      default: return '📤';
+      case 'send_email': 
+        return <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M22 7l-10 6L2 7"/></svg>;
+      case 'send_imessage': 
+        return <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>;
+      case 'send_slack_message': 
+        return <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M5.042 15.165a2.528 2.528 0 0 1-2.52 2.523A2.528 2.528 0 0 1 0 15.165a2.527 2.527 0 0 1 2.522-2.52h2.52v2.52zM6.313 15.165a2.527 2.527 0 0 1 2.521-2.52 2.527 2.527 0 0 1 2.521 2.52v6.313A2.528 2.528 0 0 1 8.834 24a2.528 2.528 0 0 1-2.521-2.522v-6.313zM8.834 5.042a2.528 2.528 0 0 1-2.521-2.52A2.528 2.528 0 0 1 8.834 0a2.528 2.528 0 0 1 2.521 2.522v2.52H8.834zM8.834 6.313a2.528 2.528 0 0 1 2.521 2.521 2.528 2.528 0 0 1-2.521 2.521H2.522A2.528 2.528 0 0 1 0 8.834a2.528 2.528 0 0 1 2.522-2.521h6.312zM18.956 8.834a2.528 2.528 0 0 1 2.522-2.521A2.528 2.528 0 0 1 24 8.834a2.528 2.528 0 0 1-2.522 2.521h-2.522V8.834zM17.688 8.834a2.528 2.528 0 0 1-2.523 2.521 2.527 2.527 0 0 1-2.52-2.521V2.522A2.527 2.527 0 0 1 15.165 0a2.528 2.528 0 0 1 2.523 2.522v6.312zM15.165 18.956a2.528 2.528 0 0 1 2.523 2.522A2.528 2.528 0 0 1 15.165 24a2.527 2.527 0 0 1-2.52-2.522v-2.522h2.52zM15.165 17.688a2.527 2.527 0 0 1-2.52-2.523 2.526 2.526 0 0 1 2.52-2.52h6.313A2.527 2.527 0 0 1 24 15.165a2.528 2.528 0 0 1-2.522 2.523h-6.313z"/></svg>;
+      case 'send_telegram_message':
+        return <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>;
+      case 'send_discord_message':
+        return <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>;
+      default: 
+        return <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 2L11 13"/><path d="M22 2L15 22l-4-9-9-4 20-7z"/></svg>;
     }
   };
 
   return (
     <div className="modal-overlay" style={{ zIndex: 9999 }}>
-      <div className="modal confirmation-modal" style={{ maxWidth: '600px' }}>
-        <div className="modal-header" style={{ 
+      <div className="modal" style={{ 
+        maxWidth: '480px', 
+        width: '100%',
+        padding: 0,
+        overflow: 'hidden',
+        borderRadius: '16px',
+        boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)'
+      }}>
+        {/* Header */}
+        <div style={{ 
           display: 'flex', 
           alignItems: 'center', 
-          gap: '12px',
-          borderBottom: '1px solid var(--border-color)',
-          paddingBottom: '16px',
-          marginBottom: '16px'
+          justifyContent: 'space-between',
+          padding: '20px 24px',
+          borderBottom: '1px solid rgba(0,0,0,0.06)'
         }}>
-          <span style={{ fontSize: '32px' }}>{getPlatformIcon()}</span>
-          <div>
-            <h2 style={{ margin: 0, fontSize: '18px' }}>Confirm Message</h2>
-            <p style={{ margin: '4px 0 0 0', color: 'var(--text-secondary)', fontSize: '14px' }}>
-              {preview.platform}
-            </p>
-          </div>
-        </div>
-        
-        <div className="confirmation-content" style={{ marginBottom: '20px' }}>
-          <div style={{ 
-            background: 'var(--bg-secondary)', 
-            borderRadius: '8px', 
-            padding: '16px',
-            marginBottom: '16px'
-          }}>
-            <div style={{ marginBottom: '12px' }}>
-              <strong style={{ color: 'var(--text-secondary)', fontSize: '12px', textTransform: 'uppercase' }}>
-                To:
-              </strong>
-              <p style={{ margin: '4px 0 0 0', fontSize: '15px' }}>{preview.recipient}</p>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <div style={{ 
+              width: '40px', 
+              height: '40px', 
+              borderRadius: '10px',
+              background: getPlatformColor(),
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: 'white'
+            }}>
+              {getPlatformIcon()}
             </div>
-            
-            {preview.subject && (
-              <div style={{ marginBottom: '12px' }}>
-                <strong style={{ color: 'var(--text-secondary)', fontSize: '12px', textTransform: 'uppercase' }}>
-                  Subject:
-                </strong>
-                <p style={{ margin: '4px 0 0 0', fontSize: '15px' }}>{preview.subject}</p>
-              </div>
-            )}
-            
-            {preview.cc && (
-              <div style={{ marginBottom: '12px' }}>
-                <strong style={{ color: 'var(--text-secondary)', fontSize: '12px', textTransform: 'uppercase' }}>
-                  CC:
-                </strong>
-                <p style={{ margin: '4px 0 0 0', fontSize: '15px' }}>{preview.cc}</p>
-              </div>
-            )}
-            
             <div>
-              <strong style={{ color: 'var(--text-secondary)', fontSize: '12px', textTransform: 'uppercase' }}>
-                Message:
-              </strong>
-              <p style={{ 
-                margin: '8px 0 0 0', 
-                fontSize: '14px',
-                whiteSpace: 'pre-wrap',
-                lineHeight: '1.5',
-                maxHeight: '300px',
-                overflow: 'auto'
-              }}>
-                {preview.message}
+              <h2 style={{ margin: 0, fontSize: '16px', fontWeight: 600, color: '#1a1a2e' }}>
+                Send via {preview.platform}
+              </h2>
+              <p style={{ margin: 0, fontSize: '13px', color: '#7a7a8c' }}>
+                Review before sending
               </p>
             </div>
           </div>
-          
-          <p style={{ 
-            color: 'var(--text-secondary)', 
-            fontSize: '13px',
-            margin: 0,
-            textAlign: 'center'
-          }}>
-            This message will be sent immediately upon approval.
-          </p>
+          <button 
+            onClick={onReject}
+            style={{
+              background: 'none',
+              border: 'none',
+              padding: '8px',
+              cursor: 'pointer',
+              color: '#9ca3af',
+              borderRadius: '8px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center'
+            }}
+            onMouseOver={(e) => e.currentTarget.style.background = '#f3f4f6'}
+            onMouseOut={(e) => e.currentTarget.style.background = 'none'}
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M18 6L6 18M6 6l12 12"/>
+            </svg>
+          </button>
         </div>
         
-        <div className="modal-actions" style={{ 
+        {/* Content */}
+        <div style={{ padding: '24px' }}>
+          {/* Recipient */}
+          <div style={{ marginBottom: '16px' }}>
+            <label style={{ 
+              display: 'block',
+              fontSize: '11px', 
+              fontWeight: 600,
+              color: '#9ca3af',
+              textTransform: 'uppercase',
+              letterSpacing: '0.5px',
+              marginBottom: '6px'
+            }}>
+              To
+            </label>
+            <div style={{ 
+              fontSize: '15px', 
+              color: '#1a1a2e',
+              fontWeight: 500
+            }}>
+              {preview.recipient}
+            </div>
+          </div>
+          
+          {/* Subject (if email) */}
+          {preview.subject && (
+            <div style={{ marginBottom: '16px' }}>
+              <label style={{ 
+                display: 'block',
+                fontSize: '11px', 
+                fontWeight: 600,
+                color: '#9ca3af',
+                textTransform: 'uppercase',
+                letterSpacing: '0.5px',
+                marginBottom: '6px'
+              }}>
+                Subject
+              </label>
+              <div style={{ 
+                fontSize: '15px', 
+                color: '#1a1a2e',
+                fontWeight: 500
+              }}>
+                {preview.subject}
+              </div>
+            </div>
+          )}
+          
+          {/* CC (if email) */}
+          {preview.cc && (
+            <div style={{ marginBottom: '16px' }}>
+              <label style={{ 
+                display: 'block',
+                fontSize: '11px', 
+                fontWeight: 600,
+                color: '#9ca3af',
+                textTransform: 'uppercase',
+                letterSpacing: '0.5px',
+                marginBottom: '6px'
+              }}>
+                CC
+              </label>
+              <div style={{ 
+                fontSize: '15px', 
+                color: '#1a1a2e'
+              }}>
+                {preview.cc}
+              </div>
+            </div>
+          )}
+          
+          {/* Message */}
+          <div>
+            <label style={{ 
+              display: 'block',
+              fontSize: '11px', 
+              fontWeight: 600,
+              color: '#9ca3af',
+              textTransform: 'uppercase',
+              letterSpacing: '0.5px',
+              marginBottom: '8px'
+            }}>
+              Message
+            </label>
+            <div style={{ 
+              background: '#f8f9fb',
+              borderRadius: '12px',
+              padding: '16px',
+              fontSize: '14px',
+              color: '#374151',
+              lineHeight: '1.6',
+              whiteSpace: 'pre-wrap',
+              maxHeight: '200px',
+              overflowY: 'auto'
+            }}>
+              {preview.message}
+            </div>
+          </div>
+        </div>
+        
+        {/* Footer */}
+        <div style={{ 
           display: 'flex', 
           gap: '12px',
+          padding: '16px 24px 24px',
           justifyContent: 'flex-end'
         }}>
           <button 
             onClick={onReject}
-            className="btn btn-secondary"
             style={{ 
-              padding: '10px 24px',
-              borderRadius: '8px',
-              fontSize: '14px'
+              padding: '10px 20px',
+              borderRadius: '10px',
+              fontSize: '14px',
+              fontWeight: 500,
+              border: '1px solid #e5e7eb',
+              background: 'white',
+              color: '#374151',
+              cursor: 'pointer',
+              transition: 'all 0.15s ease'
+            }}
+            onMouseOver={(e) => {
+              e.currentTarget.style.background = '#f9fafb';
+              e.currentTarget.style.borderColor = '#d1d5db';
+            }}
+            onMouseOut={(e) => {
+              e.currentTarget.style.background = 'white';
+              e.currentTarget.style.borderColor = '#e5e7eb';
             }}
           >
             Cancel
           </button>
           <button 
             onClick={onApprove}
-            className="btn btn-primary"
             style={{ 
               padding: '10px 24px',
-              borderRadius: '8px',
+              borderRadius: '10px',
               fontSize: '14px',
-              background: '#10b981',
-              color: 'white'
+              fontWeight: 500,
+              border: 'none',
+              background: getPlatformColor(),
+              color: 'white',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              transition: 'all 0.15s ease'
             }}
+            onMouseOver={(e) => e.currentTarget.style.opacity = '0.9'}
+            onMouseOut={(e) => e.currentTarget.style.opacity = '1'}
           >
-            ✓ Send Message
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <path d="M22 2L11 13"/><path d="M22 2L15 22l-4-9-9-4 20-7z"/>
+            </svg>
+            Send
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Login Page - Authentication screen
+// ─────────────────────────────────────────────────────────────────────────────
+
+type AuthUser = {
+  username: string;
+  displayName: string;
+};
+
+function LoginPage({ onLogin }: { onLogin: (user: AuthUser) => void }) {
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [users, setUsers] = useState<Array<{ username: string; displayName: string }>>([]);
+  const [hasUsers, setHasUsers] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    const checkUsers = async () => {
+      const result = await window.wovly.auth.hasUsers();
+      if (result.ok) {
+        setHasUsers(result.hasUsers || false);
+        if (result.hasUsers) {
+          const listResult = await window.wovly.auth.listUsers();
+          if (listResult.ok && listResult.users) {
+            setUsers(listResult.users);
+          }
+        } else {
+          // No users yet, show register mode
+          setMode("register");
+        }
+      }
+    };
+    checkUsers();
+  }, []);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+
+    try {
+      if (mode === "register") {
+        const result = await window.wovly.auth.register(username, password, displayName || username);
+        if (result.ok) {
+          // Auto-login after registration
+          const loginResult = await window.wovly.auth.login(username, password);
+          if (loginResult.ok && loginResult.user) {
+            onLogin(loginResult.user);
+          }
+        } else {
+          setError(result.error || "Registration failed");
+        }
+      } else {
+        const result = await window.wovly.auth.login(username, password);
+        if (result.ok && result.user) {
+          onLogin(result.user);
+        } else {
+          setError(result.error || "Login failed");
+        }
+      }
+    } catch (err) {
+      setError("An error occurred");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (hasUsers === null) {
+    return (
+      <div className="login-page">
+        <div className="login-container">
+          <div className="login-loading">Loading...</div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="login-page">
+      <div className="login-container">
+        <div className="login-header">
+          <WovlyIcon size={48} />
+          <h1>Wovly</h1>
+          <p>{mode === "register" ? "Create your account" : "Welcome back"}</p>
+        </div>
+
+        <form onSubmit={handleSubmit} className="login-form">
+          {mode === "register" && (
+            <div className="form-group">
+              <label>Display Name</label>
+              <input
+                type="text"
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                placeholder="Your name"
+                autoFocus
+              />
+            </div>
+          )}
+
+          <div className="form-group">
+            <label>Username</label>
+            <input
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="Enter username"
+              required
+              autoFocus={mode === "login"}
+            />
+          </div>
+
+          <div className="form-group">
+            <label>Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Enter password"
+              required
+            />
+          </div>
+
+          {error && <div className="login-error">{error}</div>}
+
+          <button type="submit" className="login-btn primary" disabled={loading}>
+            {loading ? "Please wait..." : mode === "register" ? "Create Account" : "Login"}
+          </button>
+        </form>
+
+        {hasUsers && (
+          <div className="login-footer">
+            {mode === "login" ? (
+              <p>
+                New user?{" "}
+                <button className="link-btn" onClick={() => { setMode("register"); setError(""); }}>
+                  Create an account
+                </button>
+              </p>
+            ) : (
+              <p>
+                Already have an account?{" "}
+                <button className="link-btn" onClick={() => { setMode("login"); setError(""); }}>
+                  Login
+                </button>
+              </p>
+            )}
+          </div>
+        )}
+
+        {mode === "login" && users.length > 1 && (
+          <div className="login-users">
+            <p className="users-label">Quick login:</p>
+            <div className="user-list">
+              {users.map((user) => (
+                <button
+                  key={user.username}
+                  className="user-btn"
+                  onClick={() => setUsername(user.username)}
+                >
+                  {user.displayName || user.username}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -3830,6 +5830,11 @@ function MessageConfirmationModal({
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function App() {
+  // Authentication state
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+
   const [navItem, setNavItem] = useState<NavItem>("chat");
   
   // Chat state lifted for persistence across navigation
@@ -3841,10 +5846,47 @@ export default function App() {
   
   // Pending task approvals count (for notification badge)
   const [pendingApprovalsCount, setPendingApprovalsCount] = useState(0);
-  
+
+  // Check auth session on mount
+  useEffect(() => {
+    const checkAuth = async () => {
+      try {
+        const result = await window.wovly.auth.checkSession();
+        if (result.ok && result.loggedIn && result.user) {
+          setIsLoggedIn(true);
+          setCurrentUser(result.user);
+        }
+      } catch (err) {
+        console.error("[Auth] Session check failed:", err);
+      } finally {
+        setAuthChecked(true);
+      }
+    };
+    checkAuth();
+  }, []);
+
+  const handleLogin = (user: AuthUser) => {
+    setCurrentUser(user);
+    setIsLoggedIn(true);
+  };
+
+  const handleLogout = async () => {
+    try {
+      await window.wovly.auth.logout();
+      setIsLoggedIn(false);
+      setCurrentUser(null);
+      // Reset app state
+      setChatMessages([]);
+      setChatInitialized(false);
+      setNavItem("chat");
+    } catch (err) {
+      console.error("[Auth] Logout failed:", err);
+    }
+  };
+
   // Load pending approvals count
   const loadPendingApprovalsCount = async () => {
-    if (!window.wovly) return;
+    if (!window.wovly || !isLoggedIn) return;
     try {
       const result = await window.wovly.tasks.list();
       if (result.ok && result.tasks) {
@@ -3865,6 +5907,8 @@ export default function App() {
   
   // Load pending count on mount and subscribe to updates
   useEffect(() => {
+    if (!isLoggedIn) return;
+    
     loadPendingApprovalsCount();
     
     // Subscribe to task updates to refresh count
@@ -3881,16 +5925,18 @@ export default function App() {
       unsubscribeTask?.();
       unsubscribePending?.();
     };
-  }, []);
+  }, [isLoggedIn]);
   
   // Subscribe to message confirmation requests
   useEffect(() => {
+    if (!isLoggedIn) return;
+    
     const unsubscribe = window.wovly.messageConfirmation?.onConfirmationRequired((data) => {
       console.log('[UI] Message confirmation required:', data);
       setPendingConfirmation(data);
     });
     return () => unsubscribe?.();
-  }, []);
+  }, [isLoggedIn]);
   
   const handleConfirmationApprove = async () => {
     if (pendingConfirmation) {
@@ -3907,6 +5953,25 @@ export default function App() {
       setPendingConfirmation(null);
     }
   };
+
+  // Show loading while checking auth
+  if (!authChecked) {
+    return (
+      <div className="login-page">
+        <div className="login-container">
+          <div className="login-loading">
+            <WovlyIcon size={48} />
+            <p>Loading...</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Show login page if not logged in
+  if (!isLoggedIn) {
+    return <LoginPage onLogin={handleLogin} />;
+  }
 
   return (
     <div className="app-shell">
@@ -3985,7 +6050,30 @@ export default function App() {
               <SettingsIcon size={18} /> Settings
             </button>
           </li>
+          <li>
+            <button
+              className="nav-btn nav-btn-external"
+              onClick={() => window.wovly.shell.openExternal("https://wovly.mintlify.app/")}
+            >
+              <DocsIcon size={18} /> Docs
+            </button>
+          </li>
         </ul>
+        
+        {/* Bottom section with user info and logout */}
+        <div className="nav-bottom">
+          {currentUser && (
+            <div className="nav-user">
+              <span className="nav-user-name">{currentUser.displayName}</span>
+            </div>
+          )}
+          <button
+            className="nav-btn nav-btn-logout"
+            onClick={handleLogout}
+          >
+            <LogoutIcon size={18} /> Logout
+          </button>
+        </div>
       </nav>
 
       <main className="main-content">

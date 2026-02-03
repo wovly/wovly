@@ -1,12 +1,20 @@
 {
-  "name": "@wovly/desktop",
+  "name": "wovly",
+  "productName": "Wovly",
   "private": true,
   "version": "0.1.0",
+  "description": "Your autonomous communication agent - AI assistant for Email, Slack, and iMessage",
+  "author": "Wovly <hello@wovly.com>",
   "main": "main.js",
   "type": "commonjs",
   "scripts": {
     "dev": "electron .",
-    "build": "echo \"Build step placeholder\"",
+    "build": "npm run build:ui && electron-builder --mac",
+    "build:ui": "npm run -w apps/ui build",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win",
+    "build:linux": "electron-builder --linux",
+    "dist": "electron-builder --mac --win --linux",
     "lint": "echo \"No lint configured\""
   },
   "dependencies": {
@@ -17,10 +25,72 @@
     "@wovly/llm": "*",
     "@wovly/memory": "*",
     "@wovly/tools": "*",
-    "electron": "^40.0.0",
     "esbuild": "^0.27.2",
     "esbuild-register": "^3.6.0",
     "puppeteer-core": "^22.15.0",
     "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "electron": "40.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.wovly.assistant",
+    "productName": "Wovly",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "node_modules/**/*",
+      "!node_modules/*/{CHANGELOG.md,README.md,readme.md,changelog.md}",
+      "!node_modules/**/*.{ts,map}"
+    ],
+    "extraResources": [
+      {
+        "from": "../ui/dist",
+        "to": "ui",
+        "filter": ["**/*"]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["x64", "arm64"]
+        }
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "dmg": {
+      "title": "Wovly",
+      "contents": [
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "win": {
+      "target": ["nsis"],
+      "icon": "build/icon.ico"
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Utility",
+      "icon": "build/icons"
+    }
   }
 }

@@ -20,6 +20,13 @@ export {
   OpenAIIcon,
   WovlyIcon,
   PlaywrightIcon,
+  NotionIcon,
+  GitHubIcon,
+  AsanaIcon,
+  RedditIcon,
+  SpotifyIcon,
+  DocsIcon,
+  LogoutIcon,
 } from "./external";
 
 // Navigation icons
