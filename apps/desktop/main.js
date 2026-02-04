@@ -13215,6 +13215,8 @@ TIME-BASED REMINDERS (IMPORTANT - these are CONTINUOUS tasks):
 
 
 
+    let initialDecomposition = null;
+    
     try {
       // Use Anthropic if available (preferred)
       if (apiKeys.anthropic) {
@@ -13238,15 +13240,14 @@ TIME-BASED REMINDERS (IMPORTANT - these are CONTINUOUS tasks):
           const text = data.content?.[0]?.text || "{}";
           const jsonMatch = text.match(/\{[\s\S]*\}/);
           if (jsonMatch) {
-            const result = JSON.parse(jsonMatch[0]);
-            console.log(`[QueryDecomposition] Decomposed into ${result.steps?.length || 0} steps: "${result.title}"`);
-            return result;
+            initialDecomposition = JSON.parse(jsonMatch[0]);
+            console.log(`[QueryDecomposition] Initial decomposition: ${initialDecomposition.steps?.length || 0} steps - "${initialDecomposition.title}"`);
           }
         }
       }
       
-      // Fallback to OpenAI
-      if (apiKeys.openai) {
+      // Fallback to OpenAI if Anthropic didn't work
+      if (!initialDecomposition && apiKeys.openai) {
         const response = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -13268,20 +13269,318 @@ TIME-BASED REMINDERS (IMPORTANT - these are CONTINUOUS tasks):
           const text = data.choices?.[0]?.message?.content || "{}";
           const jsonMatch = text.match(/\{[\s\S]*\}/);
           if (jsonMatch) {
+            initialDecomposition = JSON.parse(jsonMatch[0]);
+            console.log(`[QueryDecomposition] Initial decomposition: ${initialDecomposition.steps?.length || 0} steps - "${initialDecomposition.title}"`);
+          }
+        }
+      }
+
+      // If initial decomposition failed, return empty
+      if (!initialDecomposition) {
+        console.log("[QueryDecomposition] Initial decomposition failed");
+        return { title: "Unknown", steps: [], requires_task: false, reason_for_task: null };
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────────
+      // Validation Loop - Validate and refine decomposition up to 3 times
+      // ─────────────────────────────────────────────────────────────────────────────
+      let currentDecomposition = initialDecomposition;
+      let attempts = 0;
+      const MAX_REFINEMENT_ATTEMPTS = 3;
+
+      while (attempts < MAX_REFINEMENT_ATTEMPTS) {
+        console.log(`[QueryDecomposition] Validating decomposition (attempt ${attempts + 1}/${MAX_REFINEMENT_ATTEMPTS})...`);
+        
+        const validation = await validateDecomposition(
+          currentDecomposition, 
+          query, 
+          availableTools, 
+          apiKeys, 
+          activeProvider
+        );
+        
+        if (validation.isValid) {
+          console.log(`[QueryDecomposition] Decomposition validated successfully`);
+          break;
+        }
+        
+        console.log(`[QueryDecomposition] Validation issues: ${validation.issues?.join(', ') || 'unspecified'}`);
+        console.log(`[QueryDecomposition] Refining based on feedback...`);
+        
+        currentDecomposition = await refineDecomposition(
+          currentDecomposition,
+          query,
+          validation,
+          availableTools,
+          apiKeys,
+          activeProvider
+        );
+        attempts++;
+      }
+
+      if (attempts === MAX_REFINEMENT_ATTEMPTS) {
+        console.log(`[QueryDecomposition] Max refinements (${MAX_REFINEMENT_ATTEMPTS}) reached, returning best effort`);
+      }
+
+      return currentDecomposition;
+
+    } catch (err) {
+      console.error("[QueryDecomposition] Decomposition error:", err.message);
+      return { title: "Unknown", steps: [], requires_task: false, reason_for_task: null };
+    }
+  }
+
+  /**
+   * LLM-based validation of decomposition - checks if steps accomplish user's goal
+   * @param {Object} decomposition - The decomposition to validate
+   * @param {string} originalQuery - The original user query
+   * @param {Array} availableTools - List of available tool definitions
+   * @param {Object} apiKeys - Available API keys
+   * @param {string} activeProvider - The active LLM provider
+   * @returns {Object} { isValid, reasoning, issues, suggestions }
+   */
+  async function validateDecomposition(decomposition, originalQuery, availableTools, apiKeys, activeProvider) {
+    const toolDescriptions = availableTools.map(t => 
+      `- ${t.name}: ${t.description}`
+    ).join('\n');
+
+    const stepsText = decomposition.steps?.map((s, i) => 
+      `${i + 1}. ${s.action || s.step_description || JSON.stringify(s)}`
+    ).join('\n') || 'No steps defined';
+
+    const validationPrompt = `You are a task validation assistant. Evaluate whether the proposed steps will accomplish the user's goal.
+
+## Original User Request
+"${originalQuery}"
+
+## Proposed Steps
+${stepsText}
+
+## Task Type
+${decomposition.task_type || 'discrete'}
+
+## Available Tools
+${toolDescriptions}
+
+## Evaluation Criteria
+1. Do the steps use the available tools to actually perform actions?
+2. Will executing these steps accomplish what the user asked for?
+3. Are there any "meta-steps" that just describe creating a task rather than doing the actual work? (e.g., "Create task for X" or "Set reminder for X" instead of actually doing X)
+4. For time-based requests, do the steps check the time and trigger actions at the right moment?
+
+## Response Format
+Respond with ONLY a JSON object:
+{
+  "isValid": true or false,
+  "reasoning": "Brief explanation of your evaluation",
+  "issues": ["List of specific problems if invalid, empty array if valid"],
+  "suggestions": ["Specific corrections needed if invalid, empty array if valid"]
+}`;
+
+    try {
+      let response;
+      
+      // Use Anthropic if available (preferred)
+      if (apiKeys.anthropic) {
+        response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKeys.anthropic,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.anthropic,
+            max_tokens: 500,
+            messages: [{ role: "user", content: validationPrompt }]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.content?.[0]?.text || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
             const result = JSON.parse(jsonMatch[0]);
-            console.log(`[QueryDecomposition] Decomposed into ${result.steps?.length || 0} steps: "${result.title}"`);
+            console.log(`[Validation] Result: ${result.isValid ? 'VALID' : 'INVALID'} - ${result.reasoning}`);
+            return result;
+          }
+        }
+      }
+      
+      // Fallback to OpenAI
+      if (apiKeys.openai) {
+        response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKeys.openai}`
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.openai,
+            max_tokens: 500,
+            messages: [
+              { role: "system", content: "You are a task validation assistant. Respond with only JSON." },
+              { role: "user", content: validationPrompt }
+            ]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.choices?.[0]?.message?.content || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const result = JSON.parse(jsonMatch[0]);
+            console.log(`[Validation] Result: ${result.isValid ? 'VALID' : 'INVALID'} - ${result.reasoning}`);
             return result;
           }
         }
       }
 
-      // Default empty decomposition if failed
-      console.log("[QueryDecomposition] Decomposition failed");
-      return { title: "Unknown", steps: [], requires_task: false, reason_for_task: null };
+      // Default to valid if validation fails (don't block on errors)
+      console.log("[Validation] Validation skipped due to API error");
+      return { isValid: true, reasoning: 'Validation skipped due to error', issues: [], suggestions: [] };
 
     } catch (err) {
-      console.error("[QueryDecomposition] Decomposition error:", err.message);
-      return { title: "Unknown", steps: [], requires_task: false, reason_for_task: null };
+      console.error('[Validation] Error:', err.message);
+      return { isValid: true, reasoning: 'Validation skipped due to error', issues: [], suggestions: [] };
+    }
+  }
+
+  /**
+   * LLM-based refinement of decomposition based on validation feedback
+   * @param {Object} decomposition - The decomposition to refine
+   * @param {string} originalQuery - The original user query
+   * @param {Object} validationResult - The validation result with issues/suggestions
+   * @param {Array} availableTools - List of available tool definitions
+   * @param {Object} apiKeys - Available API keys
+   * @param {string} activeProvider - The active LLM provider
+   * @returns {Object} Refined decomposition
+   */
+  async function refineDecomposition(decomposition, originalQuery, validationResult, availableTools, apiKeys, activeProvider) {
+    const toolDescriptions = availableTools.map(t => 
+      `- ${t.name}: ${t.description}`
+    ).join('\n');
+
+    const stepsText = decomposition.steps?.map((s, i) => 
+      `${i + 1}. ${s.action || s.step_description || JSON.stringify(s)}`
+    ).join('\n') || 'No steps defined';
+
+    const refinementPrompt = `Your previous task decomposition was evaluated and found to have issues. Please provide a corrected version.
+
+## Original User Request
+"${originalQuery}"
+
+## Your Previous Decomposition
+Title: ${decomposition.title}
+Task Type: ${decomposition.task_type}
+Steps:
+${stepsText}
+
+## Validation Feedback
+Reasoning: ${validationResult.reasoning}
+Issues: ${validationResult.issues?.join('; ') || 'None specified'}
+Suggestions: ${validationResult.suggestions?.join('; ') || 'None specified'}
+
+## Available Tools
+${toolDescriptions}
+
+## Instructions
+Create a corrected decomposition that:
+1. Uses the actual available tools to perform real actions
+2. Does NOT create meta-steps like "create a task for X" or "set up reminder for X"
+3. Each step should be a direct, executable action using one of the available tools
+4. For time-based tasks: use get_current_time to check time, then use send_reminder when time matches
+
+Respond with ONLY a JSON object in this format:
+{
+  "title": "Brief task title",
+  "task_type": "discrete" or "continuous",
+  "success_criteria": "What defines completion (null for continuous)",
+  "monitoring_condition": "What to watch for (for continuous tasks)",
+  "trigger_action": "What to do when condition met (for continuous tasks)",
+  "steps": [
+    {
+      "step": 1,
+      "action": "Step description",
+      "tools_needed": ["tool_name"],
+      "depends_on_previous": false,
+      "may_require_waiting": false,
+      "is_recurring": false
+    }
+  ],
+  "requires_task": true
+}`;
+
+    try {
+      let response;
+      
+      // Use Anthropic if available (preferred)
+      if (apiKeys.anthropic) {
+        response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKeys.anthropic,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.anthropic,
+            max_tokens: 1500,
+            messages: [{ role: "user", content: refinementPrompt }]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.content?.[0]?.text || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const refined = JSON.parse(jsonMatch[0]);
+            console.log(`[Refinement] Generated new decomposition with ${refined.steps?.length || 0} steps`);
+            return refined;
+          }
+        }
+      }
+      
+      // Fallback to OpenAI
+      if (apiKeys.openai) {
+        response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKeys.openai}`
+          },
+          body: JSON.stringify({
+            model: CLASSIFIER_MODELS.openai,
+            max_tokens: 1500,
+            messages: [
+              { role: "system", content: "You are a task decomposition assistant. Respond with only JSON." },
+              { role: "user", content: refinementPrompt }
+            ]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const text = data.choices?.[0]?.message?.content || "{}";
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const refined = JSON.parse(jsonMatch[0]);
+            console.log(`[Refinement] Generated new decomposition with ${refined.steps?.length || 0} steps`);
+            return refined;
+          }
+        }
+      }
+
+      // Return original if refinement fails
+      console.log("[Refinement] Refinement failed, returning original");
+      return decomposition;
+
+    } catch (err) {
+      console.error('[Refinement] Error:', err.message);
+      return decomposition;
     }
   }
 
