@@ -287,6 +287,48 @@ const loadConversationContext = async (username) => {
   return { todayMessages, yesterdayMessages, recentSummaries };
 };
 
+// Save a conversation exchange to today's daily memory file
+const saveToDaily = async (username, userMessage, assistantResponse) => {
+  if (!username) {
+    console.log("[Memory] No user logged in, skipping memory save");
+    return;
+  }
+  
+  try {
+    const dailyDir = await getMemoryDailyDir(username);
+    const today = getTodayDate();
+    const filePath = path.join(dailyDir, `${today}.md`);
+    
+    const timestamp = new Date().toISOString();
+    const entry = `\n\n---\n**[${timestamp}]**\n\n**User:** ${userMessage}\n\n**Assistant:** ${assistantResponse}\n`;
+    
+    // Append to file (create if doesn't exist)
+    await fs.appendFile(filePath, entry, "utf8");
+    console.log(`[Memory] Saved conversation to ${today}.md`);
+  } catch (err) {
+    console.error("[Memory] Failed to save to daily:", err.message);
+  }
+};
+
+// Save a fact or insight to today's memory
+const saveFactToDaily = async (username, fact, source = "conversation") => {
+  if (!username) return;
+  
+  try {
+    const dailyDir = await getMemoryDailyDir(username);
+    const today = getTodayDate();
+    const filePath = path.join(dailyDir, `${today}.md`);
+    
+    const timestamp = new Date().toISOString();
+    const entry = `\n\n**[${timestamp}] Fact learned (${source}):** ${fact}\n`;
+    
+    await fs.appendFile(filePath, entry, "utf8");
+    console.log(`[Memory] Saved fact to ${today}.md`);
+  } catch (err) {
+    console.error("[Memory] Failed to save fact:", err.message);
+  }
+};
+
 module.exports = {
   CONTEXT_LIMITS,
   getMemoryDailyDir,
@@ -295,5 +337,7 @@ module.exports = {
   hasSummarySection,
   generateMemorySummary,
   processOldMemoryFiles,
-  loadConversationContext
+  loadConversationContext,
+  saveToDaily,
+  saveFactToDaily
 };

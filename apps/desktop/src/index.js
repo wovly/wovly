@@ -77,6 +77,8 @@ module.exports = {
   generateMemorySummary: memory.generateMemorySummary,
   processOldMemoryFiles: memory.processOldMemoryFiles,
   loadConversationContext: memory.loadConversationContext,
+  saveToDaily: memory.saveToDaily,
+  saveFactToDaily: memory.saveFactToDaily,
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Profile

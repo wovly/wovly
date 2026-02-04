@@ -44,6 +44,8 @@ const {
   generateMemorySummary,
   processOldMemoryFiles,
   loadConversationContext,
+  saveToDaily,
+  saveFactToDaily,
   // Profile
   getUserProfilePath,
   parseUserProfile,
@@ -4856,12 +4858,15 @@ Generate ONLY the welcome message, nothing else.`;
         message: `Poll frequency changed to: ${newPollFrequency.label}`
       });
 
-      // For event-based tasks, clear nextCheck since they don't poll on interval
+      // Update nextCheck based on the new poll frequency
       if (newPollFrequency.type === "event") {
+        // For event-based tasks, clear nextCheck since they don't poll on interval
         task.nextCheck = null;
-      } else if (task.status === "waiting" && !task.nextCheck) {
-        // Set next check if task is waiting but doesn't have one scheduled
+      } else {
+        // Always recalculate nextCheck when user explicitly changes frequency
+        // Schedule next check from NOW based on new interval
         task.nextCheck = Date.now() + newPollFrequency.value;
+        console.log(`[Tasks] Poll frequency updated for ${taskId}: next check in ${newPollFrequency.value}ms (${newPollFrequency.label})`);
       }
 
       // Save task
@@ -12394,6 +12399,20 @@ You have FULL access to the user's tools including calendar, email, contacts, et
 
   // Chat handler with agentic workflow
   ipcMain.handle("chat:send", async (_event, { messages, skipDecomposition = false, stepContext = null, workflowContext = null }) => {
+    // Helper to save conversation to daily memory
+    const saveConversationToMemory = async (userMsg, assistantResp) => {
+      try {
+        if (currentUser?.username && userMsg && assistantResp) {
+          await saveToDaily(currentUser.username, userMsg, assistantResp);
+        }
+      } catch (err) {
+        console.error("[Memory] Failed to save conversation:", err.message);
+      }
+    };
+    
+    // Extract user's message for memory saving
+    const userMessage = messages[messages.length - 1]?.content || "";
+    
     try {
       // Check if user is logged in
       if (!currentUser?.username) {
@@ -12631,6 +12650,8 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
           if (data.stop_reason === "end_turn" || !data.content.some(b => b.type === "tool_use")) {
             const textBlock = data.content.find(b => b.type === "text");
             let responseText = textBlock?.text || "";
+            // Save conversation to memory
+            await saveConversationToMemory(userMessage, responseText);
             return { ok: true, response: responseText };
           }
 
@@ -12736,6 +12757,8 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
 
           if (choice.finish_reason === "stop" || !choice.message.tool_calls) {
             let responseText = choice.message.content || "";
+            // Save conversation to memory
+            await saveConversationToMemory(userMessage, responseText);
             return { ok: true, response: responseText };
           }
 
@@ -12823,6 +12846,8 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
 
         const data = await response.json();
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        // Save conversation to memory
+        await saveConversationToMemory(userMessage, text);
         return { ok: true, response: text };
       }
 

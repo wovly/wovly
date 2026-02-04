@@ -12,7 +12,7 @@ const CLASSIFIER_MODELS = {
   openai: "gpt-4o"
 };
 
-const MAX_REFINEMENT_ATTEMPTS = 3;
+const MAX_REFINEMENT_ATTEMPTS = 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: Call LLM (supports Anthropic and OpenAI)
