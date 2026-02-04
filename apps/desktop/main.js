@@ -2832,7 +2832,7 @@ const startTaskScheduler = () => {
                     // Store it for future checks
                     await updateTask(task.id, {
                       contextMemory: { ...task.contextMemory, conversation_id: conversationId }
-                    });
+                    }, currentUser.username);
                   }
                 } catch (err) {
                   console.error(`[Tasks] Failed to capture conversation_id: ${err.message}`);
@@ -2855,7 +2855,7 @@ const startTaskScheduler = () => {
                   await updateTask(task.id, {
                     nextCheck: Date.now() + pollInterval,
                     contextMemory: { ...task.contextMemory, last_check_time: new Date().toISOString() }
-                  });
+                  }, currentUser.username);
                 }
                 continue; // Skip to next task
               }
@@ -2897,7 +2897,7 @@ const startTaskScheduler = () => {
                   recent_messages: messages.slice(0, 5) // Store up to 5 recent messages
                 },
                 logEntry: logMessage
-              });
+              }, currentUser.username);
               
               // Proactively notify user that a reply was received
               if (win) {
@@ -2926,7 +2926,7 @@ const startTaskScheduler = () => {
                 await updateTask(task.id, {
                   nextCheck: Date.now() + pollInterval,
                   contextMemory: { ...task.contextMemory, last_email_check: new Date().toISOString() }
-                });
+                }, currentUser.username);
               }
               continue;
             }
@@ -2935,7 +2935,7 @@ const startTaskScheduler = () => {
           }
           
           console.log(`[Tasks] Executing scheduled check for task: ${task.id}`);
-          await executeTaskStep(task.id);
+          await executeTaskStep(task.id, currentUser.username);
         }
       }
     } catch (err) {
@@ -2977,7 +2977,7 @@ const resumeTasksOnStartup = async (username) => {
         if (Date.now() >= task.nextCheck) {
           console.log(`[Tasks] Resuming task: ${task.id} (missed scheduled check)`);
           // Schedule immediate check for replies
-          setTimeout(() => executeTaskStep(task.id), 5000);
+          setTimeout(() => executeTaskStep(task.id, username), 5000);
         } else {
           console.log(`[Tasks] Task ${task.id} will be checked at next scheduled time`);
         }
@@ -2987,11 +2987,11 @@ const resumeTasksOnStartup = async (username) => {
         await updateTask(task.id, {
           nextCheck: Date.now() + 60000,
           logEntry: "Task resumed after app restart - checking for replies"
-        });
+        }, username);
       } else if (task.status === "active") {
         console.log(`[Tasks] Task ${task.id} is active, will continue execution`);
         // Resume active tasks after a delay to let the app fully initialize
-        setTimeout(() => executeTaskStep(task.id), 10000);
+        setTimeout(() => executeTaskStep(task.id, username), 10000);
       }
     }
   } catch (err) {
@@ -3031,10 +3031,10 @@ const runOnLoginTasks = async (username) => {
       // Add log entry
       await updateTask(task.id, {
         logEntry: "Task triggered by user login"
-      });
+      }, username);
       
       // Execute the task with a small delay to let app initialize
-      setTimeout(() => executeTaskStep(task.id), 3000);
+      setTimeout(() => executeTaskStep(task.id, username), 3000);
     }
   } catch (err) {
     console.error("[Tasks] Failed to run on-login tasks:", err.message);
@@ -7593,7 +7593,7 @@ Generate ONLY the welcome message, nothing else.`;
       
       // Only continue execution if task is active (not waiting)
       if (task.status === "active") {
-        setTimeout(() => executeTaskStep(taskId), 100);
+        setTimeout(() => executeTaskStep(taskId, currentUser?.username), 100);
       }
 
       return { ok: true, sendResult, waiting: task.status === "waiting" };
@@ -7663,7 +7663,7 @@ Generate ONLY the welcome message, nothing else.`;
       
       // Continue task execution on the next step
       if (task.status === "active") {
-        setTimeout(() => executeTaskStep(taskId), 100);
+        setTimeout(() => executeTaskStep(taskId, currentUser?.username), 100);
       }
 
       return { ok: true };
@@ -12109,7 +12109,7 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
             if (input.nextStatus === "active" && input.nextStep && input.nextStep <= task.plan.length) {
               console.log(`[Tasks] Auto-continuing to step ${input.nextStep} for task ${taskId}`);
               // Schedule immediate continuation (use setTimeout to avoid deep recursion)
-              setTimeout(() => executeTaskStep(taskId), 100);
+              setTimeout(() => executeTaskStep(taskId, currentUser?.username), 100);
             }
             
             // State was updated, we can exit the loop
@@ -12172,7 +12172,7 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
         }
         
         // Continue to next step after a short delay
-        setTimeout(() => executeTaskStep(taskId), 500);
+        setTimeout(() => executeTaskStep(taskId, currentUser?.username), 500);
         return { success: true, autoAdvanced: true };
       } else {
         // This was the last step - mark task as completed
@@ -14816,10 +14816,10 @@ ${formatDecomposedSteps(steps)}
           pendingClarification: null // Clear the pending question
         },
         logEntry: `User responded: "${userMessage.slice(0, 100)}${userMessage.length > 100 ? '...' : ''}"`
-      });
+      }, currentUser?.username);
       
       // Resume task execution
-      setTimeout(() => executeTaskStep(task.id), 100);
+      setTimeout(() => executeTaskStep(task.id, currentUser?.username), 100);
       
       return {
         ok: true,
