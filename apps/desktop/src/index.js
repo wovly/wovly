@@ -150,13 +150,26 @@ module.exports = {
   // ─────────────────────────────────────────────────────────────────────────────
   timeTools: tools.timeTools,
   executeTimeTool: tools.executeTimeTool,
+  
+  // Task primitive tools (variables, control flow, time comparison, etc.)
+  taskPrimitiveTools: tools.taskPrimitiveTools,
+  executeTaskPrimitiveTool: tools.executeTaskPrimitiveTool,
+  parseTimeString: tools.parseTimeString,
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // LLM
+  // LLM (Architect-Builder Pattern)
   // ─────────────────────────────────────────────────────────────────────────────
   CLASSIFIER_MODELS: llm.CLASSIFIER_MODELS,
+  // Main entry point
   decomposeQuery: llm.decomposeQuery,
+  // Individual stages
+  architectDecompose: llm.architectDecompose,
+  builderMapToTools: llm.builderMapToTools,
   validateDecomposition: llm.validateDecomposition,
-  refineDecomposition: llm.refineDecomposition,
-  formatDecomposedSteps: llm.formatDecomposedSteps
+  // Formatting utilities
+  formatDecomposedSteps: llm.formatDecomposedSteps,
+  formatArchitectSteps: llm.formatArchitectSteps,
+  formatBuilderPlan: llm.formatBuilderPlan,
+  // Helpers
+  getToolCategories: llm.getToolCategories
 };

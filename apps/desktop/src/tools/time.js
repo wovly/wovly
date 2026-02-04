@@ -6,8 +6,8 @@
 const timeTools = [
   {
     name: "get_current_time",
-    description: "Get the current date and time. Use this to check if it's time for a scheduled action.",
-    schema: {
+    description: "Get the current date and time. Use this to check if it's time for a scheduled action. Returns hour (0-23), minute (0-59), and formatted time string.",
+    input_schema: {
       type: "object",
       properties: {
         timezone: {
@@ -20,8 +20,8 @@ const timeTools = [
   },
   {
     name: "send_reminder",
-    description: "Send a reminder message to the user in the chat. Use this for time-based reminders.",
-    schema: {
+    description: "Send a reminder message to the user in the chat. Use this for time-based reminders and notifications.",
+    input_schema: {
       type: "object",
       properties: {
         message: {

@@ -6,8 +6,16 @@
 
 const path = require("path");
 const fs = require("fs/promises");
-const { safeStorage } = require("electron");
 const { getUserDataDir } = require("../utils/helpers");
+
+// Lazy-load safeStorage to avoid issues with module loading order
+let _safeStorage = null;
+const getSafeStorage = () => {
+  if (!_safeStorage) {
+    _safeStorage = require("electron").safeStorage;
+  }
+  return _safeStorage;
+};
 
 // In-memory cache of decrypted credentials (per user)
 let credentialsCache = new Map(); // username -> credentials object
@@ -32,7 +40,7 @@ const loadCredentials = async (username) => {
   
   try {
     // Check if safeStorage is available
-    if (!safeStorage.isEncryptionAvailable()) {
+    if (!getSafeStorage().isEncryptionAvailable()) {
       console.warn("[Credentials] Encryption not available on this system");
       // Fall back to checking for unencrypted file (migration case)
       try {
@@ -54,7 +62,7 @@ const loadCredentials = async (username) => {
 
     // Read encrypted file
     const encryptedBuffer = await fs.readFile(credentialsPath);
-    const decryptedString = safeStorage.decryptString(encryptedBuffer);
+    const decryptedString = getSafeStorage().decryptString(encryptedBuffer);
     const creds = JSON.parse(decryptedString);
     credentialsCache.set(username, creds);
     console.log(`[Credentials] Loaded ${Object.keys(creds).length} credentials for ${username}`);
@@ -95,7 +103,7 @@ const saveCredentials = async (credentials, username) => {
   const credentialsPath = await getCredentialsPath(username);
   
   try {
-    if (!safeStorage.isEncryptionAvailable()) {
+    if (!getSafeStorage().isEncryptionAvailable()) {
       console.warn("[Credentials] Encryption not available - storing with basic protection");
       // Fallback: store as JSON but with restricted permissions
       await fs.writeFile(credentialsPath + ".json", JSON.stringify(credentials, null, 2), {
@@ -106,7 +114,7 @@ const saveCredentials = async (credentials, username) => {
     }
 
     const jsonString = JSON.stringify(credentials);
-    const encryptedBuffer = safeStorage.encryptString(jsonString);
+    const encryptedBuffer = getSafeStorage().encryptString(jsonString);
     await fs.writeFile(credentialsPath, encryptedBuffer);
     credentialsCache.set(username, credentials);
     console.log(`[Credentials] Saved ${Object.keys(credentials).length} credentials for ${username} (encrypted)`);
