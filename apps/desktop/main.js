@@ -13114,104 +13114,54 @@ IMPORTANT: Browser automation (page loads, clicking buttons, form submissions) i
   async function decomposeQuery(query, availableTools, apiKeys, activeProvider) {
     const toolNames = availableTools.map(t => `${t.name}: ${t.description}`).join("\n");
     
-    const decompositionPrompt = `Break down this complex query into clear, sequential steps:
+    const decompositionPrompt = `You are a task decomposition assistant. Review the user's request and intent, then break it down into clear, sequential steps that can be accomplished with the tools provided.
 
-Query: "${query}"
+Think of this like writing a simple computer program - each step must be PRECISE and EXECUTABLE, not vague or abstract.
 
-Available tools:
+## User Request
+"${query}"
+
+## Available Tools
 ${toolNames}
 
-FIRST, determine if this is a DISCRETE or CONTINUOUS task:
-- DISCRETE: Has a clear end goal that can be completed (e.g., "find out X", "schedule a meeting", "send an email")
-- CONTINUOUS: Ongoing monitoring/watching with no end (e.g., "monitor weather and alert when it rains", "watch for emails from X")
+## Core Principles
 
-Respond with ONLY a JSON object (no markdown, no explanation):
+1. **Every step must call a tool** - Steps cannot be abstract like "at 12pm send a reminder". How does the task know when it's 12pm? It must call a tool to check the time.
+
+2. **Tasks poll at regular intervals** (e.g., every 1 minute) - Time-based conditions need an acceptance window. Instead of "when it's exactly 12:00", use "when the time is between 11:59 and 12:01".
+
+3. **Steps must be atomic and executable** - Each step is ONE action using ONE tool that produces a concrete result.
+
+4. **No meta-tasks** - Don't create steps like "create a reminder" or "set up a task". The steps themselves ARE the task.
+
+5. **Use conditional logic** - Steps can include conditions like "IF [condition from previous step], THEN [action]".
+
+## Task Types
+
+- **DISCRETE**: Has a clear end goal (send email, find information, schedule meeting)
+- **CONTINUOUS**: Ongoing monitoring with no end (check weather daily, monitor inbox, time-based reminders)
+
+## Response Format
+
+Respond with ONLY a JSON object:
 {
-  "title": "Brief 3-5 word task title",
+  "title": "Brief 3-5 word title",
   "task_type": "discrete" or "continuous",
-  "success_criteria": "What defines successful completion (for discrete tasks)",
-  "monitoring_condition": "What to watch for (for continuous tasks only)",
-  "trigger_action": "What to do when condition is met (for continuous tasks only)",
+  "success_criteria": "What defines completion (null for continuous)",
+  "monitoring_condition": "What triggers action (for continuous tasks)",
+  "trigger_action": "What to do when triggered (for continuous tasks)",
   "steps": [
     {
       "step": 1,
-      "action": "Clear description of what to do in this step",
-      "tools_needed": ["tool_name1"],
+      "action": "Precise description using [tool_name]",
+      "tools_needed": ["tool_name"],
       "depends_on_previous": false,
       "may_require_waiting": false,
-      "is_recurring": false,
-      "expected_output": "What this step should produce"
+      "is_recurring": false
     }
   ],
-  "requires_task": false,
-  "reason_for_task": null
-}
-
-CRITICAL Rules:
-1. Each step should be atomic - one clear action
-2. Steps should be in logical execution order
-3. Set depends_on_previous=true if step needs data from previous step
-4. Set may_require_waiting=true ONLY for steps waiting for HUMAN responses (email replies, chat messages from others, etc.)
-   - Browser automation (page loads, form submissions, clicking) is IMMEDIATE - NOT waiting
-   - API calls are IMMEDIATE - NOT waiting  
-   - Only set true when waiting for another PERSON to respond
-5. Set requires_task=true if ANY step has may_require_waiting=true OR if there are 10+ steps OR if task_type is "continuous"
-6. Be specific about which tool to use in each step
-
-DYNAMIC STEP ADJUSTMENT:
-- Steps can be adjusted based on information learned during execution
-- If a step discovers something unexpected, subsequent steps may need to change
-- If user provides additional context mid-task, steps should adapt
-- Example: If step 1 "lookup contact" fails, add a step to "ask user for contact details" and continue
-
-BROWSER AUTOMATION - IMPORTANT:
-7. If a task requires finding information from the web (flights, hotels, products, prices, news, etc.) and no specific tool exists, USE browser_automation!
-8. When browser automation is needed, create EXPLICIT steps:
-   - Step 1: "Open [specific website URL]" using browser_automation
-   - Step 2: "Take screenshot to see page content" using browser_automation
-   - Step 3: "Fill search form with [specific details]" using browser_automation
-   - Step 4: "Click search button" using browser_automation
-   - Step 5: "Take screenshot to see results" using browser_automation
-   - Step 6: "Extract relevant information from results" using browser_automation
-9. ALWAYS pick a specific website. Common choices:
-   - Flights: https://www.google.com/travel/flights OR https://www.kayak.com OR https://www.expedia.com
-   - Hotels: https://www.booking.com OR https://www.hotels.com
-   - Products/Shopping: https://www.amazon.com OR https://www.google.com/shopping
-   - General search: https://www.google.com
-10. NEVER say "I don't have access to X" - if browser_automation is available, USE IT to browse websites!
-
-FOR DISCRETE TASKS (task_type: "discrete"):
-7. Set success_criteria to describe what defines completion
-8. The LAST step MUST be a confirmation/completion step that verifies success criteria is met. Examples:
-   - "follow up until he gives you an answer" → final step: "Confirm we have received a definitive answer and notify user of the result"
-   - "schedule a meeting" → final step: "Confirm meeting is scheduled and send confirmation to user"
-   - "find out X" → final step: "Confirm we have obtained X and summarize the finding to the user"
-
-FOR CONTINUOUS TASKS (task_type: "continuous"):
-9. Set success_criteria to null (no final success - task runs indefinitely)
-10. Set monitoring_condition to describe what triggers action (e.g., "rain detected in weather", "new email from X")
-11. Set trigger_action to describe what happens when condition is met (e.g., "send alert to user")
-12. Mark steps that repeat with is_recurring=true
-13. The plan should describe ONE monitoring cycle. Examples:
-    - "monitor weather and alert when it rains" → steps: 1) Check weather forecast, 2) If rain detected, alert user, 3) Wait and repeat
-    - "watch inbox for emails from X" → steps: 1) Check recent emails from X, 2) If new email found, notify user, 3) Wait and repeat
-
-TIME-BASED REMINDERS (IMPORTANT - these are CONTINUOUS tasks):
-14. "remind me to X at Y time" or "alert me at Y" are CONTINUOUS tasks that check time
-15. Use get_current_time to check the current time, and send_reminder to notify the user
-16. Examples:
-    - "remind me to eat lunch at 12pm" → 
-      task_type: "continuous"
-      monitoring_condition: "current time is 12:00 PM"
-      trigger_action: "send reminder to eat lunch"
-      steps: [
-        {step: 1, action: "Check current time using get_current_time", tools_needed: ["get_current_time"], is_recurring: true},
-        {step: 2, action: "If time is 12:00 PM (+/- 2 minutes), send reminder 'Time to eat lunch!' using send_reminder", tools_needed: ["send_reminder"]},
-        {step: 3, action: "Wait and continue monitoring", is_recurring: true}
-      ]
-    - "remind me every day at 9am to take medicine" → same pattern with monitoring_condition: "current time is 9:00 AM"
-    - "alert me when it's 5pm" → same pattern with trigger time of 5:00 PM
-17. Do NOT create meta-tasks about "creating reminders" - THIS task IS the reminder`;
+  "requires_task": true
+}`;
 
 
 
