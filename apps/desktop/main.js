@@ -911,7 +911,16 @@ const startTaskScheduler = () => {
               // If this is a wait_for_reply workflow, evaluate the reply with LLM
               if (task.contextMemory?.wait_for_reply_active) {
                 console.log(`[Tasks] wait_for_reply active - evaluating reply for task ${task.id}`);
-                const apiKeys = await getApiKeys(currentUser.username);
+                
+                // Get API keys from settings
+                const settingsPath = await getSettingsPath(currentUser?.username);
+                let apiKeys = {};
+                try {
+                  const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+                  apiKeys = settings.apiKeys || {};
+                } catch {
+                  console.error("[Tasks] Could not load API keys for reply evaluation");
+                }
                 
                 // Get full reply content (prefer full content over snippet)
                 let fullReplyContent = messagePreview;
