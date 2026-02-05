@@ -253,7 +253,7 @@ const taskPrimitiveTools = [
   },
   {
     name: "notify_user",
-    description: "Send a notification message to the user in the chat. Use for status updates, confirmations, or questions. Different from send_reminder which is specifically for time-based alerts.",
+    description: "Send a notification message to the user in the chat. Use for status updates, confirmations, or follow-up questions. IMPORTANT: When type='question', the task will PAUSE and wait for the user to respond before continuing. For questions that don't need a response, use type='info' instead.",
     input_schema: {
       type: "object",
       properties: {
@@ -264,7 +264,7 @@ const taskPrimitiveTools = [
         type: { 
           type: "string",
           enum: ["info", "success", "warning", "question"],
-          description: "Notification type (affects styling)" 
+          description: "Notification type. 'question' will pause the task and wait for user response. Other types just display the message." 
         }
       },
       required: ["message"]
@@ -310,6 +310,53 @@ const taskPrimitiveTools = [
         }
       },
       required: ["question"]
+    }
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Follow-up Workflow Tools
+  // ─────────────────────────────────────────────────────────────────────────────
+  {
+    name: "wait_for_reply",
+    description: "Wait for a reply to a message you just sent. Polls for new messages at regular intervals. When a reply is received, the LLM evaluates if it satisfies the original request. If not satisfied or no reply after timeout, automatically sends a follow-up (max 3 attempts). Use this after sending an email/text/slack message to handle the entire follow-up workflow automatically.",
+    input_schema: {
+      type: "object",
+      properties: {
+        platform: { 
+          type: "string", 
+          enum: ["email", "imessage", "slack", "telegram", "discord"],
+          description: "Which messaging platform to monitor for replies" 
+        },
+        contact: { 
+          type: "string", 
+          description: "Who to wait for a reply from (email address, phone number, Slack user, etc.)" 
+        },
+        original_request: { 
+          type: "string", 
+          description: "What information or action was requested in the original message" 
+        },
+        success_criteria: { 
+          type: "string", 
+          description: "What a satisfactory reply should contain (e.g., 'contains a specific date and time', 'confirms availability', 'provides the requested document')" 
+        },
+        conversation_id: {
+          type: "string",
+          description: "Thread/conversation ID to filter replies (e.g., email threadId, chat_id). If not provided, will match any message from the contact."
+        },
+        poll_interval_minutes: { 
+          type: "number", 
+          description: "How often to check for new messages (default: 5 minutes)" 
+        },
+        followup_after_hours: { 
+          type: "number", 
+          description: "Hours to wait before sending a follow-up if no reply (default: 24 hours)" 
+        },
+        max_followups: { 
+          type: "number", 
+          description: "Maximum number of follow-up messages to send before giving up (default: 3)" 
+        }
+      },
+      required: ["platform", "contact", "original_request", "success_criteria"]
     }
   }
 ];
@@ -677,11 +724,25 @@ async function executeTaskPrimitiveTool(toolName, toolInput, context = {}) {
           mainWindow.webContents.send("chat:newMessage", {
             role: "assistant",
             content: `${typeEmoji} ${message}`,
-            source: "task_notification"
+            source: type === "question" ? "task_question" : "task_notification",
+            expectsResponse: type === "question"
           });
         }
         
         console.log(`[TaskPrimitive] Notify user [${type}]: ${message}`);
+        
+        // If type is "question", treat this like ask_user_question and wait for response
+        if (type === "question") {
+          console.log(`[TaskPrimitive] notify_user with type=question - setting task to wait for input`);
+          return {
+            success: true,
+            action: "wait_for_user_input",
+            question: message,
+            save_response_as: null,
+            message: `Asked user: "${message}" - waiting for response`
+          };
+        }
+        
         return {
           success: true,
           type,
@@ -762,6 +823,59 @@ async function executeTaskPrimitiveTool(toolName, toolInput, context = {}) {
             sent: false
           };
         }
+      }
+      
+      // ─────────────────────────────────────────────────────────────────────────
+      // Follow-up Workflow
+      // ─────────────────────────────────────────────────────────────────────────
+      
+      case "wait_for_reply": {
+        const { 
+          platform, 
+          contact, 
+          original_request, 
+          success_criteria,
+          conversation_id,
+          poll_interval_minutes = 5, 
+          followup_after_hours = 24, 
+          max_followups = 3 
+        } = toolInput;
+        
+        if (!platform || !contact || !original_request || !success_criteria) {
+          return { 
+            success: false, 
+            error: "platform, contact, original_request, and success_criteria are required" 
+          };
+        }
+        
+        console.log(`[TaskPrimitive] Wait for reply from ${contact} via ${platform}`);
+        console.log(`[TaskPrimitive] Original request: ${original_request}`);
+        console.log(`[TaskPrimitive] Success criteria: ${success_criteria}`);
+        console.log(`[TaskPrimitive] Poll: ${poll_interval_minutes}min, Followup: ${followup_after_hours}h, Max: ${max_followups}`);
+        
+        // Notify user that we're waiting
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send("chat:newMessage", {
+            role: "assistant",
+            content: `⏳ **Waiting for reply from ${contact}**\n\nI'll check for their response every ${poll_interval_minutes} minutes. If they don't reply within ${followup_after_hours} hours, I'll send a follow-up (up to ${max_followups} times).`,
+            source: "task"
+          });
+        }
+        
+        // Return special action to set up the wait_for_reply workflow
+        return {
+          success: true,
+          action: "wait_for_reply",
+          platform,
+          contact,
+          original_request,
+          success_criteria,
+          conversation_id: conversation_id || null,
+          poll_interval_minutes,
+          followup_after_hours,
+          max_followups,
+          message: `Waiting for reply from ${contact} via ${platform}`
+        };
       }
       
       default:

@@ -188,9 +188,25 @@ The system has these fundamental tools for building any task:
 
 **Communication:**
 - send_reminder: Display a reminder message to the user (with ⏰ prefix)
-- notify_user: Send status updates/notifications (with type emoji)
+- notify_user: Send status updates/notifications. Use type="question" for follow-up questions that need user response (task pauses)
 - send_chat_message: Send any message to the main chat window
-- ask_user_question: Ask the user a question and wait for their reply (task pauses until response)
+- ask_user_question: Ask the user a question and wait for their reply (task pauses until response) - use for clarification or multi-choice decisions
+
+**Message Reply Handling (IMPORTANT):**
+- wait_for_reply: After sending any message (email, iMessage, Slack, etc.) where you need to wait for and evaluate the response, use wait_for_reply instead of manual polling/checking. It handles the ENTIRE follow-up workflow automatically:
+  - Polls for new messages at configurable intervals
+  - Evaluates replies using LLM to check if they satisfy the original request
+  - Automatically sends follow-up messages (up to 3) if reply is unsatisfactory
+  - Handles timeouts (24h default) if no reply is received
+  - Parameters: platform, contact, original_request, success_criteria, conversation_id (optional), poll_interval_minutes, followup_after_hours, max_followups
+
+## Example: "Email John and ask for the meeting time, follow up if he doesn't give a specific time"
+1. Send email to John asking for meeting time
+2. wait_for_reply with: platform="email", contact="john@example.com", original_request="meeting time", success_criteria="contains a specific date and time for the meeting"
+
+## Example: "Text Sarah to confirm dinner plans, keep asking until she confirms"
+1. Send iMessage to Sarah asking to confirm dinner
+2. wait_for_reply with: platform="imessage", contact="Sarah", original_request="confirm dinner plans", success_criteria="explicitly confirms attendance or declines"
 
 ## Example: "Remind me at 12pm daily"
 1. Parse user's time ("12pm") and save to variable "target_hour"
@@ -323,9 +339,12 @@ This plan executes via POLLING - steps run repeatedly at intervals. Use these pa
 
 **For output:**
 - send_reminder: Show reminder message to user (with ⏰ prefix)
-- notify_user: Show status/info notifications (with type emoji)
+- notify_user: Show status/info notifications. Use type="question" to ask follow-up questions (task pauses for response)
 - send_chat_message: Send any message directly to the chat
-- ask_user_question: Ask user a question and wait for reply (pauses task)
+- ask_user_question: Ask user a question and wait for reply (task pauses until response)
+
+**For message reply workflows:**
+- wait_for_reply: Use IMMEDIATELY after sending any message (email, iMessage, Slack, etc.) when you need to wait for and evaluate a reply. This ONE tool handles the entire follow-up workflow - do NOT manually implement polling loops or conditional checking for replies. Args: platform, contact, original_request, success_criteria, conversation_id (optional), poll_interval_minutes (default 5), followup_after_hours (default 24), max_followups (default 3)
 
 # Tool Definitions
 ${toolDefsJson}
@@ -606,7 +625,9 @@ async function decomposeQuery(query, availableTools, apiKeys, activeProvider, ma
         dependencies: p.dependencies,
         depends_on_previous: (p.dependencies?.length || 0) > 0,
         // Only flag as waiting if it actually waits for external input
-        may_require_waiting: p.tool === "ask_user_question" || p.tool.includes("wait_for"),
+        // notify_user with type="question" also waits for user response
+        may_require_waiting: p.tool === "ask_user_question" || p.tool.includes("wait_for") || 
+          (p.tool === "notify_user" && p.args?.type === "question"),
         is_conditional: p.is_conditional || false,
         is_recurring: architectResult.task_type === "continuous"
       })),

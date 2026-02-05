@@ -225,13 +225,19 @@ const checkForNewSlackMessages = async (channelOrUser, afterTimestamp, accessTok
 };
 
 // Check for new Gmail messages
-const checkForNewEmails = async (accessToken, fromEmail, afterTimestamp) => {
+// threadId parameter allows filtering to a specific email thread (for reply tracking)
+const checkForNewEmails = async (accessToken, fromEmail, afterTimestamp, threadId = null) => {
   if (!accessToken || !fromEmail) {
     return { hasNew: false, reason: "missing parameters" };
   }
 
   try {
-    const query = `from:${fromEmail} newer_than:2d`;
+    // Build query - include threadId if provided to filter to same conversation
+    let query = `from:${fromEmail} newer_than:2d`;
+    
+    // If threadId is provided, we'll filter results by thread after fetching
+    // (Gmail API doesn't support direct thread filtering in search query)
+    
     const url = new URL("https://www.googleapis.com/gmail/v1/users/me/messages");
     url.searchParams.set("q", query);
     url.searchParams.set("maxResults", "10");
@@ -263,6 +269,14 @@ const checkForNewEmails = async (accessToken, fromEmail, afterTimestamp) => {
         
         if (msgResponse.ok) {
           const msgData = await msgResponse.json();
+          
+          // If threadId is specified, filter to only messages in the same thread
+          // This ensures we only detect replies to our original email, not other emails from this contact
+          if (threadId && msgData.threadId !== threadId) {
+            console.log(`[Messaging] Skipping email ${msg.id} - different thread (${msgData.threadId} vs ${threadId})`);
+            continue;
+          }
+          
           const internalDate = parseInt(msgData.internalDate, 10);
           
           if (internalDate > afterTimestamp) {
@@ -271,6 +285,7 @@ const checkForNewEmails = async (accessToken, fromEmail, afterTimestamp) => {
             const snippet = msgData.snippet || '';
             newMessages.push({
               id: msg.id,
+              threadId: msgData.threadId, // Include threadId in response
               timestamp: internalDate,
               subject: subjectHeader?.value || "(no subject)",
               snippet: snippet

@@ -399,6 +399,279 @@ let whatsappSaveCreds = null;
 // Note: Session, auth, and utility functions are now imported from ./src
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Wait-for-Reply Workflow Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Use LLM to evaluate if a reply satisfies the success criteria
+ * @param {Object} params - Evaluation parameters
+ * @param {string} params.replyContent - The content of the reply
+ * @param {string} params.originalRequest - What was originally requested
+ * @param {string} params.successCriteria - What constitutes a satisfactory reply
+ * @param {string} params.contact - Who the reply is from
+ * @param {Object} apiKeys - API keys for LLM
+ * @returns {Object} { satisfies: boolean, reason: string, extractedInfo: string }
+ */
+async function evaluateReplyWithLLM(params, apiKeys) {
+  const { replyContent, originalRequest, successCriteria, contact } = params;
+  
+  if (!apiKeys?.anthropic) {
+    console.log("[WaitForReply] No API key for LLM evaluation, assuming reply satisfies criteria");
+    return { satisfies: true, reason: "No API key available for evaluation", extractedInfo: replyContent };
+  }
+  
+  console.log(`[WaitForReply] Evaluating reply from ${contact}`);
+  console.log(`[WaitForReply] Original request: ${originalRequest}`);
+  console.log(`[WaitForReply] Success criteria: ${successCriteria}`);
+  console.log(`[WaitForReply] Reply content: ${replyContent?.substring(0, 200)}...`);
+  
+  const prompt = `You are evaluating if a reply to a message satisfies the original request.
+
+ORIGINAL REQUEST:
+${originalRequest}
+
+SUCCESS CRITERIA:
+${successCriteria}
+
+REPLY FROM ${contact}:
+${replyContent}
+
+TASK:
+Determine if this reply satisfies the success criteria. Be reasonable - if the person has provided the requested information, even if not perfectly formatted, it should be considered satisfactory.
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{
+  "satisfies": true or false,
+  "reason": "Brief explanation of why the reply does or doesn't satisfy the criteria",
+  "extractedInfo": "If satisfies=true, extract the key information from the reply. If satisfies=false, leave empty."
+}`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKeys.anthropic,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 500,
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+    
+    if (!response.ok) {
+      console.error("[WaitForReply] LLM API error:", response.status);
+      return { satisfies: false, reason: "LLM evaluation failed", extractedInfo: "" };
+    }
+    
+    const data = await response.json();
+    const content = data.content?.[0]?.text || "";
+    
+    // Parse JSON from response
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const result = JSON.parse(jsonMatch[0]);
+      console.log(`[WaitForReply] Evaluation result: satisfies=${result.satisfies}, reason=${result.reason}`);
+      return {
+        satisfies: result.satisfies === true,
+        reason: result.reason || "",
+        extractedInfo: result.extractedInfo || ""
+      };
+    }
+    
+    console.log("[WaitForReply] Could not parse LLM response, assuming not satisfied");
+    return { satisfies: false, reason: "Could not parse evaluation response", extractedInfo: "" };
+    
+  } catch (err) {
+    console.error("[WaitForReply] Evaluation error:", err.message);
+    return { satisfies: false, reason: `Evaluation error: ${err.message}`, extractedInfo: "" };
+  }
+}
+
+/**
+ * Generate a follow-up message using LLM based on the original request and any unsatisfactory reply
+ * @param {Object} params - Generation parameters
+ * @param {string} params.originalRequest - What was originally requested
+ * @param {string} params.previousReply - The unsatisfactory reply (if any)
+ * @param {string} params.reason - Why the previous reply was unsatisfactory
+ * @param {number} params.followupCount - How many follow-ups have been sent
+ * @param {boolean} params.isTimeout - Whether this is a timeout follow-up (no reply received)
+ * @param {Object} apiKeys - API keys for LLM
+ * @returns {string} The follow-up message to send
+ */
+async function generateFollowupMessage(params, apiKeys) {
+  const { originalRequest, previousReply, reason, followupCount, isTimeout } = params;
+  
+  if (!apiKeys?.anthropic) {
+    // Fallback message if no API key
+    if (isTimeout) {
+      return `Hi, I wanted to follow up on my previous message. ${originalRequest} Please let me know when you have a chance.`;
+    }
+    return `Thanks for your response. Could you please provide more details? ${originalRequest}`;
+  }
+  
+  const prompt = `You need to write a polite follow-up message.
+
+ORIGINAL REQUEST:
+${originalRequest}
+
+${isTimeout ? `This is follow-up #${followupCount + 1} because the recipient hasn't responded yet.` : `
+THEIR PREVIOUS REPLY:
+${previousReply}
+
+WHY IT'S NOT SATISFACTORY:
+${reason}
+`}
+
+TASK:
+Write a brief, friendly follow-up message that:
+1. Is polite and professional
+2. ${isTimeout ? "Gently reminds them about the original request" : "Thanks them for their response and asks for the specific missing information"}
+3. Is concise (2-3 sentences max)
+4. Doesn't sound pushy or demanding
+
+Respond with ONLY the message text, no quotes or explanations.`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKeys.anthropic,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 300,
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+    
+    if (!response.ok) {
+      console.error("[WaitForReply] Follow-up generation API error:", response.status);
+      return isTimeout 
+        ? `Hi, just following up on my previous message. ${originalRequest}`
+        : `Thanks for your response. Could you please provide: ${originalRequest}`;
+    }
+    
+    const data = await response.json();
+    return data.content?.[0]?.text?.trim() || `Following up: ${originalRequest}`;
+    
+  } catch (err) {
+    console.error("[WaitForReply] Follow-up generation error:", err.message);
+    return isTimeout 
+      ? `Hi, just following up on my previous message. ${originalRequest}`
+      : `Thanks for your response. Could you please provide: ${originalRequest}`;
+  }
+}
+
+/**
+ * Send a follow-up message via the appropriate platform
+ * @param {Object} params - Follow-up parameters
+ * @param {string} params.platform - Platform to send via (email, imessage, slack, telegram, discord)
+ * @param {string} params.contact - Recipient contact info
+ * @param {string} params.message - The follow-up message to send
+ * @param {string} params.conversationId - Thread/conversation ID to reply to
+ * @param {Object} params.task - The task object for context
+ * @param {string} username - Username for credential access
+ * @returns {Object} Result with success status and details
+ */
+async function sendFollowupMessage(params, username) {
+  const { platform, contact, message, conversationId, task } = params;
+  
+  console.log(`[WaitForReply] Sending follow-up via ${platform} to ${contact}`);
+  
+  try {
+    let result;
+    
+    switch (platform) {
+      case "email": {
+        // Get Gmail access token
+        const googleCreds = await getCredentials("google", username);
+        if (!googleCreds?.access_token) {
+          return { success: false, error: "Google credentials not available for email follow-up" };
+        }
+        
+        // Send reply to the same thread
+        const { sendEmail, sendReply } = require("./src/integrations/google-integration");
+        
+        if (conversationId) {
+          // Reply to existing thread
+          result = await sendReply(googleCreds.access_token, {
+            threadId: conversationId,
+            to: contact,
+            body: message
+          });
+        } else {
+          // Send new email if no thread ID
+          result = await sendEmail(googleCreds.access_token, {
+            to: contact,
+            subject: `Re: ${task?.contextMemory?.original_request?.substring(0, 50) || "Follow-up"}`,
+            body: message
+          });
+        }
+        break;
+      }
+      
+      case "imessage": {
+        const { sendMessage } = require("./src/integrations/imessage-integration");
+        result = await sendMessage(contact, message);
+        break;
+      }
+      
+      case "slack": {
+        const slackCreds = await getCredentials("slack", username);
+        if (!slackCreds?.access_token) {
+          return { success: false, error: "Slack credentials not available for follow-up" };
+        }
+        
+        const { postMessage } = require("./src/integrations/slack-integration");
+        // For Slack, the conversationId is the channel/DM ID
+        result = await postMessage(slackCreds.access_token, conversationId || contact, message);
+        break;
+      }
+      
+      case "telegram": {
+        const telegramCreds = await getCredentials("telegram", username);
+        if (!telegramCreds?.bot_token) {
+          return { success: false, error: "Telegram credentials not available for follow-up" };
+        }
+        
+        const { sendMessage: sendTelegramMessage } = require("./src/integrations/telegram-integration");
+        result = await sendTelegramMessage(telegramCreds.bot_token, conversationId || contact, message);
+        break;
+      }
+      
+      case "discord": {
+        const discordCreds = await getCredentials("discord", username);
+        if (!discordCreds?.bot_token) {
+          return { success: false, error: "Discord credentials not available for follow-up" };
+        }
+        
+        const { sendMessage: sendDiscordMessage } = require("./src/integrations/discord-integration");
+        result = await sendDiscordMessage(discordCreds.bot_token, conversationId || contact, message);
+        break;
+      }
+      
+      default:
+        return { success: false, error: `Unknown platform: ${platform}` };
+    }
+    
+    return { 
+      success: true, 
+      result,
+      message: `Follow-up sent to ${contact} via ${platform}` 
+    };
+    
+  } catch (err) {
+    console.error(`[WaitForReply] Error sending follow-up via ${platform}:`, err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Task Scheduler
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -492,16 +765,90 @@ const startTaskScheduler = () => {
               );
               
               if (!check.hasNew) {
-                // No new messages - reschedule using task's poll frequency
-                const pollInterval = task.pollFrequency?.type === "event" ? null : (task.pollFrequency?.value || 60000);
-                console.log(`[Tasks] No new ${integration.name} from ${waitingForContact}, rescheduling in ${pollInterval ? pollInterval/1000 + 's' : 'event-based'}`);
-                if (pollInterval) {
-                  await updateTask(task.id, {
-                    nextCheck: Date.now() + pollInterval,
-                    contextMemory: { ...task.contextMemory, last_check_time: new Date().toISOString() }
-                  }, currentUser.username);
+                // No new messages - check if this is a wait_for_reply workflow with timeout
+                if (task.contextMemory?.wait_for_reply_active) {
+                  const waitStartTime = task.contextMemory.wait_started_at;
+                  const followupAfterMs = (task.contextMemory.followup_after_hours || 24) * 60 * 60 * 1000;
+                  const lastFollowupTime = task.contextMemory.last_followup_time;
+                  const timeSinceStart = Date.now() - new Date(waitStartTime).getTime();
+                  const timeSinceLastFollowup = lastFollowupTime 
+                    ? Date.now() - new Date(lastFollowupTime).getTime() 
+                    : timeSinceStart;
+                  
+                  // Check if we've waited long enough since last followup/start
+                  if (timeSinceLastFollowup >= followupAfterMs) {
+                    const currentFollowupCount = task.contextMemory.followup_count || 0;
+                    const maxFollowups = task.contextMemory.max_followups || 3;
+                    
+                    if (currentFollowupCount >= maxFollowups) {
+                      // Max follow-ups reached with no reply - notify user
+                      console.log(`[Tasks] wait_for_reply timeout: max follow-ups (${maxFollowups}) reached for task ${task.id}`);
+                      
+                      await updateTask(task.id, {
+                        status: "waiting_for_input",
+                        contextMemory: {
+                          ...task.contextMemory,
+                          wait_for_reply_active: false,
+                          max_followups_reached: true,
+                          timeout_reached: true,
+                          pendingClarification: `I've sent ${maxFollowups} follow-ups to ${waitingForContact} over the past ${Math.round(timeSinceStart / (1000 * 60 * 60))} hours but haven't received a reply. What would you like me to do?`
+                        },
+                        logEntry: `Timeout: No reply after ${maxFollowups} follow-ups - asking user for guidance`
+                      }, currentUser.username);
+                      
+                      if (win) {
+                        win.webContents.send("chat:newMessage", {
+                          role: "assistant",
+                          content: `⚠️ **Task: ${task.title}**\n\nI've sent ${maxFollowups} follow-up messages to ${waitingForContact} over the past ${Math.round(timeSinceStart / (1000 * 60 * 60))} hours, but haven't received a reply.\n\nOriginal request: "${task.contextMemory.original_request}"\n\nWhat would you like me to do?\n1. Keep trying\n2. Try a different approach\n3. Cancel this task`,
+                          source: "task_question",
+                          expectsResponse: true
+                        });
+                      }
+                      
+                      continue;
+                    }
+                    
+                    // Send timeout follow-up
+                    console.log(`[Tasks] wait_for_reply timeout - sending follow-up #${currentFollowupCount + 1} to ${waitingForContact}`);
+                    
+                    // Mark that we need to send a follow-up due to timeout
+                    await updateTask(task.id, {
+                      contextMemory: {
+                        ...task.contextMemory,
+                        needs_followup: true,
+                        followup_is_timeout: true,
+                        followup_reason: `No reply received after ${Math.round(timeSinceLastFollowup / (1000 * 60 * 60))} hours`
+                      },
+                      logEntry: `No reply in ${Math.round(timeSinceLastFollowup / (1000 * 60 * 60))} hours - preparing timeout follow-up #${currentFollowupCount + 1}`
+                    }, currentUser.username);
+                    
+                    // Refresh task and fall through to executeTaskStep to handle the follow-up
+                    task = await getTask(task.id, currentUser.username);
+                    // Don't continue - let it fall through to executeTaskStep
+                  } else {
+                    // Not yet time for follow-up - reschedule
+                    const pollInterval = task.pollFrequency?.type === "event" ? null : (task.pollFrequency?.value || 60000);
+                    console.log(`[Tasks] No new ${integration.name} from ${waitingForContact}, rescheduling in ${pollInterval ? pollInterval/1000 + 's' : 'event-based'}`);
+                    if (pollInterval) {
+                      await updateTask(task.id, {
+                        nextCheck: Date.now() + pollInterval,
+                        contextMemory: { ...task.contextMemory, last_check_time: new Date().toISOString() }
+                      }, currentUser.username);
+                    }
+                    continue;
+                  }
+                } else {
+                  // Not a wait_for_reply workflow - standard reschedule
+                  const pollInterval = task.pollFrequency?.type === "event" ? null : (task.pollFrequency?.value || 60000);
+                  console.log(`[Tasks] No new ${integration.name} from ${waitingForContact}, rescheduling in ${pollInterval ? pollInterval/1000 + 's' : 'event-based'}`);
+                  if (pollInterval) {
+                    await updateTask(task.id, {
+                      nextCheck: Date.now() + pollInterval,
+                      contextMemory: { ...task.contextMemory, last_check_time: new Date().toISOString() }
+                    }, currentUser.username);
+                  }
+                  continue; // Skip to next task
                 }
-                continue; // Skip to next task
               }
               
               console.log(`[Tasks] New ${integration.name} from ${waitingForContact}! Running executor.`);
@@ -554,6 +901,110 @@ const startTaskScheduler = () => {
                   content: displayMessage,
                   source: "task"
                 });
+              }
+              
+              // If this is a wait_for_reply workflow, evaluate the reply with LLM
+              if (task.contextMemory?.wait_for_reply_active) {
+                console.log(`[Tasks] wait_for_reply active - evaluating reply for task ${task.id}`);
+                const apiKeys = await getApiKeys(currentUser.username);
+                
+                // Get full reply content (prefer full content over snippet)
+                let fullReplyContent = messagePreview;
+                if (messages[0]) {
+                  fullReplyContent = messages[0].body || messages[0].text || messages[0].snippet || messagePreview;
+                }
+                
+                const evaluation = await evaluateReplyWithLLM({
+                  replyContent: fullReplyContent,
+                  originalRequest: task.contextMemory.original_request,
+                  successCriteria: task.contextMemory.success_criteria,
+                  contact: waitingForContact
+                }, apiKeys);
+                
+                if (evaluation.satisfies) {
+                  // Reply satisfies criteria - complete the task!
+                  console.log(`[Tasks] Reply satisfies criteria - completing task ${task.id}`);
+                  
+                  await updateTask(task.id, {
+                    status: "completed",
+                    contextMemory: {
+                      ...task.contextMemory,
+                      wait_for_reply_active: false,
+                      reply_satisfied: true,
+                      extracted_info: evaluation.extractedInfo,
+                      completed_at: new Date().toISOString()
+                    },
+                    logEntry: `Reply from ${waitingForContact} satisfied criteria: ${evaluation.reason}`
+                  }, currentUser.username);
+                  
+                  // Notify user of completion
+                  if (win && !task.notificationsDisabled) {
+                    const completionMsg = evaluation.extractedInfo 
+                      ? `✅ **Task Completed: ${task.title}**\n\nReceived satisfactory reply from ${waitingForContact}.\n\n**Extracted Information:**\n${evaluation.extractedInfo}`
+                      : `✅ **Task Completed: ${task.title}**\n\nReceived satisfactory reply from ${waitingForContact}.`;
+                    
+                    win.webContents.send("chat:newMessage", {
+                      role: "assistant",
+                      content: completionMsg,
+                      source: "task"
+                    });
+                  }
+                  
+                  continue; // Task complete, move to next task
+                } else {
+                  // Reply doesn't satisfy criteria - handle follow-up
+                  console.log(`[Tasks] Reply doesn't satisfy criteria: ${evaluation.reason}`);
+                  const currentFollowupCount = task.contextMemory.followup_count || 0;
+                  const maxFollowups = task.contextMemory.max_followups || 3;
+                  
+                  if (currentFollowupCount >= maxFollowups) {
+                    // Max follow-ups reached - notify user and pause
+                    console.log(`[Tasks] Max follow-ups (${maxFollowups}) reached - notifying user`);
+                    
+                    await updateTask(task.id, {
+                      status: "waiting_for_input",
+                      contextMemory: {
+                        ...task.contextMemory,
+                        wait_for_reply_active: false,
+                        max_followups_reached: true,
+                        last_evaluation_reason: evaluation.reason,
+                        pendingClarification: `I've sent ${maxFollowups} follow-ups to ${waitingForContact} but haven't received a satisfactory reply. What would you like me to do?`
+                      },
+                      logEntry: `Max follow-ups (${maxFollowups}) reached - asking user for guidance`
+                    }, currentUser.username);
+                    
+                    if (win) {
+                      win.webContents.send("chat:newMessage", {
+                        role: "assistant",
+                        content: `⚠️ **Task: ${task.title}**\n\nI've sent ${maxFollowups} follow-up messages to ${waitingForContact}, but their responses haven't contained the requested information (${task.contextMemory.original_request}).\n\nLast response: "${messagePreview}"\n\nWhat would you like me to do?\n1. Keep trying\n2. Try a different approach\n3. Cancel this task`,
+                        source: "task_question",
+                        expectsResponse: true
+                      });
+                    }
+                    
+                    continue; // Waiting for user input, move to next task
+                  }
+                  
+                  // Send a follow-up message asking for the missing info
+                  console.log(`[Tasks] Sending follow-up #${currentFollowupCount + 1} to ${waitingForContact}`);
+                  
+                  // Store that we need to send a follow-up - the actual sending will happen in executeTaskStep
+                  // or we can directly send it here using the integration
+                  await updateTask(task.id, {
+                    contextMemory: {
+                      ...task.contextMemory,
+                      followup_count: currentFollowupCount + 1,
+                      last_followup_time: new Date().toISOString(),
+                      needs_followup: true,
+                      followup_reason: evaluation.reason,
+                      last_reply_content: fullReplyContent
+                    },
+                    logEntry: `Reply from ${waitingForContact} didn't satisfy criteria - preparing follow-up #${currentFollowupCount + 1}: ${evaluation.reason}`
+                  }, currentUser.username);
+                  
+                  // Refresh task and fall through to executeTaskStep which will handle the follow-up
+                  task = await getTask(task.id, currentUser.username);
+                }
               }
             }
           }
@@ -4922,6 +5373,11 @@ Generate ONLY the welcome message, nothing else.`;
           task.status = "waiting";
           task.currentStep.state = "waiting";
           
+          // CRITICAL: Set nextCheck to prevent immediate re-execution by scheduler
+          // Use the task's poll frequency or default to 5 minutes
+          const pollInterval = task.pollFrequency?.value || 300000; // Default 5 minutes
+          task.nextCheck = Date.now() + pollInterval;
+          
           // Capture conversation/thread ID from send result for thread-specific reply checking
           // This ensures we only monitor replies in THIS conversation, not from other threads
           const conversationId = sendResult?.chatId ||     // iMessage chat_id
@@ -4940,7 +5396,7 @@ Generate ONLY the welcome message, nothing else.`;
             ...(conversationId ? { conversation_id: conversationId } : {})
           };
           
-          console.log(`[Tasks] Message sent for waiting step "${currentStepDesc}" - staying on step ${task.currentStep.step}, waiting for response${conversationId ? ` (conversation: ${conversationId})` : ''}`);
+          console.log(`[Tasks] Message sent for waiting step "${currentStepDesc}" - staying on step ${task.currentStep.step}, waiting for response${conversationId ? ` (conversation: ${conversationId})` : ''}, next check in ${pollInterval/1000}s`);
           
           task.executionLog.push({
             timestamp: new Date().toISOString(),
@@ -9452,6 +9908,96 @@ Generate ONLY the welcome message, nothing else.`;
     }
 
     // ────────────────────────────────────────────────────────────────────────────
+    // WAIT_FOR_REPLY FOLLOW-UP MODE - When needs_followup is set
+    // ────────────────────────────────────────────────────────────────────────────
+    
+    if (task.contextMemory?.needs_followup && task.contextMemory?.wait_for_reply_active) {
+      console.log(`[Tasks] Handling wait_for_reply follow-up for task ${taskId}`);
+      
+      const ctx = task.contextMemory;
+      const isTimeout = ctx.followup_is_timeout || false;
+      const currentFollowupCount = ctx.followup_count || 0;
+      
+      try {
+        // Generate the follow-up message using LLM
+        const followupMessage = await generateFollowupMessage({
+          originalRequest: ctx.original_request,
+          previousReply: ctx.last_reply_content || "",
+          reason: ctx.followup_reason || "No specific information provided",
+          followupCount: currentFollowupCount,
+          isTimeout: isTimeout
+        }, apiKeys);
+        
+        console.log(`[Tasks] Generated follow-up message: "${followupMessage.substring(0, 100)}..."`);
+        
+        // Send the follow-up message
+        const sendResult = await sendFollowupMessage({
+          platform: ctx.waiting_via,
+          contact: ctx.waiting_for_contact,
+          message: followupMessage,
+          conversationId: ctx.conversation_id,
+          task: task
+        }, currentUser?.username);
+        
+        if (sendResult.success) {
+          console.log(`[Tasks] Follow-up sent successfully to ${ctx.waiting_for_contact}`);
+          
+          // Update task - clear needs_followup, update timing, increment counter
+          const pollIntervalMs = (ctx.poll_interval_minutes || 5) * 60000;
+          await updateTask(taskId, {
+            status: "waiting",
+            nextCheck: Date.now() + pollIntervalMs,
+            contextMemory: {
+              ...ctx,
+              needs_followup: false,
+              followup_is_timeout: false,
+              followup_count: currentFollowupCount + 1,
+              last_followup_time: new Date().toISOString(),
+              last_followup_message: followupMessage
+            },
+            logEntry: `Sent follow-up #${currentFollowupCount + 1} to ${ctx.waiting_for_contact}: "${followupMessage.substring(0, 100)}..."`
+          }, currentUser?.username);
+          
+          // Notify user
+          if (mainWindow && !task.notificationsDisabled) {
+            mainWindow.webContents.send("chat:newMessage", {
+              role: "assistant",
+              content: `📨 **Task: ${task.title}**\n\nSent follow-up #${currentFollowupCount + 1} to ${ctx.waiting_for_contact} via ${ctx.waiting_via}:\n\n> ${followupMessage}\n\nContinuing to wait for reply...`,
+              source: "task"
+            });
+          }
+          
+          return { success: true, action: "followup_sent", contact: ctx.waiting_for_contact };
+        } else {
+          console.error(`[Tasks] Failed to send follow-up: ${sendResult.error}`);
+          
+          await updateTask(taskId, {
+            contextMemory: {
+              ...ctx,
+              needs_followup: false,
+              followup_send_error: sendResult.error
+            },
+            logEntry: `Failed to send follow-up: ${sendResult.error}`
+          }, currentUser?.username);
+          
+          return { error: sendResult.error };
+        }
+        
+      } catch (err) {
+        console.error(`[Tasks] Error handling follow-up: ${err.message}`);
+        await updateTask(taskId, {
+          contextMemory: {
+            ...task.contextMemory,
+            needs_followup: false,
+            followup_error: err.message
+          },
+          logEntry: `Error handling follow-up: ${err.message}`
+        }, currentUser?.username);
+        return { error: err.message };
+      }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
     // DIRECT EXECUTION MODE - When structured plan with tool calls is available
     // ────────────────────────────────────────────────────────────────────────────
     
@@ -9476,9 +10022,23 @@ Generate ONLY the welcome message, nothing else.`;
       let lastScreenshot = null;
       
       try {
+        // Determine which step to resume from (skip already-completed steps)
+        const resumeFromStep = task.currentStep?.step || 1;
+        const isResuming = resumeFromStep > 1;
+        if (isResuming) {
+          console.log(`[Tasks] Resuming direct execution from step ${resumeFromStep}`);
+        }
+        
         // Execute each step in the structured plan
         for (const planStep of task.structuredPlan) {
           const { step_id, tool, args, output_var, description } = planStep;
+          
+          // Skip already-completed steps when resuming
+          if (step_id < resumeFromStep) {
+            console.log(`[Tasks] Skipping already-completed step ${step_id}`);
+            continue;
+          }
+          
           console.log(`[Tasks] Direct exec step ${step_id}: [${tool}] ${description}`);
           
           // Log step to task
@@ -9560,6 +10120,47 @@ Generate ONLY the welcome message, nothing else.`;
               logEntry: `Asked user: "${toolResult.question}" - waiting for response`
             }, currentUser?.username);
             return { success: true, waitingForInput: true, question: toolResult.question };
+          }
+          
+          // Handle wait_for_reply action - sets up polling for message replies
+          if (toolResult && toolResult.action === "wait_for_reply") {
+            const pollIntervalMs = (toolResult.poll_interval_minutes || 5) * 60000;
+            console.log(`[Tasks] Task ${taskId} waiting for reply from ${toolResult.contact} via ${toolResult.platform}`);
+            console.log(`[Tasks] Poll interval: ${pollIntervalMs}ms, Followup after: ${toolResult.followup_after_hours}h, Max: ${toolResult.max_followups}`);
+            
+            await updateTask(taskId, {
+              status: "waiting",
+              nextCheck: Date.now() + pollIntervalMs,
+              currentStep: { 
+                step: step_id, 
+                description: `Waiting for reply from ${toolResult.contact}`,
+                state: "waiting" 
+              },
+              contextMemory: {
+                ...task.contextMemory,
+                // Core wait_for_reply context
+                wait_for_reply_active: true,
+                waiting_via: toolResult.platform,
+                waiting_for_contact: toolResult.contact,
+                original_request: toolResult.original_request,
+                success_criteria: toolResult.success_criteria,
+                conversation_id: toolResult.conversation_id || task.contextMemory?.conversation_id || null,
+                // Timing
+                first_message_time: task.contextMemory?.first_message_time || new Date().toISOString(),
+                last_message_time: new Date().toISOString(),
+                poll_interval_minutes: toolResult.poll_interval_minutes || 5,
+                followup_after_hours: toolResult.followup_after_hours || 24,
+                last_followup_time: null,
+                // Follow-up tracking
+                max_followups: toolResult.max_followups || 3,
+                followup_count: task.contextMemory?.followup_count || 0,
+                // Reply tracking
+                new_reply_detected: false
+              },
+              logEntry: `Waiting for reply from ${toolResult.contact} via ${toolResult.platform} (poll: ${toolResult.poll_interval_minutes || 5}min, followup: ${toolResult.followup_after_hours || 24}h)`
+            }, currentUser?.username);
+            
+            return { success: true, waitingForReply: true, contact: toolResult.contact, platform: toolResult.platform };
           }
           
           // Small delay between browser operations to let pages render
@@ -10130,6 +10731,42 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
               }, currentUser?.username);
               
               return { success: true, waitingForInput: true, question: toolResult.question };
+            }
+            
+            // Handle wait_for_reply action - sets up polling for message replies
+            if (toolResult && toolResult.action === "wait_for_reply") {
+              const pollIntervalMs = (toolResult.poll_interval_minutes || 5) * 60000;
+              console.log(`[Tasks] Task ${taskId} waiting for reply from ${toolResult.contact} via ${toolResult.platform}`);
+              
+              await updateTask(taskId, {
+                status: "waiting",
+                nextCheck: Date.now() + pollIntervalMs,
+                currentStep: { 
+                  step: task.currentStep.step, 
+                  description: `Waiting for reply from ${toolResult.contact}`,
+                  state: "waiting" 
+                },
+                contextMemory: {
+                  ...task.contextMemory,
+                  wait_for_reply_active: true,
+                  waiting_via: toolResult.platform,
+                  waiting_for_contact: toolResult.contact,
+                  original_request: toolResult.original_request,
+                  success_criteria: toolResult.success_criteria,
+                  conversation_id: toolResult.conversation_id || task.contextMemory?.conversation_id || null,
+                  first_message_time: task.contextMemory?.first_message_time || new Date().toISOString(),
+                  last_message_time: new Date().toISOString(),
+                  poll_interval_minutes: toolResult.poll_interval_minutes || 5,
+                  followup_after_hours: toolResult.followup_after_hours || 24,
+                  last_followup_time: null,
+                  max_followups: toolResult.max_followups || 3,
+                  followup_count: task.contextMemory?.followup_count || 0,
+                  new_reply_detected: false
+                },
+                logEntry: `Waiting for reply from ${toolResult.contact} via ${toolResult.platform}`
+              }, currentUser?.username);
+              
+              return { success: true, waitingForReply: true, contact: toolResult.contact, platform: toolResult.platform };
             }
             
             // Handle save_variable action - update task context memory
@@ -11806,6 +12443,12 @@ ${formatDecomposedSteps(steps)}
     if (includeTaskTools) tools.push(...taskTools);
     if (includeMemoryTools) tools.push(...memoryTools);
     
+    // Time tools - always available (get_current_time, parse_time, etc.)
+    tools.push(...timeTools);
+    
+    // Task primitive tools - always available for task execution (save_variable, evaluate_condition, notify_user, etc.)
+    tools.push(...taskPrimitiveTools);
+    
     // Documentation tools - always available for help questions
     tools.push(...documentationTools);
     if (googleAccessToken) tools.push(...googleWorkspaceTools);
@@ -12117,9 +12760,10 @@ ${formatDecomposedSteps(steps)}
       }, accessToken);
     },
     
-    checkForNewMessages: async (contact, afterTimestamp, accessToken) => {
+    checkForNewMessages: async (contact, afterTimestamp, accessToken, conversationId) => {
       if (!accessToken) return { hasNew: false, reason: "no access token" };
-      return await checkForNewEmails(accessToken, contact, afterTimestamp);
+      // conversationId is the threadId for emails - filter to same email thread
+      return await checkForNewEmails(accessToken, contact, afterTimestamp, conversationId);
     },
     
     getMessages: async (contact, options, accessToken) => {
