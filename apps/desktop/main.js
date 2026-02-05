@@ -10106,6 +10106,22 @@ Generate ONLY the welcome message, nothing else.`;
             lastScreenshot = toolResult.screenshot;
           }
           
+          // Capture threadId from email sends for later use by wait_for_reply
+          // Gmail returns threadId when sending emails - we need this to filter replies to the same conversation
+          if (toolResult && toolResult.threadId && tool === "send_email") {
+            console.log(`[Tasks] Captured email threadId: ${toolResult.threadId}`);
+            task.contextMemory = {
+              ...task.contextMemory,
+              conversation_id: toolResult.threadId,
+              last_email_thread_id: toolResult.threadId,
+              last_email_message_id: toolResult.messageId
+            };
+            // Persist to database immediately so it's available for wait_for_reply
+            await updateTask(taskId, {
+              contextMemory: task.contextMemory
+            }, currentUser?.username);
+          }
+          
           // Handle special tool results
           if (toolResult && toolResult.pending) {
             console.log(`[Tasks] Message pending approval in task ${taskId}`);
@@ -10130,8 +10146,11 @@ Generate ONLY the welcome message, nothing else.`;
           // Handle wait_for_reply action - sets up polling for message replies
           if (toolResult && toolResult.action === "wait_for_reply") {
             const pollIntervalMs = (toolResult.poll_interval_minutes || 5) * 60000;
+            const effectiveConversationId = toolResult.conversation_id || task.contextMemory?.conversation_id || null;
             console.log(`[Tasks] Task ${taskId} waiting for reply from ${toolResult.contact} via ${toolResult.platform}`);
             console.log(`[Tasks] Poll interval: ${pollIntervalMs}ms, Followup after: ${toolResult.followup_after_hours}h, Max: ${toolResult.max_followups}`);
+            console.log(`[Tasks] Using conversation_id: ${effectiveConversationId || '(none - will match any email from contact)'}`);
+            
             
             await updateTask(taskId, {
               status: "waiting",
@@ -10713,6 +10732,20 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
             };
             toolResult = await executeTool(toolUse.name, toolUse.input, taskContext);
             
+            // Capture threadId from email sends for later use by wait_for_reply
+            if (toolResult && toolResult.threadId && toolUse.name === "send_email") {
+              console.log(`[Tasks] Captured email threadId: ${toolResult.threadId}`);
+              task.contextMemory = {
+                ...task.contextMemory,
+                conversation_id: toolResult.threadId,
+                last_email_thread_id: toolResult.threadId,
+                last_email_message_id: toolResult.messageId
+              };
+              await updateTask(taskId, {
+                contextMemory: task.contextMemory
+              }, currentUser?.username);
+            }
+            
             // If a message is pending approval, update task status and return
             if (toolResult && toolResult.pending) {
               console.log(`[Tasks] Message pending approval in task ${taskId}`);
@@ -10741,7 +10774,9 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
             // Handle wait_for_reply action - sets up polling for message replies
             if (toolResult && toolResult.action === "wait_for_reply") {
               const pollIntervalMs = (toolResult.poll_interval_minutes || 5) * 60000;
+              const effectiveConversationId = toolResult.conversation_id || task.contextMemory?.conversation_id || null;
               console.log(`[Tasks] Task ${taskId} waiting for reply from ${toolResult.contact} via ${toolResult.platform}`);
+              console.log(`[Tasks] Using conversation_id: ${effectiveConversationId || '(none - will match any email from contact)'}`);
               
               await updateTask(taskId, {
                 status: "waiting",
