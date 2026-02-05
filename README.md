@@ -43,6 +43,11 @@ A privacy-first desktop AI communication assistant that manages your contacts, f
 - **Personal Playbooks** – Create reusable workflows tailored to your role: "Weekly status report: summarize my sent emails, check Asana tasks, draft update to manager"
 - **Constraint-Aware Execution** – Set guardrails for sensitive actions: "Never auto-send messages to executives without approval"
 
+### 📱 Remote Interfaces
+- **Talk to Wovly from Anywhere** – Chat with Wovly via WhatsApp or Telegram when you're away from your computer
+- **Full Capability Access** – Run tasks, check emails, send messages, and get updates from your phone
+- **Real-time Notifications** – Receive task alerts and important updates wherever you are
+
 ### 🌐 Browser Automation
 - **Web Research** – Navigate websites, extract data, fill forms
 - **Credential Management** – Securely stored login credentials for automated authentication
@@ -133,6 +138,18 @@ Choose your preferred AI model:
 
 "Watch my inbox for emails from [client] and summarize immediately"
 → Monitors and alerts in real-time
+```
+
+### Remote Access (via WhatsApp/Telegram)
+```
+[WhatsApp] "Any important emails today?"
+→ Get summaries and updates on your phone from anywhere
+
+[Telegram] "Create a task to remind me to call mom at 5pm"
+→ Create and manage tasks remotely
+
+[WhatsApp] "Text my wife I'm running 10 min late"
+→ Send messages across platforms from your phone
 ```
 
 ---
