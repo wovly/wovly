@@ -701,7 +701,7 @@ const startTaskScheduler = () => {
         console.log(`[Tasks] Scheduler tick: ${waitingTasks.length} waiting tasks`);
       }
       
-      for (const task of tasks) {
+      for (let task of tasks) {
         // Skip event-based tasks - they only run on specific events like login
         if (task.pollFrequency?.type === "event") {
           continue;
