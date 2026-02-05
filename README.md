@@ -3,11 +3,16 @@
 **Your Autonomous Personal AI Communication Assistant**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](https://github.com/bluerune234/wovly)
+[![Platform](https://img.shields.io/badge/Platform-macOS-blue)](https://github.com/wovly/wovly)
+[![Beta](https://img.shields.io/badge/Status-Beta-orange)](https://github.com/wovly/wovly/issues)
 [![Electron](https://img.shields.io/badge/Electron-Latest-47848F)](https://www.electronjs.org/)
 [![Documentation](https://img.shields.io/badge/Docs-wovly.mintlify.app-blue.svg)](https://wovly.mintlify.app/)
 
 A privacy-first desktop AI communication assistant that manages your contacts, follow ups, chat analysis, and remembers context across Email, Slack, iMessage, WhatsApp, Telegram, and more.
+
+> **🚧 Beta Notice:** Wovly is currently in beta. We appreciate your feedback! Please [report bugs and request features](https://github.com/wovly/wovly/issues) on GitHub.
+>
+> **Platform Support:** Currently macOS only. Windows and Linux support coming soon.
 
 <p align="center">
   <img src="assets/screenshot.png" alt="Wovly Screenshot" width="900">
@@ -44,9 +49,11 @@ A privacy-first desktop AI communication assistant that manages your contacts, f
 - **Anti-Detection** – Built-in measures to reduce bot detection
 
 ### 🔒 Privacy-First Architecture
-- **Local Storage** – All app data stored on your machine.  Only LLM usage or 3rd party API connections send information out.
+- **Local Storage** – App data (profiles, tasks, skills, credentials) stored on your machine
+- **LLM API Calls** – Chat conversations are sent to your chosen LLM provider via API
+- **No Wovly Servers** – Direct API calls to providers, nothing passes through us
 - **Multi-User Support** – Per-user data isolation for shared computers
-- **Encrypted Credentials** – OS-level encryption via Keychain/DPAPI/libsecret to store your website logins
+- **Encrypted Credentials** – OS-level encryption via Keychain/DPAPI/libsecret
 
 ---
 
@@ -134,23 +141,25 @@ Choose your preferred AI model:
 
 ### Prerequisites
 
+- **macOS** 10.15 (Catalina) or later
 - **Node.js** 18+
-- **macOS** (full feature support) or Windows/Linux (without iMessage)
 - API key for at least one LLM provider
 
 ### Quick Start
 
 ```bash
 # Clone the repository
-git clone https://github.com/bluerune234/wovly.git
+git clone https://github.com/wovly/wovly.git
 cd wovly
 
 # Install dependencies
 npm install
 
-# Start the application
+# Start the application (from root directory!)
 npm run dev
 ```
+
+> **Note:** `npm run dev` must be run from the **root** `wovly/` directory, not from a subdirectory. This command starts both the UI dev server (Vite on port 5173) and the Electron app simultaneously.
 
 ### Configuration
 
@@ -231,12 +240,12 @@ wovly/
 
 ## Privacy & Security
 
-- **App data stays local** – No SaaS data sharing, only LLM or 3rd party API information exchange
+- **App data stored locally** – Profiles, tasks, skills, and credentials stay on your device
+- **Chat prompts sent to LLMs** – Your conversations are sent to your chosen provider (Anthropic, OpenAI, or Google) via their APIs
+- **No Wovly servers** – Direct API calls to providers, nothing passes through us
 - **Per-user isolation** – Each user's data is completely separated
 - **Encrypted credentials** – OS-level encryption (Keychain/DPAPI/libsecret)
-- **Direct API calls** – Requests go directly to providers, no proxy
 - **Local browser automation** – Chromium runs on your machine
-- **No data leaves your machine** except for API requests to providers you configure and prompts sent to LLM services (Anthropic, OpenAI, Gemini)
 
 ---
 
@@ -256,8 +265,10 @@ Or browse the `/docs` directory for:
 
 ## Development
 
+**Important:** All commands should be run from the **root** `wovly/` directory.
+
 ```bash
-# Development mode (hot reload)
+# Development mode (runs UI + Electron together)
 npm run dev
 
 # Build for production
@@ -266,6 +277,63 @@ npm run build
 # Run linter
 npm run lint
 ```
+
+### Troubleshooting Development
+
+If `npm run dev` fails or the app window doesn't open:
+
+```bash
+# 1. Make sure you're in the root directory
+pwd  # Should show /path/to/wovly
+
+# 2. Kill any lingering processes from previous runs
+pkill -f "vite" ; pkill -f "electron"
+
+# 3. If port 5173 is in use, kill that process
+lsof -ti:5173 | xargs kill -9
+
+# 4. Try again
+npm run dev
+```
+
+### Running Components Separately
+
+If needed, you can run the UI and Electron separately in two terminals:
+
+```bash
+# Terminal 1: Start UI dev server
+cd apps/ui && npm run dev
+
+# Terminal 2: Start Electron (after UI is running)
+cd apps/desktop && npm run dev
+```
+
+---
+
+## Feedback & Bug Reports
+
+Wovly is in **beta** and we'd love your feedback! Help us improve by reporting issues on GitHub.
+
+### Filing an Issue
+
+1. Go to [GitHub Issues](https://github.com/wovly/wovly/issues)
+2. Click **New Issue**
+3. Choose a template:
+   - **Bug Report** – Something isn't working
+   - **Feature Request** – Suggest an improvement
+4. Provide as much detail as possible
+
+### What to Include
+
+For bug reports:
+- Steps to reproduce the issue
+- Expected vs actual behavior
+- macOS version and Wovly version
+- Console logs (Cmd + Option + I → Console tab)
+
+For feature requests:
+- Clear description of the desired functionality
+- Use case explaining why it would be helpful
 
 ---
 

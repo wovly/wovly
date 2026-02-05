@@ -21,6 +21,8 @@ declare module "*.jpeg" {
   export default src;
 }
 
+type OnboardingStage = "api_setup" | "profile" | "task_demo" | "skill_demo" | "integrations" | "completed";
+
 type WovlyFullProfile = {
   firstName: string;
   lastName: string;
@@ -31,8 +33,21 @@ type WovlyFullProfile = {
   homeLife: string;
   userId: string;
   created: string;
-  onboardingCompleted: boolean;
+  onboardingStage: OnboardingStage;
+  onboardingSkippedAt: string | null;
   notes: string[]; // Custom facts and notes
+};
+
+type OnboardingStatus = {
+  ok: boolean;
+  stage: OnboardingStage;
+  skippedAt: string | null;
+  hasApiKeys: boolean;
+  hasTask: boolean;
+  hasSkill: boolean;
+  hasIntegrations: boolean;
+  profileComplete: boolean;
+  error?: string;
 };
 
 type CalendarEvent = {
@@ -158,6 +173,17 @@ type PendingMessage = {
   created: string;
 };
 
+type StructuredPlanStep = {
+  step_id: number;
+  tool: string;
+  description: string;
+  args: Record<string, unknown>;
+  output_var?: string;
+  dependencies?: number[];
+  is_conditional?: boolean;
+  condition?: string | null;
+};
+
 type Task = {
   id: string;
   title: string;
@@ -170,6 +196,7 @@ type Task = {
   pollFrequency?: TaskPollFrequency; // Per-task polling frequency
   originalRequest: string;
   plan: string[];
+  structuredPlan?: StructuredPlanStep[] | null; // For direct execution
   currentStep: TaskCurrentStep;
   executionLog: TaskLogEntry[];
   contextMemory: Record<string, string>;
@@ -189,7 +216,7 @@ type Skill = {
   keywords: string[];
   procedure: string[];
   constraints: string[];
-  tools: string[];
+  // Note: tools field removed - Builder auto-selects tools based on procedure
 };
 
 type WovlyIpcApi = {
@@ -433,6 +460,8 @@ type WovlyIpcApi = {
       ok: boolean;
       message: string;
       needsOnboarding?: boolean;
+      needsApiSetup?: boolean;
+      onboardingStage?: OnboardingStage;
       timeOfDay?: "morning" | "afternoon" | "evening" | "night";
       hour?: number;
       dayOfWeek?: string;
@@ -441,6 +470,12 @@ type WovlyIpcApi = {
       tomorrowEventCount?: number;
       error?: string;
     }>;
+  };
+  // Onboarding wizard
+  onboarding: {
+    getStatus: () => Promise<OnboardingStatus>;
+    setStage: (stage: OnboardingStage) => Promise<{ ok: boolean; stage?: OnboardingStage; error?: string }>;
+    skip: () => Promise<{ ok: boolean; error?: string }>;
   };
   // Chat Interfaces (WhatsApp, Telegram, etc.)
   whatsapp: {
@@ -491,6 +526,17 @@ type WovlyIpcApi = {
       title: string;
       originalRequest: string;
       plan: string[];
+      // Structured plan with tool calls for direct execution
+      structuredPlan?: Array<{
+        step_id: number;
+        tool: string;
+        description: string;
+        args: Record<string, unknown>;
+        output_var?: string;
+        dependencies?: number[];
+        is_conditional?: boolean;
+        condition?: string | null;
+      }>;
       context?: Record<string, string>;
       taskType?: "discrete" | "continuous";
       successCriteria?: string | null;
@@ -512,6 +558,7 @@ type WovlyIpcApi = {
     approvePendingMessage: (taskId: string, messageId: string, editedMessage?: string) => Promise<{ ok: boolean; error?: string }>;
     rejectPendingMessage: (taskId: string, messageId: string) => Promise<{ ok: boolean; error?: string }>;
     setAutoSend: (taskId: string, autoSend: boolean) => Promise<{ ok: boolean; error?: string }>;
+    setNotificationsDisabled: (taskId: string, disabled: boolean) => Promise<{ ok: boolean; error?: string }>;
     // Poll frequency operations
     setPollFrequency: (taskId: string, pollFrequency: string | TaskPollFrequency) => Promise<{ ok: boolean; pollFrequency?: TaskPollFrequency; error?: string }>;
     getPollFrequencyPresets: () => Promise<{ ok: boolean; presets?: Record<string, TaskPollFrequency>; error?: string }>;

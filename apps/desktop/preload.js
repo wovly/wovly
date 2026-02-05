@@ -126,6 +126,12 @@ contextBridge.exposeInMainWorld("wovly", {
   welcome: {
     generate: () => ipcRenderer.invoke("welcome:generate")
   },
+  // Onboarding wizard
+  onboarding: {
+    getStatus: () => ipcRenderer.invoke("onboarding:getStatus"),
+    setStage: (stage) => ipcRenderer.invoke("onboarding:setStage", { stage }),
+    skip: () => ipcRenderer.invoke("onboarding:skip")
+  },
   // Chat Interfaces (WhatsApp, Telegram, etc.)
   whatsapp: {
     connect: () => ipcRenderer.invoke("whatsapp:connect"),
@@ -180,6 +186,8 @@ contextBridge.exposeInMainWorld("wovly", {
       ipcRenderer.invoke("tasks:rejectPendingMessage", { taskId, messageId }),
     setAutoSend: (taskId, autoSend) => 
       ipcRenderer.invoke("tasks:setAutoSend", { taskId, autoSend }),
+    setNotificationsDisabled: (taskId, disabled) => 
+      ipcRenderer.invoke("tasks:setNotificationsDisabled", { taskId, disabled }),
     // Poll frequency operations
     setPollFrequency: (taskId, pollFrequency) => 
       ipcRenderer.invoke("tasks:setPollFrequency", { taskId, pollFrequency }),

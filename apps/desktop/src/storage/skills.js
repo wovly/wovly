@@ -21,8 +21,8 @@ const parseSkill = (markdown, filename) => {
     description: "",
     keywords: [],
     procedure: [],
-    constraints: [],
-    tools: []
+    constraints: []
+    // Note: tools field removed - Builder auto-selects tools
   };
 
   const lines = markdown.split("\n");
@@ -64,13 +64,8 @@ const parseSkill = (markdown, filename) => {
       if (match) {
         skill.constraints.push(match[1].trim());
       }
-    } else if (currentSection === "tools") {
-      if (line.trim()) {
-        // Tools are comma-separated
-        const tools = line.split(",").map(t => t.trim()).filter(t => t);
-        skill.tools.push(...tools);
-      }
     }
+    // Note: tools section removed - Builder auto-selects tools
   }
 
   return skill;
@@ -78,22 +73,24 @@ const parseSkill = (markdown, filename) => {
 
 // Serialize skill object to markdown
 const serializeSkill = (skill) => {
-  let markdown = `# ${skill.name}
+  // Ensure all arrays exist with defaults
+  const keywords = Array.isArray(skill.keywords) ? skill.keywords : [];
+  const procedure = Array.isArray(skill.procedure) ? skill.procedure : [];
+  const constraints = Array.isArray(skill.constraints) ? skill.constraints : [];
+  
+  let markdown = `# ${skill.name || "Untitled Skill"}
 
 ## Description
-${skill.description}
+${skill.description || "No description provided."}
 
 ## Keywords
-${skill.keywords.join(", ")}
+${keywords.length > 0 ? keywords.join(", ") : "general"}
 
 ## Procedure
-${skill.procedure.map((step, i) => `${i + 1}. ${step}`).join("\n")}
+${procedure.length > 0 ? procedure.map((step, i) => `${i + 1}. ${step}`).join("\n") : "1. Follow the task instructions"}
 
 ## Constraints
-${skill.constraints.map(c => `- ${c}`).join("\n")}
-
-## Tools
-${skill.tools.join(", ")}
+${constraints.length > 0 ? constraints.map(c => `- ${c}`).join("\n") : "- None specified"}
 `;
   return markdown;
 };

@@ -42,6 +42,7 @@ const parseTaskMarkdown = (markdown, taskId) => {
     pollFrequency: { ...DEFAULT_POLL_FREQUENCY },
     originalRequest: "",
     plan: [],
+    structuredPlan: null, // Array of {step_id, tool, args, description, output_var, dependencies}
     currentStep: {
       step: 1,
       description: "",
@@ -116,6 +117,13 @@ const parseTaskMarkdown = (markdown, taskId) => {
       }
     }
 
+    if (currentSection === "structured plan") {
+      // Structured plan is stored as JSON
+      if (line.trim().startsWith("[") || (task._structuredPlanBuffer && !line.startsWith("##"))) {
+        task._structuredPlanBuffer = (task._structuredPlanBuffer || "") + line + "\n";
+      }
+    }
+
     if (currentSection === "current step") {
       if (line.startsWith("Step:")) {
         task.currentStep.step = parseInt(line.replace("Step:", "").trim()) || 1;
@@ -179,6 +187,19 @@ const parseTaskMarkdown = (markdown, taskId) => {
     task.pendingMessages.push(currentPendingMessage);
   }
 
+  // Parse structured plan JSON if present
+  if (task._structuredPlanBuffer) {
+    try {
+      const jsonMatch = task._structuredPlanBuffer.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        task.structuredPlan = JSON.parse(jsonMatch[0]);
+      }
+    } catch (e) {
+      console.error(`[Tasks] Failed to parse structured plan for ${taskId}:`, e.message);
+    }
+    delete task._structuredPlanBuffer;
+  }
+
   return task;
 };
 
@@ -208,6 +229,16 @@ ${task.originalRequest || ""}
     task.plan.forEach((step, index) => {
       markdown += `${index + 1}. ${step}\n`;
     });
+  }
+
+  // Add structured plan if available (for direct execution)
+  if (task.structuredPlan && task.structuredPlan.length > 0) {
+    markdown += `
+## Structured Plan
+\`\`\`json
+${JSON.stringify(task.structuredPlan, null, 2)}
+\`\`\`
+`;
   }
 
   markdown += `
@@ -338,6 +369,8 @@ const createTask = async (taskData, username) => {
     originalRequest: taskData.originalRequest || "",
     messagingChannel: messagingChannel || null,
     plan: skillPlan,
+    // Store structured plan with tool calls for direct execution
+    structuredPlan: taskData.structuredPlan || null,
     currentStep: {
       step: 1,
       description: skillPlan[0] || "",
@@ -346,7 +379,7 @@ const createTask = async (taskData, username) => {
     },
     executionLog: [{
       timestamp: new Date().toISOString(),
-      message: `Task created${messagingChannel ? ` (using ${messagingChannel})` : ""}${matchedSkill ? ` (skill: ${matchedSkill.name})` : ""}${taskType === "continuous" ? " (continuous monitoring)" : ""} [Poll: ${pollFrequency.label}]`
+      message: `Task created${messagingChannel ? ` (using ${messagingChannel})` : ""}${matchedSkill ? ` (skill: ${matchedSkill.name})` : ""}${taskType === "continuous" ? " (continuous monitoring)" : ""}${taskData.structuredPlan ? " (direct execution)" : ""} [Poll: ${pollFrequency.label}]`
     }],
     contextMemory: {
       ...taskData.context,

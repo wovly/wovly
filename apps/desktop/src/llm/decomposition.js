@@ -133,11 +133,29 @@ function getToolCategories(availableTools) {
 // Stage 1: The Architect (Reasoning Agent)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function architectDecompose(query, availableTools, apiKeys, activeProvider) {
+async function architectDecompose(query, availableTools, apiKeys, activeProvider, matchedSkill = null) {
   const toolCategories = getToolCategories(availableTools);
+  
+  // Build skill context section if a skill matched
+  let skillSection = "";
+  if (matchedSkill && matchedSkill.skill) {
+    const skill = matchedSkill.skill;
+    skillSection = `
+# Matched Skill: ${skill.name} (confidence: ${(matchedSkill.confidence * 100).toFixed(0)}%)
+
+**Description:** ${skill.description}
+
+**Recommended Procedure (use as reference):**
+${skill.procedure.map((s, i) => `${i + 1}. ${s}`).join('\n')}
+
+Use this skill's procedure as domain knowledge to guide your decomposition. You may adapt the steps as needed for the specific user request.
+`;
+    console.log(`[Architect] Using matched skill: ${skill.name}`);
+  }
   
   const architectPrompt = `# System Role
 You are The Architect. Your goal is to break down a user's natural language request into a strictly sequential list of logical steps that work within this system's execution model.
+${skillSection}
 
 # CRITICAL: How This System Works
 
@@ -215,6 +233,9 @@ Respond with ONLY a JSON object:
 "${query}"`;
 
   console.log("[Architect] Analyzing user intent...");
+  if (matchedSkill) {
+    console.log(`[Architect] Matched skill: ${matchedSkill.skill.name} (${(matchedSkill.confidence * 100).toFixed(0)}% confidence)`);
+  }
   console.log(`[Architect] Tool categories:\n${toolCategories}`);
   
   const response = await callLLM(architectPrompt, apiKeys, activeProvider, { maxTokens: 1500 });
@@ -239,7 +260,7 @@ Respond with ONLY a JSON object:
 // Stage 2: The Builder (Grounding Agent)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function builderMapToTools(architectResult, availableTools, apiKeys, activeProvider, validationFeedback = null) {
+async function builderMapToTools(architectResult, availableTools, apiKeys, activeProvider, validationFeedback = null, skillConstraints = null) {
   // Format tool definitions with full schemas
   const toolDefinitions = availableTools.map(t => {
     const schema = t.input_schema || { type: "object", properties: {}, required: [] };
@@ -266,6 +287,18 @@ ${validationFeedback.suggestions?.map(s => `- ${s}`).join("\n") || "None"}
 
 Please correct these issues in your new mapping.
 `;
+  }
+  
+  // Build skill constraints section
+  let constraintsSection = "";
+  if (skillConstraints && skillConstraints.length > 0) {
+    constraintsSection = `
+# Skill Constraints (MUST follow)
+${skillConstraints.map(c => `- ${c}`).join('\n')}
+
+IMPORTANT: Your tool mappings MUST respect these constraints.
+`;
+    console.log(`[Builder] Applying ${skillConstraints.length} skill constraints`);
   }
 
   const builderPrompt = `# System Role
@@ -304,8 +337,8 @@ User Intent: ${architectResult.user_intent}
 
 Steps:
 ${logicalStepsText}
-${feedbackSection}
-# Constraints
+${feedbackSection}${constraintsSection}
+# Output Constraints
 1. Output ONLY valid JSON - no explanations, no markdown.
 2. Each step MUST map to exactly ONE tool from the definitions.
 3. Use "output_var" to capture tool results for later steps.
@@ -477,13 +510,23 @@ ${stepsText}
 // Main Entry Point: decomposeQuery (Orchestrates Architect -> Builder -> Validator)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function decomposeQuery(query, availableTools, apiKeys, activeProvider) {
+async function decomposeQuery(query, availableTools, apiKeys, activeProvider, matchedSkill = null) {
   try {
+    // Extract skill constraints for Builder (if skill matched)
+    const skillConstraints = matchedSkill?.skill?.constraints || null;
+    
+    if (matchedSkill) {
+      console.log(`[Decomposition] Using skill: ${matchedSkill.skill.name}`);
+      if (skillConstraints && skillConstraints.length > 0) {
+        console.log(`[Decomposition] Skill constraints: ${skillConstraints.join('; ')}`);
+      }
+    }
+    
     // ─────────────────────────────────────────────────────────────────────────
     // Stage 1: Architect - Understand intent and create logical steps
     // ─────────────────────────────────────────────────────────────────────────
     
-    const architectResult = await architectDecompose(query, availableTools, apiKeys, activeProvider);
+    const architectResult = await architectDecompose(query, availableTools, apiKeys, activeProvider, matchedSkill);
     
     if (!architectResult) {
       console.log("[Decomposition] Architect failed, returning empty result");
@@ -507,7 +550,8 @@ async function decomposeQuery(query, availableTools, apiKeys, activeProvider) {
         availableTools, 
         apiKeys, 
         activeProvider,
-        validationFeedback
+        validationFeedback,
+        skillConstraints
       );
       
       if (!builderResult) {
@@ -561,7 +605,9 @@ async function decomposeQuery(query, availableTools, apiKeys, activeProvider) {
         output_var: p.output_var,
         dependencies: p.dependencies,
         depends_on_previous: (p.dependencies?.length || 0) > 0,
-        may_require_waiting: p.tool.includes("wait") || p.is_conditional,
+        // Only flag as waiting if it actually waits for external input
+        may_require_waiting: p.tool === "ask_user_question" || p.tool.includes("wait_for"),
+        is_conditional: p.is_conditional || false,
         is_recurring: architectResult.task_type === "continuous"
       })),
       

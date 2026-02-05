@@ -117,7 +117,59 @@ const {
   getToolCategories,
 } = require("./src");
 
+// Tutorial / Onboarding
+const {
+  ONBOARDING_STAGES,
+  isInOnboarding,
+  getNextStage,
+  isProfileComplete,
+  processProfileStageMessage,
+  getStageWelcomeMessage,
+  checkStageAdvancement,
+  shouldUseTutorialMode,
+  generateTutorialResponse
+} = require("./src/tutorial");
+
 // Note: BrowserController is now imported from ./src/browser/controller.js
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared Onboarding Helper - Check if skill demo is completed (Marco -> Polo)
+// This is shared between chat:send and chat:executeInline handlers
+// ─────────────────────────────────────────────────────────────────────────────
+async function checkSkillDemoCompletionShared(userMsg, assistantResp, username, winRef) {
+  if (!username) return;
+  
+  try {
+    const profilePath = await getUserProfilePath(username);
+    const markdown = await fs.readFile(profilePath, "utf8");
+    const profile = parseUserProfile(markdown);
+    
+    if (profile.onboardingStage === "skill_demo") {
+      // Check if user said "marco" (case insensitive) and got "polo" in response
+      const userSaidMarco = userMsg.toLowerCase().includes("marco");
+      const responseSaidPolo = assistantResp.toLowerCase().includes("polo");
+      
+      if (userSaidMarco && responseSaidPolo) {
+        console.log("[Onboarding] Skill test passed (Marco/Polo), advancing to integrations stage");
+        profile.onboardingStage = "integrations";
+        await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
+        
+        // Send the integrations message after a brief delay
+        setTimeout(() => {
+          if (winRef && winRef.webContents) {
+            winRef.webContents.send("chat:newMessage", {
+              role: "assistant",
+              content: `You're almost done! To unlock Wovly's full potential, connect some integrations:\n\n**Recommended:**\n- **Google Workspace** - Email and calendar management\n- **iMessage** (macOS) - Send and receive texts\n- **Slack** - Team messaging\n- **Browser Automation** - Web research and form filling\n\nHead to the **Integrations** page to connect these, or say "skip" to finish onboarding.\n\nBy the way, you can continue to tell me important facts about yourself. Just share them and I'll ask if you want me to save them to your profile. Things like your spouse's name, your pet's name, allergies, important dates, or preferences.`,
+              source: "app"
+            });
+          }
+        }, 1000);
+      }
+    }
+  } catch (err) {
+    console.error("[Onboarding] Error checking skill demo completion:", err.message);
+  }
+}
 
 // Global browser controller instance (module-level for reference)
 let browserController = null;
@@ -1810,11 +1862,8 @@ app.whenReady().then(async () => {
       const markdown = await fs.readFile(profilePath, "utf8");
       const profile = parseUserProfile(markdown);
       
-      const needsOnboarding = !profile.onboardingCompleted && (
-        !profile.occupation || 
-        !profile.homeLife || 
-        !profile.city
-      );
+      // Use the new onboardingStage field
+      const needsOnboarding = profile.onboardingStage !== "completed";
       
       return { ok: true, needsOnboarding, profile };
     } catch {
@@ -1898,6 +1947,146 @@ app.whenReady().then(async () => {
     }
   });
 
+  // Onboarding handlers
+  ipcMain.handle("onboarding:getStatus", async () => {
+    try {
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      
+      // Check if any API keys are configured
+      const settingsPath = await getSettingsPath(currentUser.username);
+      let hasApiKeys = false;
+      try {
+        const settingsData = await fs.readFile(settingsPath, "utf8");
+        const settings = JSON.parse(settingsData);
+        // Check for any LLM API keys
+        hasApiKeys = !!(
+          settings.anthropicApiKey || 
+          settings.openaiApiKey || 
+          settings.googleApiKey ||
+          settings.deepseekApiKey ||
+          settings.ollamaEndpoint
+        );
+      } catch {
+        // No settings file means no API keys
+      }
+      
+      // Get current onboarding stage from profile
+      const profilePath = await getUserProfilePath(currentUser.username);
+      const markdown = await fs.readFile(profilePath, "utf8");
+      const profile = parseUserProfile(markdown);
+      
+      // Check if they have any integrations connected
+      let hasIntegrations = false;
+      try {
+        const settingsData = await fs.readFile(settingsPath, "utf8");
+        const settings = JSON.parse(settingsData);
+        hasIntegrations = !!(
+          settings.googleAccessToken ||
+          settings.slackAccessToken ||
+          settings.weatherEnabled ||
+          settings.browserEnabled ||
+          settings.telegramToken ||
+          settings.discordAccessToken ||
+          settings.notionAccessToken ||
+          settings.githubAccessToken
+        );
+      } catch {
+        // No settings
+      }
+      
+      // Check if they have any tasks
+      let hasTask = false;
+      try {
+        const tasksDir = await getTasksDir(currentUser.username);
+        const files = await fs.readdir(tasksDir);
+        hasTask = files.some(f => f.endsWith('.md'));
+      } catch {
+        // No tasks
+      }
+      
+      // Check if they have any skills
+      let hasSkill = false;
+      try {
+        const skillsDir = await getSkillsDir(currentUser.username);
+        const files = await fs.readdir(skillsDir);
+        hasSkill = files.some(f => f.endsWith('.md'));
+      } catch {
+        // No skills
+      }
+      
+      console.log(`[Onboarding] Status: stage=${profile.onboardingStage}, hasApiKeys=${hasApiKeys}, hasTask=${hasTask}, hasSkill=${hasSkill}, hasIntegrations=${hasIntegrations}`);
+      
+      return { 
+        ok: true, 
+        stage: profile.onboardingStage,
+        skippedAt: profile.onboardingSkippedAt,
+        hasApiKeys,
+        hasTask,
+        hasSkill,
+        hasIntegrations,
+        profileComplete: !!(profile.firstName && profile.firstName !== "User" && profile.occupation)
+      };
+    } catch (err) {
+      console.error("[Onboarding] Error getting status:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("onboarding:setStage", async (_event, { stage }) => {
+    try {
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      
+      if (!ONBOARDING_STAGES.includes(stage)) {
+        return { ok: false, error: `Invalid stage: ${stage}. Valid stages: ${ONBOARDING_STAGES.join(", ")}` };
+      }
+      
+      const profilePath = await getUserProfilePath(currentUser.username);
+      const markdown = await fs.readFile(profilePath, "utf8");
+      const profile = parseUserProfile(markdown);
+      
+      profile.onboardingStage = stage;
+      // Clear skipped status when advancing
+      if (stage !== profile.onboardingStage) {
+        profile.onboardingSkippedAt = null;
+      }
+      
+      await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
+      console.log(`[Onboarding] Set stage to: ${stage}`);
+      
+      return { ok: true, stage };
+    } catch (err) {
+      console.error("[Onboarding] Error setting stage:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("onboarding:skip", async () => {
+    try {
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+      
+      const profilePath = await getUserProfilePath(currentUser.username);
+      const markdown = await fs.readFile(profilePath, "utf8");
+      const profile = parseUserProfile(markdown);
+      
+      profile.onboardingStage = "completed";
+      profile.onboardingSkippedAt = new Date().toISOString();
+      
+      await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
+      console.log("[Onboarding] Skipped onboarding");
+      
+      return { ok: true };
+    } catch (err) {
+      console.error("[Onboarding] Error skipping:", err.message);
+      return { ok: false, error: err.message };
+    }
+  });
+
   // Skills handlers
   ipcMain.handle("skills:list", async () => {
     try {
@@ -1972,9 +2161,6 @@ keyword1, keyword2, keyword3
 ## Constraints
 - Important constraint or rule
 - Another constraint
-
-## Tools
-tool1, tool2
 `;
     return { ok: true, template };
   });
@@ -2011,26 +2197,113 @@ tool1, tool2
         // Profile not available
       }
 
-      // Check if onboarding needed - return simple message if so
-      const needsOnboarding = profile && !profile.onboardingCompleted && (
-        !profile.occupation || 
-        !profile.homeLife || 
-        !profile.city
-      );
+      // Check if any API keys are configured
+      const settingsPath = await getSettingsPath(currentUser?.username);
+      let hasApiKeys = false;
+      let apiKeys = {};
+      let models = {};
+      let activeProvider = "anthropic";
+      try {
+        const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+        apiKeys = settings.apiKeys || {};
+        models = settings.models || {};
+        activeProvider = settings.activeProvider || "anthropic";
+        hasApiKeys = !!(
+          apiKeys.anthropic || 
+          apiKeys.openai || 
+          apiKeys.google ||
+          apiKeys.deepseek ||
+          settings.ollamaEndpoint
+        );
+      } catch {
+        // No settings file
+      }
 
-      if (needsOnboarding && profile) {
-        const greeting = timeOfDay === "morning" ? "Good morning" : 
-                        timeOfDay === "afternoon" ? "Good afternoon" : 
-                        timeOfDay === "evening" ? "Good evening" : "Hey there";
+      // ONBOARDING STAGE 0: API Setup
+      // If no API keys, show API setup message
+      if (!hasApiKeys) {
+        console.log("[Onboarding] No API keys configured, showing setup message");
         return {
           ok: true,
-          message: `${greeting}, ${profile.firstName || "there"}! Welcome to Wovly.\n\nTo help me assist you better, I'd love to get to know you a bit. Mind if I ask you a few quick questions?`,
-          needsOnboarding: true,
+          message: `Welcome to Wovly! I'm your AI assistant.\n\nTo get started, you'll need to connect me to an AI provider. Head to **Settings** and add an API key from Anthropic, OpenAI, or Google.\n\nOnce configured, I'll help you set up your profile and show you what I can do!`,
+          needsApiSetup: true,
+          onboardingStage: "api_setup",
           timeOfDay,
           profile
         };
       }
 
+      // Check onboarding stage
+      const onboardingStage = profile?.onboardingStage || "api_setup";
+      
+      // ONBOARDING STAGE 1: Profile Questions
+      if (onboardingStage === "api_setup" || onboardingStage === "profile") {
+        // If they have API keys but are still in api_setup stage, advance to profile
+        if (onboardingStage === "api_setup" && hasApiKeys) {
+          console.log("[Onboarding] API keys configured, advancing to profile stage");
+          // Update the profile to reflect new stage
+          if (profile) {
+            profile.onboardingStage = "profile";
+            const profilePath = await getUserProfilePath(currentUser?.username);
+            await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
+          }
+        }
+        
+        const greeting = timeOfDay === "morning" ? "Good morning" : 
+                        timeOfDay === "afternoon" ? "Good afternoon" : 
+                        timeOfDay === "evening" ? "Good evening" : "Hey there";
+        
+        console.log("[Onboarding] Starting profile questions");
+        return {
+          ok: true,
+          message: `${greeting}! Great, you're all set up! Let me get to know you a bit.\n\nWhat should I call you? (Just your first name is fine!)`,
+          needsOnboarding: true,
+          onboardingStage: "profile",
+          timeOfDay,
+          profile
+        };
+      }
+
+      // ONBOARDING STAGE 2: Task Demo
+      if (onboardingStage === "task_demo") {
+        console.log("[Onboarding] Starting task demo");
+        return {
+          ok: true,
+          message: `Now let's see Wovly in action! Try creating your first task.\n\nType something like: **"Remind me to eat lunch at 12pm tomorrow"**\n\nTasks run in the background and can monitor, remind, and take actions for you.`,
+          needsOnboarding: true,
+          onboardingStage: "task_demo",
+          timeOfDay,
+          profile
+        };
+      }
+
+      // ONBOARDING STAGE 3: Skill Demo
+      if (onboardingStage === "skill_demo") {
+        console.log("[Onboarding] Starting skill demo");
+        return {
+          ok: true,
+          message: `Excellent! Now let's create a skill. Skills teach me custom procedures.\n\nTry: **"Create a skill where if I say marco you say polo"**`,
+          needsOnboarding: true,
+          onboardingStage: "skill_demo",
+          timeOfDay,
+          profile
+        };
+      }
+
+      // ONBOARDING STAGE 4: Integrations
+      if (onboardingStage === "integrations") {
+        console.log("[Onboarding] Starting integrations recommendations");
+        return {
+          ok: true,
+          message: `You're almost done! To unlock Wovly's full potential, connect some integrations:\n\n**Recommended:**\n- **Google Workspace** - Email and calendar management\n- **iMessage** (macOS) - Send and receive texts\n- **Slack** - Team messaging\n- **Browser Automation** - Web research and form filling\n\nHead to the **Integrations** page to connect these, or say "skip" to finish onboarding.`,
+          needsOnboarding: true,
+          onboardingStage: "integrations",
+          timeOfDay,
+          profile
+        };
+      }
+
+      // COMPLETED - Normal operation
       // Get today's and tomorrow's agenda if Google is authorized
       let todayEvents = [];
       let tomorrowEvents = [];
@@ -2055,38 +2328,6 @@ tool1, tool2
         }
       } catch (err) {
         console.error("Calendar fetch error:", err);
-      }
-
-      // Get API keys for LLM
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let apiKeys = {};
-      let models = {};
-      let activeProvider = "anthropic";
-      try {
-        const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-        apiKeys = settings.apiKeys || {};
-        models = settings.models || {};
-        activeProvider = settings.activeProvider || "anthropic";
-      } catch {
-        // No settings
-      }
-
-      // If no API key, return a simple template message
-      if (!apiKeys.anthropic && !apiKeys.openai && !apiKeys.google) {
-        const firstName = profile?.firstName || "there";
-        let simpleMessage;
-        
-        if (timeOfDay === "night") {
-          simpleMessage = `Hey ${firstName}, it's getting late. Hope you had a good ${dayOfWeek}. Rest well!`;
-        } else if (timeOfDay === "morning") {
-          simpleMessage = `Good morning, ${firstName}! Ready to take on this ${dayOfWeek}?`;
-        } else if (timeOfDay === "evening") {
-          simpleMessage = `Good evening, ${firstName}! Hope your ${dayOfWeek} is winding down nicely.`;
-        } else {
-          simpleMessage = `Good afternoon, ${firstName}! How's your ${dayOfWeek} going?`;
-        }
-        
-        return { ok: true, message: simpleMessage, timeOfDay, profile };
       }
 
       // Build context for LLM
@@ -4263,6 +4504,31 @@ Generate ONLY the welcome message, nothing else.`;
       }
       const task = await createTask(taskData, currentUser.username);
       
+      // Check if we should advance onboarding from task_demo to skill_demo
+      try {
+        const profilePath = await getUserProfilePath(currentUser.username);
+        const markdown = await fs.readFile(profilePath, "utf8");
+        const profile = parseUserProfile(markdown);
+        if (profile.onboardingStage === "task_demo") {
+          console.log("[Onboarding] First task created, advancing to skill_demo stage");
+          profile.onboardingStage = "skill_demo";
+          await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
+          
+          // Send the skill demo prompt after task notification
+          setTimeout(() => {
+            if (win && win.webContents) {
+              win.webContents.send("chat:newMessage", {
+                role: "assistant",
+                content: `Excellent! Now let's create a skill. Skills teach me custom procedures.\n\nTry: **"Create a skill where if I say marco you say polo"**`,
+                source: "app"
+              });
+            }
+          }, 2000);
+        }
+      } catch (err) {
+        console.error("[Onboarding] Error checking task_demo stage:", err.message);
+      }
+      
       // Send initial notification that task is starting
       if (win && win.webContents) {
         win.webContents.send("chat:newMessage", {
@@ -4829,6 +5095,37 @@ Generate ONLY the welcome message, nothing else.`;
     }
   });
 
+  // Set notifications disabled preference for a task
+  ipcMain.handle("tasks:setNotificationsDisabled", async (_event, { taskId, disabled }) => {
+    try {
+      const task = await getTask(taskId, currentUser?.username);
+      if (!task) {
+        return { ok: false, error: "Task not found" };
+      }
+
+      task.notificationsDisabled = disabled;
+      task.lastUpdated = new Date().toISOString();
+      task.executionLog.push({
+        timestamp: new Date().toISOString(),
+        message: `Notifications ${disabled ? 'disabled' : 'enabled'}`
+      });
+
+      // Save task
+      const tasksDir = await getTasksDir(currentUser?.username);
+      const taskPath = path.join(tasksDir, `${taskId}.md`);
+      await fs.writeFile(taskPath, serializeTask(task), "utf8");
+
+      // Only notify if notifications are being enabled
+      if (!disabled) {
+        addTaskUpdate(taskId, `Notifications enabled`);
+      }
+
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
   // Set poll frequency for a task
   ipcMain.handle("tasks:setPollFrequency", async (_event, { taskId, pollFrequency }) => {
     try {
@@ -5212,11 +5509,11 @@ Generate ONLY the welcome message, nothing else.`;
     }
   ];
 
-  // Memory search tool - for explicit historical searches
+  // Memory tools - for accessing historical conversations
   const memoryTools = [
     {
       name: "search_memory",
-      description: "Search through historical conversations. Use when user explicitly asks about past conversations, especially those older than 2 weeks. Examples: 'did we ever discuss Italy?', 'what did I say about the project last month?'",
+      description: "Search through historical conversations by keyword. Use when user asks about past conversations with specific topics. Examples: 'did we ever discuss Italy?', 'what did I say about the project?'",
       input_schema: {
         type: "object",
         properties: {
@@ -5228,6 +5525,55 @@ Generate ONLY the welcome message, nothing else.`;
           }
         },
         required: ["query"]
+      }
+    },
+    {
+      name: "get_conversations_for_date",
+      description: "Get all conversations from a specific date. Use when user asks about what was discussed on a particular day. Examples: 'what did we talk about yesterday?', 'what did we discuss on Monday?', 'show me our conversation from January 15th'",
+      input_schema: {
+        type: "object",
+        properties: {
+          date: { 
+            type: "string", 
+            description: "The date to retrieve. Can be: 'today', 'yesterday', a relative day like 'last Monday', or a specific date like '2024-01-15' or 'January 15, 2024'"
+          }
+        },
+        required: ["date"]
+      }
+    },
+    {
+      name: "search_memory_between_dates",
+      description: "Search conversations within a specific date range. Use when user asks about discussions during a time period. Examples: 'what did we discuss last week?', 'find mentions of the project between Christmas and New Year'",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Optional search terms. If empty, returns all conversations in range." },
+          start_date: { type: "string", description: "Start date (inclusive). Format: 'YYYY-MM-DD' or relative like 'last Monday', '2 weeks ago'" },
+          end_date: { type: "string", description: "End date (inclusive). Format: 'YYYY-MM-DD' or relative like 'yesterday', 'today'" }
+        },
+        required: ["start_date", "end_date"]
+      }
+    },
+    {
+      name: "list_memory_dates",
+      description: "List all dates that have conversation records. Use to see conversation history availability or find when conversations started. Examples: 'when did we first chat?', 'how many days have we talked?', 'list all our conversation dates'",
+      input_schema: {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "Maximum number of dates to return. Default 30." }
+        },
+        required: []
+      }
+    },
+    {
+      name: "get_conversation_summary",
+      description: "Get the AI-generated summary for a specific date's conversations. Faster than retrieving full conversations when user just wants highlights. Examples: 'give me a summary of yesterday's chat', 'what were the key points from last Monday?'",
+      input_schema: {
+        type: "object",
+        properties: {
+          date: { type: "string", description: "The date to get summary for. Format: 'YYYY-MM-DD' or relative like 'yesterday', 'last Monday'" }
+        },
+        required: ["date"]
       }
     }
   ];
@@ -5329,6 +5675,369 @@ Generate ONLY the welcome message, nothing else.`;
       found: true,
       totalMatches: results.length,
       results: results.slice(0, 10) // Limit to 10 most recent matching days
+    };
+  };
+
+  // Helper: Parse natural language date to YYYY-MM-DD format
+  const parseDateString = (dateStr) => {
+    const now = new Date();
+    const lower = dateStr.toLowerCase().trim();
+    
+    // Handle relative dates
+    if (lower === "today") {
+      return now.toISOString().split('T')[0];
+    }
+    if (lower === "yesterday") {
+      const d = new Date(now);
+      d.setDate(d.getDate() - 1);
+      return d.toISOString().split('T')[0];
+    }
+    
+    // Handle "X days ago"
+    const daysAgoMatch = lower.match(/^(\d+)\s*days?\s*ago$/);
+    if (daysAgoMatch) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - parseInt(daysAgoMatch[1]));
+      return d.toISOString().split('T')[0];
+    }
+    
+    // Handle "X weeks ago"
+    const weeksAgoMatch = lower.match(/^(\d+)\s*weeks?\s*ago$/);
+    if (weeksAgoMatch) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - parseInt(weeksAgoMatch[1]) * 7);
+      return d.toISOString().split('T')[0];
+    }
+    
+    // Handle "last Monday", "last Tuesday", etc.
+    const dayNames = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+    const lastDayMatch = lower.match(/^last\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
+    if (lastDayMatch) {
+      const targetDay = dayNames.indexOf(lastDayMatch[1]);
+      const d = new Date(now);
+      const currentDay = d.getDay();
+      let daysBack = currentDay - targetDay;
+      if (daysBack <= 0) daysBack += 7;
+      d.setDate(d.getDate() - daysBack);
+      return d.toISOString().split('T')[0];
+    }
+    
+    // Handle "this Monday", "this Tuesday", etc. (current week)
+    const thisDayMatch = lower.match(/^this\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
+    if (thisDayMatch) {
+      const targetDay = dayNames.indexOf(thisDayMatch[1]);
+      const d = new Date(now);
+      const currentDay = d.getDay();
+      let daysDiff = targetDay - currentDay;
+      d.setDate(d.getDate() + daysDiff);
+      return d.toISOString().split('T')[0];
+    }
+    
+    // Try parsing as a date string (handles "January 15, 2024", "2024-01-15", etc.)
+    const parsed = new Date(dateStr);
+    if (!isNaN(parsed.getTime())) {
+      return parsed.toISOString().split('T')[0];
+    }
+    
+    // Return as-is if already in YYYY-MM-DD format
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+      return dateStr;
+    }
+    
+    return null; // Could not parse
+  };
+
+  // Get conversations for a specific date
+  const executeGetConversationsForDate = async (dateInput) => {
+    if (!currentUser?.username) {
+      return { error: "Not logged in" };
+    }
+    
+    const dateStr = parseDateString(dateInput);
+    if (!dateStr) {
+      return { error: `Could not parse date: "${dateInput}". Try formats like "yesterday", "last Monday", "2024-01-15", or "January 15, 2024"` };
+    }
+    
+    const dailyDir = await getMemoryDailyDir(currentUser.username);
+    const longtermDir = await getMemoryLongtermDir(currentUser.username);
+    
+    // Try daily first, then longterm
+    let content = null;
+    let source = null;
+    
+    try {
+      const dailyPath = path.join(dailyDir, `${dateStr}.md`);
+      content = await fs.readFile(dailyPath, "utf8");
+      source = "daily";
+    } catch {
+      try {
+        const longtermPath = path.join(longtermDir, `${dateStr}.md`);
+        content = await fs.readFile(longtermPath, "utf8");
+        source = "longterm";
+      } catch {
+        // No file found
+      }
+    }
+    
+    if (!content) {
+      return { 
+        found: false, 
+        date: dateStr,
+        message: `No conversations found for ${dateStr}.` 
+      };
+    }
+    
+    // Parse conversations from content
+    const entries = content.split(/\n---\n/).filter(e => e.trim());
+    const conversations = [];
+    
+    for (const entry of entries) {
+      // Skip summary section
+      if (entry.startsWith('## Summary')) continue;
+      
+      const timestampMatch = entry.match(/\*\*\[([^\]]+)\]\*\*/);
+      const userMatch = entry.match(/\*\*User:\*\*\s*([\s\S]*?)(?=\*\*Assistant:\*\*|$)/);
+      const assistantMatch = entry.match(/\*\*Assistant:\*\*\s*([\s\S]*?)$/);
+      
+      if (userMatch || assistantMatch) {
+        conversations.push({
+          timestamp: timestampMatch ? timestampMatch[1] : null,
+          user: userMatch ? userMatch[1].trim() : null,
+          assistant: assistantMatch ? assistantMatch[1].trim() : null
+        });
+      }
+    }
+    
+    return {
+      found: true,
+      date: dateStr,
+      source,
+      conversationCount: conversations.length,
+      conversations: conversations.slice(0, 20) // Limit to 20 most recent
+    };
+  };
+
+  // Search memory between specific dates
+  const executeSearchMemoryBetweenDates = async (query, startDateInput, endDateInput) => {
+    if (!currentUser?.username) {
+      return { error: "Not logged in" };
+    }
+    
+    const startDate = parseDateString(startDateInput);
+    const endDate = parseDateString(endDateInput);
+    
+    if (!startDate) {
+      return { error: `Could not parse start date: "${startDateInput}"` };
+    }
+    if (!endDate) {
+      return { error: `Could not parse end date: "${endDateInput}"` };
+    }
+    
+    const dailyDir = await getMemoryDailyDir(currentUser.username);
+    const longtermDir = await getMemoryLongtermDir(currentUser.username);
+    const results = [];
+    const queryLower = query ? query.toLowerCase() : null;
+    
+    // Helper to check if date is in range
+    const isInRange = (dateStr) => {
+      return dateStr >= startDate && dateStr <= endDate;
+    };
+    
+    // Helper to search a file
+    const searchFile = async (filePath, dateStr) => {
+      try {
+        const content = await fs.readFile(filePath, "utf8");
+        
+        // If no query, just return that we found content for this date
+        if (!queryLower) {
+          const preview = content.slice(0, 200).replace(/\n/g, ' ').trim();
+          results.push({
+            date: dateStr,
+            preview: preview + (content.length > 200 ? '...' : '')
+          });
+          return;
+        }
+        
+        // Search for query matches
+        if (content.toLowerCase().includes(queryLower)) {
+          const lines = content.split('\n');
+          const matchingLines = lines.filter(line => 
+            line.toLowerCase().includes(queryLower)
+          ).slice(0, 3);
+          
+          if (matchingLines.length > 0) {
+            results.push({
+              date: dateStr,
+              matches: matchingLines
+            });
+          }
+        }
+      } catch {
+        // Skip unreadable files
+      }
+    };
+    
+    // Search daily files
+    try {
+      const dailyFiles = await fs.readdir(dailyDir);
+      for (const file of dailyFiles) {
+        if (!file.endsWith('.md')) continue;
+        const dateStr = file.replace('.md', '');
+        if (isInRange(dateStr)) {
+          await searchFile(path.join(dailyDir, file), dateStr);
+        }
+      }
+    } catch {
+      // No daily directory
+    }
+    
+    // Search longterm files
+    try {
+      const longtermFiles = await fs.readdir(longtermDir);
+      for (const file of longtermFiles) {
+        if (!file.endsWith('.md')) continue;
+        const dateStr = file.replace('.md', '');
+        if (isInRange(dateStr)) {
+          await searchFile(path.join(longtermDir, file), dateStr);
+        }
+      }
+    } catch {
+      // No longterm directory
+    }
+    
+    // Sort by date (most recent first)
+    results.sort((a, b) => b.date.localeCompare(a.date));
+    
+    if (results.length === 0) {
+      const msg = queryLower 
+        ? `No conversations matching "${query}" found between ${startDate} and ${endDate}.`
+        : `No conversations found between ${startDate} and ${endDate}.`;
+      return { found: false, message: msg };
+    }
+    
+    return {
+      found: true,
+      dateRange: { start: startDate, end: endDate },
+      query: query || null,
+      totalDays: results.length,
+      results: results.slice(0, 15)
+    };
+  };
+
+  // List all memory dates
+  const executeListMemoryDates = async (limit = 30) => {
+    if (!currentUser?.username) {
+      return { error: "Not logged in" };
+    }
+    
+    const dailyDir = await getMemoryDailyDir(currentUser.username);
+    const longtermDir = await getMemoryLongtermDir(currentUser.username);
+    const allDates = new Set();
+    
+    // Get dates from daily
+    try {
+      const dailyFiles = await fs.readdir(dailyDir);
+      for (const file of dailyFiles) {
+        if (file.endsWith('.md')) {
+          allDates.add(file.replace('.md', ''));
+        }
+      }
+    } catch {
+      // No daily directory
+    }
+    
+    // Get dates from longterm
+    try {
+      const longtermFiles = await fs.readdir(longtermDir);
+      for (const file of longtermFiles) {
+        if (file.endsWith('.md')) {
+          allDates.add(file.replace('.md', ''));
+        }
+      }
+    } catch {
+      // No longterm directory
+    }
+    
+    // Sort dates (most recent first)
+    const sortedDates = Array.from(allDates).sort().reverse();
+    
+    if (sortedDates.length === 0) {
+      return { found: false, message: "No conversation history found." };
+    }
+    
+    const oldestDate = sortedDates[sortedDates.length - 1];
+    const newestDate = sortedDates[0];
+    
+    return {
+      found: true,
+      totalDays: sortedDates.length,
+      oldestDate,
+      newestDate,
+      dates: sortedDates.slice(0, limit)
+    };
+  };
+
+  // Get conversation summary for a date
+  const executeGetConversationSummary = async (dateInput) => {
+    if (!currentUser?.username) {
+      return { error: "Not logged in" };
+    }
+    
+    const dateStr = parseDateString(dateInput);
+    if (!dateStr) {
+      return { error: `Could not parse date: "${dateInput}"` };
+    }
+    
+    const dailyDir = await getMemoryDailyDir(currentUser.username);
+    const longtermDir = await getMemoryLongtermDir(currentUser.username);
+    
+    // Try longterm first (summaries are there), then daily
+    let content = null;
+    let source = null;
+    
+    try {
+      const longtermPath = path.join(longtermDir, `${dateStr}.md`);
+      content = await fs.readFile(longtermPath, "utf8");
+      source = "longterm";
+    } catch {
+      try {
+        const dailyPath = path.join(dailyDir, `${dateStr}.md`);
+        content = await fs.readFile(dailyPath, "utf8");
+        source = "daily";
+      } catch {
+        // No file found
+      }
+    }
+    
+    if (!content) {
+      return { 
+        found: false, 
+        date: dateStr,
+        message: `No conversations found for ${dateStr}.` 
+      };
+    }
+    
+    // Extract summary if it exists
+    const summaryMatch = content.match(/## Summary\n([\s\S]*?)\n---/);
+    
+    if (summaryMatch) {
+      return {
+        found: true,
+        date: dateStr,
+        hasSummary: true,
+        summary: summaryMatch[1].trim()
+      };
+    }
+    
+    // No summary - this is likely a recent file
+    // Return a brief preview instead
+    const preview = content.slice(0, 500).replace(/\n+/g, '\n').trim();
+    return {
+      found: true,
+      date: dateStr,
+      hasSummary: false,
+      message: "No summary available yet (summaries are generated for older conversations).",
+      preview: preview + (content.length > 500 ? '...' : '')
     };
   };
 
@@ -8297,6 +9006,15 @@ Generate ONLY the welcome message, nothing else.`;
         const { addNote, removeNote, ...otherFields } = toolInput;
         Object.assign(profile, otherFields);
         
+        // Check if we should advance onboarding from profile stage to task_demo
+        // Requires: first name (not default), and at least one of: occupation, city, or homeLife
+        const hasBasicInfo = profile.firstName && profile.firstName !== "User" && profile.firstName !== "";
+        const hasContextInfo = profile.occupation || profile.city || profile.homeLife;
+        if (profile.onboardingStage === "profile" && hasBasicInfo && hasContextInfo) {
+          console.log("[Onboarding] Profile info collected, advancing to task_demo stage");
+          profile.onboardingStage = "task_demo";
+        }
+        
         const newMarkdown = serializeUserProfile(profile);
         await fs.writeFile(profilePath, newMarkdown, "utf8");
         return { success: true, profile, message: "Profile updated successfully" };
@@ -8733,6 +9451,157 @@ Generate ONLY the welcome message, nothing else.`;
       return { error: "Anthropic API key required" };
     }
 
+    // ────────────────────────────────────────────────────────────────────────────
+    // DIRECT EXECUTION MODE - When structured plan with tool calls is available
+    // ────────────────────────────────────────────────────────────────────────────
+    
+    if (task.structuredPlan && task.structuredPlan.length > 0 && task.structuredPlan[0].tool) {
+      console.log(`[Tasks] Using DIRECT EXECUTION mode for task ${taskId}`);
+      console.log(`[Tasks] Structured plan has ${task.structuredPlan.length} steps`);
+      
+      // Use shared tool builder - ensures tasks have same tools as chat
+      const { tools: directExecTools, executeTool: directExecExecuteTool } = await loadIntegrationsAndBuildTools({
+        includeProfileTools: false,
+        includeTaskTools: false,
+        includeMemoryTools: false
+      });
+      
+      const toolsByName = {};
+      for (const t of directExecTools) {
+        toolsByName[t.name] = t;
+      }
+      
+      const results = {};
+      let lastResult = null;
+      let lastScreenshot = null;
+      
+      try {
+        // Execute each step in the structured plan
+        for (const planStep of task.structuredPlan) {
+          const { step_id, tool, args, output_var, description } = planStep;
+          console.log(`[Tasks] Direct exec step ${step_id}: [${tool}] ${description}`);
+          
+          // Log step to task
+          await updateTask(taskId, {
+            currentStep: { step: step_id, description, state: "executing" },
+            logEntry: `Executing step ${step_id}: ${description}`
+          }, currentUser?.username);
+          
+          // Skip internal control tools for tasks (they don't make sense in direct mode)
+          if (tool === "complete_task" || tool === "goto_step" || tool === "update_task_state") {
+            console.log(`[Tasks] Skipping control tool: ${tool}`);
+            continue;
+          }
+          
+          // Check if tool exists
+          if (!toolsByName[tool]) {
+            console.log(`[Tasks] Unknown tool: ${tool}, skipping step`);
+            results[`step_${step_id}`] = { error: `Unknown tool: ${tool}` };
+            continue;
+          }
+          
+          // Substitute variables from previous results
+          let resolvedArgs = { ...args };
+          if (args) {
+            const argsStr = JSON.stringify(args);
+            const substituted = argsStr.replace(/\{\{step_(\d+)\.(\w+)\}\}/g, (match, stepNum, field) => {
+              const prevResult = results[`step_${stepNum}`];
+              if (prevResult && prevResult[field] !== undefined) {
+                return String(prevResult[field]);
+              }
+              return match;
+            });
+            try {
+              resolvedArgs = JSON.parse(substituted);
+            } catch (e) {
+              console.log(`[Tasks] Failed to parse substituted args: ${e.message}`);
+            }
+          }
+          
+          console.log(`[Tasks] Direct exec tool ${tool} with args:`, JSON.stringify(resolvedArgs).slice(0, 200));
+          
+          // Execute the tool
+          const taskContext = { 
+            taskId, 
+            autoSend: task.autoSend || false,
+            contextMemory: task.contextMemory || {}
+          };
+          
+          const toolResult = await directExecExecuteTool(tool, resolvedArgs, taskContext);
+          
+          // Store result
+          if (output_var) {
+            results[output_var] = toolResult;
+          }
+          results[`step_${step_id}`] = toolResult;
+          lastResult = toolResult;
+          
+          // Capture screenshot if browser tool returned one
+          if (toolResult && toolResult.screenshot) {
+            lastScreenshot = toolResult.screenshot;
+          }
+          
+          // Handle special tool results
+          if (toolResult && toolResult.pending) {
+            console.log(`[Tasks] Message pending approval in task ${taskId}`);
+            return { success: true, pendingMessage: true, message: toolResult.message };
+          }
+          
+          if (toolResult && toolResult.action === "wait_for_user_input") {
+            console.log(`[Tasks] Task ${taskId} waiting for user input: ${toolResult.question}`);
+            await updateTask(taskId, {
+              status: "waiting_for_input",
+              contextMemory: {
+                ...task.contextMemory,
+                pendingClarification: toolResult.question,
+                clarificationTimestamp: new Date().toISOString(),
+                saveResponseAs: toolResult.save_response_as || null
+              },
+              logEntry: `Asked user: "${toolResult.question}" - waiting for response`
+            }, currentUser?.username);
+            return { success: true, waitingForInput: true, question: toolResult.question };
+          }
+          
+          // Small delay between browser operations to let pages render
+          if (tool.startsWith("browser_")) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        }
+        
+        // All steps completed - mark task as done
+        console.log(`[Tasks] Direct execution completed for task ${taskId}`);
+        
+        await updateTask(taskId, {
+          status: "completed",
+          currentStep: { step: task.structuredPlan.length, state: "completed" },
+          logEntry: `Task completed via direct execution (${task.structuredPlan.length} steps)`
+        }, currentUser?.username);
+        
+        // Notify user
+        if (win && !win.isDestroyed() && !task.notificationsDisabled) {
+          addTaskUpdate(taskId, `✅ Task completed!`, {
+            toChat: true,
+            emoji: "✅",
+            taskTitle: task.title
+          });
+        }
+        
+        return { success: true, completed: true, directExecution: true };
+        
+      } catch (err) {
+        console.error(`[Tasks] Direct execution error for ${taskId}:`, err.message);
+        await updateTask(taskId, {
+          status: "failed",
+          logEntry: `Direct execution failed: ${err.message}`
+        }, currentUser?.username);
+        return { error: err.message };
+      }
+    }
+    
+    // ────────────────────────────────────────────────────────────────────────────
+    // STANDARD LLM-BASED EXECUTION - Fallback when no structured plan
+    // ────────────────────────────────────────────────────────────────────────────
+
     // Task state management tool (specific to task executor)
     const taskStateManagementTool = {
       name: "update_task_state",
@@ -9161,66 +10030,39 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
 
             await updateTask(taskId, updates, currentUser?.username);
 
-            // PROACTIVE NOTIFICATIONS - Always notify user of important task events
-            console.log(`[Tasks] Notification check: win=${!!win}, status=${input.nextStatus}, nextStep=${input.nextStep}, currentStep=${task.currentStep.step}`);
+            // NOTIFICATIONS - Only alert on final states (completed, failed) unless disabled
+            console.log(`[Tasks] Notification check: win=${!!win}, status=${input.nextStatus}, notificationsDisabled=${task.notificationsDisabled}`);
             
-            if (win) {
+            // Check if notifications are disabled for this task
+            if (win && !task.notificationsDisabled) {
               let notificationMessage = null;
               let notificationEmoji = "📋";
               
-              // Completed tasks get special notification
+              // Only send chat notifications for FINAL states
               if (input.nextStatus === "completed") {
                 notificationEmoji = "✅";
                 notificationMessage = `Task completed!\n\n${input.logMessage}`;
               }
-              // Failed tasks get alert notification
               else if (input.nextStatus === "failed") {
                 notificationEmoji = "❌";
                 notificationMessage = `Task failed: ${input.logMessage}`;
               }
-              // Step advancement (not just waiting on same step)
-              else if (input.nextStep && input.nextStep > task.currentStep.step) {
-                notificationEmoji = "📝";
-                const nextStepDesc = task.plan[input.nextStep - 1] || "";
-                notificationMessage = `Step ${task.currentStep.step} complete: ${input.logMessage}\n\nMoving to step ${input.nextStep}: ${nextStepDesc}`;
-              }
-              // Waiting for user input/clarification
+              // Waiting for user input still needs notification (user action required)
               else if (input.nextStatus === "waiting_for_input") {
                 notificationEmoji = "❓";
                 const question = input.clarificationQuestion || "I need more information to continue.";
                 notificationMessage = `${input.logMessage}\n\n**Question:** ${question}\n\nPlease reply in the chat to continue the task.`;
               }
-              // Waiting for user approval of drafted message
+              // Waiting for user approval still needs notification (user action required)
               else if (input.nextStatus === "waiting_approval" || updates.status === "waiting_approval") {
                 notificationEmoji = "📨";
                 const recipient = input.contextUpdates?.actionable_message_from || task.contextMemory?.actionable_message_from || "contact";
                 notificationMessage = `${input.logMessage}\n\n**Action Required:** I've drafted a reply to ${recipient}. Please review and approve or edit the message in the Tasks panel.`;
               }
-              // Waiting for reply - brief update  
-              else if (input.nextStatus === "waiting") {
-                notificationEmoji = "⏳";
-                const waitingFor = input.contextUpdates?.waiting_for_contact || task.contextMemory?.waiting_for_contact;
-                notificationMessage = `${input.logMessage}${waitingFor ? `\n\nWaiting for reply from ${waitingFor}...` : ""}`;
-              }
-              // Any other status change with a log message - always notify
-              else if (input.logMessage && input.nextStatus === "active") {
-                notificationEmoji = "🔄";
-                notificationMessage = input.logMessage;
-              }
-              // Custom notification from executor
-              else if (input.notifyUser) {
-                notificationMessage = input.notifyUser;
-              }
-              // FALLBACK: Always notify if there's a logMessage, even if no other condition matched
-              else if (input.logMessage) {
-                notificationEmoji = "📋";
-                notificationMessage = input.logMessage;
-              }
               
-              console.log(`[Tasks] Notification message: ${notificationMessage ? notificationMessage.slice(0, 50) + "..." : "NONE"}`);
-              
-              // Send notification to chat if we have one
+              // Send notification to chat only for important states
               if (notificationMessage) {
+                console.log(`[Tasks] Notification message: ${notificationMessage.slice(0, 50)}...`);
                 addTaskUpdate(taskId, notificationMessage);
                 win.webContents.send("chat:newMessage", {
                   role: "assistant",
@@ -9228,7 +10070,16 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
                   source: "task"
                 });
                 console.log(`[Tasks] Notification SENT to chat`);
+              } else {
+                // Still log the update for the task panel, just don't send to chat
+                if (input.logMessage) {
+                  addTaskUpdate(taskId, input.logMessage);
+                }
               }
+            } else if (win && task.notificationsDisabled && input.logMessage) {
+              // Notifications disabled but still add to task panel log
+              addTaskUpdate(taskId, input.logMessage);
+              console.log(`[Tasks] Notification SKIPPED - notifications disabled for task`);
             } else {
               console.log(`[Tasks] Notification SKIPPED - no window`);
             }
@@ -9357,14 +10208,10 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
         
         console.log(`[Tasks] Auto-advanced from step ${currentStep} to step ${nextStep}`);
         
-        // Notify user
+        // Log update to task panel (no chat notification for step progress)
         if (win && !win.isDestroyed()) {
           const notificationMessage = `Step ${currentStep} completed. Moving to step ${nextStep}: ${task.plan[nextStep - 1]}`;
-          addTaskUpdate(taskId, notificationMessage, {
-            toChat: true,
-            emoji: "📝",
-            taskTitle: task.title
-          });
+          addTaskUpdate(taskId, notificationMessage);
         }
         
         // Continue to next step after a short delay
@@ -9422,7 +10269,7 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
    * @param {string} userRequest - User's request describing the skill
    * @param {Object} apiKeys - Available API keys
    * @param {string} activeProvider - The active LLM provider
-   * @returns {Object} Skill object with name, description, keywords, procedure, constraints, tools
+   * @returns {Object} Skill object with name, description, keywords, procedure, constraints
    */
   async function generateSkillFromDescription(userRequest, apiKeys, activeProvider) {
     const prompt = `You are helping create a skill (a reusable procedure) for an AI assistant called Wovly.
@@ -9432,18 +10279,9 @@ USER REQUEST:
 
 Based on this request, generate a skill with the following structure. Be specific and actionable.
 
-Available tools the skill can use:
-- send_email: Send emails via Gmail
-- list_emails: Search/list emails
-- get_email_content: Read email content
-- send_imessage: Send text messages via iMessage/SMS
-- get_recent_messages: Get recent iMessage conversations
-- send_slack_message: Send Slack messages
-- get_slack_messages: Get Slack messages
-- search_calendar: Search calendar events
-- create_calendar_event: Create calendar events
-- update_task_state: Update task progress
-- browser tools: navigate_to, page_snapshot, browser_click, browser_type, etc.
+A skill provides:
+1. Domain knowledge to guide the AI when decomposing tasks (procedure)
+2. Constraints the AI must follow when executing the task
 
 Respond with ONLY valid JSON (no markdown, no backticks):
 {
@@ -9460,8 +10298,7 @@ Respond with ONLY valid JSON (no markdown, no backticks):
   "constraints": [
     "Important rule or limitation",
     "Another constraint to follow"
-  ],
-  "tools": ["tool1", "tool2"]
+  ]
 }`;
 
     try {
@@ -11042,7 +11879,20 @@ ${formatDecomposedSteps(steps)}
       }
       // Memory tools
       if (memoryTools.find(t => t.name === toolName)) {
-        return await executeMemorySearch(toolInput.query, toolInput.date_range);
+        switch (toolName) {
+          case "search_memory":
+            return await executeMemorySearch(toolInput.query, toolInput.date_range);
+          case "get_conversations_for_date":
+            return await executeGetConversationsForDate(toolInput.date);
+          case "search_memory_between_dates":
+            return await executeSearchMemoryBetweenDates(toolInput.query, toolInput.start_date, toolInput.end_date);
+          case "list_memory_dates":
+            return await executeListMemoryDates(toolInput.limit);
+          case "get_conversation_summary":
+            return await executeGetConversationSummary(toolInput.date);
+          default:
+            return { error: `Unknown memory tool: ${toolName}` };
+        }
       }
       // Documentation tools
       if (documentationTools.find(t => t.name === toolName)) {
@@ -11577,7 +12427,16 @@ ${formatDecomposedSteps(steps)}
     // Skill Creation Detection - Check if user wants to create a new skill
     // ─────────────────────────────────────────────────────────────────────────
     
-    const skillCreationMatch = userMessage.toLowerCase().match(/^(create|make|add|new)\s+(a\s+)?skill\s+(called|named|for|that|to|:|\s)/i);
+    // Match patterns like:
+    // - "create a skill where..."
+    // - "make a skill that..."
+    // - "add a new skill for..."
+    // - "new skill: ..."
+    // - "create skill called X"
+    // - "teach me a skill" / "learn a skill"
+    const skillCreationMatch = userMessage.toLowerCase().match(
+      /^(create|make|add|new|teach|learn)\s+(a\s+)?(new\s+)?skill\b/i
+    );
     if (skillCreationMatch) {
       console.log("[Skills] Detected skill creation request");
       
@@ -11606,14 +12465,34 @@ ${formatDecomposedSteps(steps)}
         
         console.log(`[Skills] Created new skill: ${skillId}`);
         
+        // Ensure arrays exist for safe formatting
+        const keywords = Array.isArray(generatedSkill.keywords) ? generatedSkill.keywords : [];
+        const procedure = Array.isArray(generatedSkill.procedure) ? generatedSkill.procedure : [];
+        const constraints = Array.isArray(generatedSkill.constraints) ? generatedSkill.constraints : [];
+        
+        // Check if this is the skill_demo stage and advance onboarding
+        let onboardingAdvancedMessage = "";
+        try {
+          const profilePath = await getUserProfilePath(currentUser?.username);
+          const profileMarkdown = await fs.readFile(profilePath, "utf8");
+          const userProfile = parseUserProfile(profileMarkdown);
+          if (userProfile.onboardingStage === "skill_demo") {
+            console.log("[Onboarding] Skill created during skill_demo, prompting to test it");
+            // Don't advance yet - wait for them to test the skill
+            onboardingAdvancedMessage = `\n\nYour skill is ready! Now test it by saying **"Marco"** and see what happens.`;
+          }
+        } catch (err) {
+          console.error("[Onboarding] Error checking skill_demo stage:", err.message);
+        }
+        
         // Format response with skill details
         const response = `I've created a new skill: **${generatedSkill.name}**\n\n` +
-          `**Description:** ${generatedSkill.description}\n\n` +
-          `**Keywords:** ${generatedSkill.keywords.join(', ')}\n\n` +
-          `**Procedure:**\n${generatedSkill.procedure.map((step, i) => `${i + 1}. ${step}`).join('\n')}\n\n` +
-          `**Constraints:**\n${generatedSkill.constraints.map(c => `- ${c}`).join('\n')}\n\n` +
-          `**Tools:** ${generatedSkill.tools.join(', ')}\n\n` +
-          `The skill has been saved and is now available. You can view and edit it in the Skills page.`;
+          `**Description:** ${generatedSkill.description || 'No description'}\n\n` +
+          `**Keywords:** ${keywords.length > 0 ? keywords.join(', ') : 'general'}\n\n` +
+          `**Procedure:**\n${procedure.length > 0 ? procedure.map((step, i) => `${i + 1}. ${step}`).join('\n') : '1. Follow task instructions'}\n\n` +
+          (constraints.length > 0 ? `**Constraints:**\n${constraints.map(c => `- ${c}`).join('\n')}\n\n` : '') +
+          `The skill has been saved and is now available. You can view and edit it in the Skills page.` +
+          onboardingAdvancedMessage;
         
         return {
           ok: true,
@@ -11960,24 +12839,92 @@ ${formatDecomposedSteps(steps)}
         // Debug: Log available tools
         console.log(`[QueryDecomposition] Available tools (${toolsForDecomposition.length}): ${toolsForDecomposition.map(t => t.name).join(', ')}`);
         
-        const queryDecomposition = await decomposeQuery(enrichedQuery, toolsForDecomposition, apiKeys, activeProvider);
+        // Find matching skill for the query
+        let matchedSkillForDecomposition = null;
+        try {
+          const skills = await loadAllSkills(currentUser?.username);
+          if (skills.length > 0) {
+            matchedSkillForDecomposition = await findBestSkill(enrichedQuery, currentUser?.username, skills);
+            if (matchedSkillForDecomposition) {
+              console.log(`[QueryDecomposition] Matched skill: ${matchedSkillForDecomposition.skill.name} (${(matchedSkillForDecomposition.confidence * 100).toFixed(0)}%)`);
+            }
+          }
+        } catch (err) {
+          console.error("[QueryDecomposition] Error finding skill:", err.message);
+        }
+        
+        const queryDecomposition = await decomposeQuery(enrichedQuery, toolsForDecomposition, apiKeys, activeProvider, matchedSkillForDecomposition);
         
         // Check if we should suggest creating a task or execute inline
         if (queryDecomposition && queryDecomposition.steps && queryDecomposition.steps.length > 0) {
-          const hasWaitingSteps = queryDecomposition.steps.some(s => s.may_require_waiting);
-          const tooManySteps = queryDecomposition.steps.length > 10;
-          const shouldSuggestTask = queryDecomposition.requires_task || hasWaitingSteps || tooManySteps;
+          // Check if user explicitly requested a task
+          const queryLower = enrichedQuery.toLowerCase();
+          const explicitlyRequestedTask = queryLower.includes("create a task") || 
+                                          queryLower.includes("make a task") || 
+                                          queryLower.includes("add a task") ||
+                                          queryLower.includes("set up a task") ||
+                                          queryLower.includes("schedule a task") ||
+                                          queryLower.includes("remind me") ||
+                                          queryLower.includes("every day") ||
+                                          queryLower.includes("everyday") ||
+                                          queryLower.includes("daily") ||
+                                          queryLower.includes("weekly") ||
+                                          queryLower.includes("monitor");
           
-          console.log(`[QueryDecomposition] Task decision: requires_task=${queryDecomposition.requires_task}, hasWaitingSteps=${hasWaitingSteps}, tooManySteps=${tooManySteps}`);
-          console.log(`[QueryDecomposition] Steps with waiting: ${queryDecomposition.steps.filter(s => s.may_require_waiting).map(s => s.action).join(', ') || 'none'}`);
+          // Check for steps that truly require waiting for external input
+          const hasWaitingSteps = queryDecomposition.steps.some(s => 
+            s.may_require_waiting || 
+            s.tools_needed?.some(t => t === "ask_user_question")
+          );
+          
+          // Check for steps that wait for human responses (emails, messages)
+          const needsExternalInput = queryDecomposition.steps.some(s => {
+            const actionLower = s.action?.toLowerCase() || "";
+            return (
+              actionLower.includes("wait for reply") ||
+              actionLower.includes("wait for response") ||
+              actionLower.includes("waiting for reply") ||
+              actionLower.includes("waiting for response") ||
+              actionLower.includes("monitor for") ||
+              actionLower.includes("check for new")
+            );
+          });
+          
+          const tooManySteps = queryDecomposition.steps.length > 10;
+          const isContinuousTask = queryDecomposition.task_type === "continuous";
+          
+          // Queries that are instant lookups should never become tasks
+          const isInstantLookup = queryLower.includes("what did we") ||
+                                  queryLower.includes("what have we") ||
+                                  queryLower.includes("show me") ||
+                                  queryLower.includes("tell me about") ||
+                                  queryLower.includes("get my") ||
+                                  queryLower.includes("list my") ||
+                                  queryLower.includes("what's on my") ||
+                                  queryLower.includes("search for") ||
+                                  queryLower.includes("find me") ||
+                                  queryLower.includes("look up");
+          
+          // Only suggest task if:
+          // 1. User explicitly requested a task, OR
+          // 2. Task requires waiting for external input (human replies), OR
+          // 3. It's a continuous/monitoring task, OR
+          // 4. Too many steps (>10)
+          // BUT NOT if it's an instant lookup query
+          const shouldSuggestTask = !isInstantLookup && (explicitlyRequestedTask || hasWaitingSteps || needsExternalInput || isContinuousTask || tooManySteps);
+          
+          console.log(`[QueryDecomposition] Task decision: explicitlyRequested=${explicitlyRequestedTask}, hasWaitingSteps=${hasWaitingSteps}, needsExternalInput=${needsExternalInput}, isContinuous=${isContinuousTask}, tooManySteps=${tooManySteps}, isInstantLookup=${isInstantLookup}`);
+          console.log(`[QueryDecomposition] shouldSuggestTask=${shouldSuggestTask}`);
           
           if (shouldSuggestTask) {
             const stepsDisplay = formatDecomposedSteps(queryDecomposition.steps);
-            const taskReason = hasWaitingSteps 
+            const taskReason = hasWaitingSteps || needsExternalInput
               ? "This task involves waiting for external responses (like replies), which requires a background task."
-              : tooManySteps 
-                ? `This task has ${queryDecomposition.steps.length} steps, which is best handled as a background task.`
-                : queryDecomposition.reason_for_task || "This task is best handled as a background task.";
+              : isContinuousTask
+                ? "This is a recurring/monitoring task that needs to run continuously."
+                : tooManySteps 
+                  ? `This task has ${queryDecomposition.steps.length} steps, which is best handled as a background task.`
+                  : queryDecomposition.reason_for_task || "This task is best handled as a background task.";
             
             return {
               ok: true,
@@ -11988,6 +12935,19 @@ ${formatDecomposedSteps(steps)}
               ...(detectedFactsDuringWorkflow.length > 0 ? { detectedFacts: detectedFactsDuringWorkflow } : {})
             };
           }
+          
+          // Execute inline - no formal task needed for simple multi-step queries
+          console.log(`[QueryDecomposition] Executing ${queryDecomposition.steps.length} steps inline...`);
+          
+          // Use the same inline execution logic as handleDismissTaskSuggestion
+          // Return signal to frontend to execute inline
+          return {
+            ok: true,
+            executeInline: true,
+            decomposition: queryDecomposition,
+            // Include any facts detected during workflow for deferred saving
+            ...(detectedFactsDuringWorkflow.length > 0 ? { detectedFacts: detectedFactsDuringWorkflow } : {})
+          };
         }
       } catch (err) {
         console.error("[QueryDecomposition] Error in decomposition flow:", err.message);
@@ -12410,6 +13370,12 @@ You have FULL access to the user's tools including calendar, email, contacts, et
       }
     };
     
+    // Helper to check for skill demo completion (Marco -> Polo test)
+    // Delegates to shared helper function
+    const checkSkillDemoCompletion = async (userMsg, assistantResp) => {
+      await checkSkillDemoCompletionShared(userMsg, assistantResp, currentUser?.username, win);
+    };
+    
     // Extract user's message for memory saving
     const userMessage = messages[messages.length - 1]?.content || "";
     
@@ -12418,6 +13384,89 @@ You have FULL access to the user's tools including calendar, email, contacts, et
       if (!currentUser?.username) {
         return { ok: false, error: "Please log in to use chat. Click the logout icon and log in again." };
       }
+      
+      // ─────────────────────────────────────────────────────────────────────────
+      // Tutorial Mode - Handle onboarding stages with isolated processing
+      // ─────────────────────────────────────────────────────────────────────────
+      
+      // Load profile to check onboarding stage
+      let profile = null;
+      try {
+        const profilePath = await getUserProfilePath(currentUser.username);
+        const markdown = await fs.readFile(profilePath, "utf8");
+        profile = parseUserProfile(markdown);
+      } catch {
+        // No profile yet
+      }
+      
+      const currentStage = profile?.onboardingStage || "completed";
+      
+      // Check if we should use tutorial mode (isolated from task decomposition)
+      if (shouldUseTutorialMode(currentStage, userMessage)) {
+        console.log(`[Tutorial] Processing message in tutorial mode (stage: ${currentStage})`);
+        
+        // Check for stage advancement triggers
+        const advancement = await checkStageAdvancement(currentStage, userMessage, {
+          lastResponse: messages[messages.length - 2]?.content
+        });
+        
+        if (advancement && advancement.shouldAdvance) {
+          console.log(`[Tutorial] Advancing from ${currentStage} to ${advancement.nextStage}`);
+          profile.onboardingStage = advancement.nextStage;
+          const profilePath = await getUserProfilePath(currentUser.username);
+          await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
+          
+          if (advancement.response) {
+            return { ok: true, response: advancement.response };
+          }
+          // If no response, will continue to show next stage welcome
+        }
+        
+        // Handle profile stage - collect user info
+        if (currentStage === "profile") {
+          console.log(`[Tutorial] Processing profile collection`);
+          const result = await processProfileStageMessage(userMessage, profile, null);
+          
+          // Save the updated fields
+          if (Object.keys(result.updatedFields).length > 0) {
+            const profilePath = await getUserProfilePath(currentUser.username);
+            Object.assign(profile, result.updatedFields);
+            
+            // Check if we should advance to next stage
+            if (result.shouldAdvance) {
+              console.log(`[Tutorial] Profile complete, advancing to task_demo`);
+              profile.onboardingStage = "task_demo";
+            }
+            
+            await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
+          }
+          
+          // Return the response (next question or completion message)
+          if (result.response) {
+            // Save to memory
+            await saveConversationToMemory(userMessage, result.response);
+            return { ok: true, response: result.response };
+          }
+          
+          // If shouldAdvance but no response, show next stage welcome
+          if (result.shouldAdvance) {
+            const welcome = getStageWelcomeMessage("task_demo", profile, "afternoon");
+            await saveConversationToMemory(userMessage, welcome.message);
+            return { ok: true, response: welcome.message };
+          }
+        }
+        
+        // For other tutorial stages, generate a guidance response
+        const tutorialResponse = generateTutorialResponse(currentStage, userMessage, profile);
+        if (tutorialResponse) {
+          await saveConversationToMemory(userMessage, tutorialResponse);
+          return { ok: true, response: tutorialResponse };
+        }
+      }
+      
+      // ─────────────────────────────────────────────────────────────────────────
+      // Normal Processing - Use full chat pipeline
+      // ─────────────────────────────────────────────────────────────────────────
       
       // Use the shared processing function
       const processResult = await processChatQuery(messages, { skipDecomposition, stepContext, workflowContext });
@@ -12652,6 +13701,10 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             let responseText = textBlock?.text || "";
             // Save conversation to memory
             await saveConversationToMemory(userMessage, responseText);
+            
+            // Check for skill demo completion (Marco -> Polo test)
+            await checkSkillDemoCompletion(userMessage, responseText);
+            
             return { ok: true, response: responseText };
           }
 
@@ -12759,6 +13812,10 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             let responseText = choice.message.content || "";
             // Save conversation to memory
             await saveConversationToMemory(userMessage, responseText);
+            
+            // Check for skill demo completion (Marco -> Polo test)
+            await checkSkillDemoCompletion(userMessage, responseText);
+            
             return { ok: true, response: responseText };
           }
 
@@ -12848,6 +13905,10 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
         // Save conversation to memory
         await saveConversationToMemory(userMessage, text);
+        
+        // Check for skill demo completion (Marco -> Polo test)
+        await checkSkillDemoCompletion(userMessage, text);
+        
         return { ok: true, response: text };
       }
 
@@ -12864,7 +13925,112 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
       console.log(`[Chat] ========== INLINE EXECUTION STARTED ==========`);
       console.log(`[Chat] Title: ${decomposition.title}`);
       console.log(`[Chat] Steps: ${decomposition.steps?.length || 0}`);
+      console.log(`[Chat] Plan: ${decomposition.plan?.length || 0} tool calls`);
       console.log(`[Chat] Original message: ${originalMessage?.substring(0, 100)}...`);
+      
+      // Check if we have a structured plan from the Builder (with tool + args)
+      // If so, execute tools directly without LLM calls for each step
+      if (decomposition.plan && decomposition.plan.length > 0 && decomposition.plan[0].tool) {
+        console.log(`[Chat] Using DIRECT execution mode - executing tools without LLM`);
+        
+        // Send initial progress message
+        if (win && win.webContents) {
+          win.webContents.send("chat:newMessage", {
+            role: "assistant",
+            content: `🚀 **${decomposition.title}**\n\nExecuting...`,
+            source: "decomposed"
+          });
+        }
+        
+        // Build tool executor with all available tools
+        const accessToken = await getGoogleAccessToken(currentUser?.username).catch(() => null);
+        const slackAccessToken = await getSlackAccessToken(currentUser?.username).catch(() => null);
+        const settingsPath = await getSettingsPath(currentUser?.username);
+        let hasBrowserTools = false;
+        try {
+          const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+          hasBrowserTools = settings.browserEnabled === true;
+        } catch { /* default */ }
+        
+        const toolExecutor = buildToolsAndExecutor({
+          googleAccessToken: accessToken,
+          slackAccessToken,
+          weatherEnabled: true,
+          iMessageEnabled: process.platform === "darwin",
+          browserEnabled: hasBrowserTools
+        });
+        
+        const results = {};
+        let lastResult = null;
+        let lastScreenshot = null;
+        
+        // Execute each tool in the plan directly
+        for (const planStep of decomposition.plan) {
+          const { tool, args, output_var, description } = planStep;
+          console.log(`[Chat] Direct exec: ${tool} - ${description}`);
+          
+          // Substitute variables from previous results
+          let resolvedArgs = { ...args };
+          if (args) {
+            const argsStr = JSON.stringify(args);
+            const substituted = argsStr.replace(/\{\{step_(\d+)\.(\w+)\}\}/g, (match, stepNum, field) => {
+              const prevResult = results[`step_${stepNum}`];
+              if (prevResult && prevResult[field] !== undefined) {
+                return JSON.stringify(prevResult[field]).slice(1, -1); // Remove quotes
+              }
+              return match;
+            });
+            resolvedArgs = JSON.parse(substituted);
+          }
+          
+          try {
+            // Execute the tool
+            const result = await toolExecutor.executeTool(tool, resolvedArgs);
+            
+            // Store result for variable substitution
+            if (output_var) {
+              results[`step_${planStep.step_id}`] = result;
+              results[output_var] = result;
+            }
+            lastResult = result;
+            
+            // Capture screenshots for display
+            if (result.screenshotDataUrl) {
+              lastScreenshot = result.screenshotDataUrl;
+              if (win && !win.isDestroyed()) {
+                win.webContents.send("chat:screenshot", { dataUrl: result.screenshotDataUrl });
+              }
+            }
+            
+            console.log(`[Chat] Direct exec ${tool}: success=${result.success !== false}`);
+            
+            // Small delay between browser operations to let pages load
+            if (tool.startsWith('browser_')) {
+              await new Promise(r => setTimeout(r, 500));
+            }
+            
+          } catch (err) {
+            console.error(`[Chat] Direct exec ${tool} error:`, err.message);
+            // Continue with other steps even if one fails
+          }
+        }
+        
+        // Generate summary response
+        let response = `✅ **${decomposition.title}** - Done!`;
+        if (lastResult?.summary) {
+          response = `✅ ${lastResult.summary}`;
+        } else if (lastResult?.url) {
+          response = `✅ **${decomposition.title}**\n\nNavigated to: ${lastResult.url}`;
+        }
+        
+        // Check for skill demo completion (Marco/Polo test) after inline execution
+        await checkSkillDemoCompletionShared(originalMessage, response, currentUser?.username, win);
+        
+        return { ok: true, response };
+      }
+      
+      // Fallback to LLM-based execution for complex tasks without pre-planned tools
+      console.log(`[Chat] Using LLM execution mode`);
       
       const { steps, title } = decomposition;
       const stepResults = [];
@@ -13382,6 +14548,9 @@ ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
       } else if (goalAchieved) {
         finalResponse = lastResult?.response || "Task completed.";
       }
+      
+      // Check for skill demo completion (Marco/Polo test) after LLM inline execution
+      await checkSkillDemoCompletionShared(originalMessage, finalResponse, currentUser?.username, win);
       
       return {
         ok: true,

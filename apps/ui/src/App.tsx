@@ -372,6 +372,18 @@ type DecompositionStep = {
   expected_output?: string;
 };
 
+// Structured plan step from the Builder
+type StructuredPlanStep = {
+  step_id: number;
+  tool: string;
+  description: string;
+  args: Record<string, unknown>;
+  output_var?: string;
+  dependencies?: number[];
+  is_conditional?: boolean;
+  condition?: string | null;
+};
+
 type DecompositionResult = {
   title: string;
   task_type: "discrete" | "continuous";
@@ -381,6 +393,8 @@ type DecompositionResult = {
   monitoring_condition?: string | null;
   trigger_action?: string | null;
   steps: DecompositionStep[];
+  // Structured plan with tool calls (from Builder)
+  plan?: StructuredPlanStep[];
   requires_task: boolean;
   reason_for_task?: string | null;
 };
@@ -423,12 +437,14 @@ function ChatPanel({
   messages,
   setMessages,
   initialized,
-  setInitialized
+  setInitialized,
+  onNavigate
 }: {
   messages: ChatMessage[];
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
   initialized: boolean;
   setInitialized: React.Dispatch<React.SetStateAction<boolean>>;
+  onNavigate: (nav: NavItem) => void;
 }) {
   const [message, setMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -447,6 +463,10 @@ function ChatPanel({
   
   // Workflow state - tracks active workflows to prevent interruption by ad-hoc features
   const [activeWorkflow, setActiveWorkflow] = useState<WorkflowState>({ type: null });
+  
+  // Onboarding state
+  const [onboardingStage, setOnboardingStage] = useState<OnboardingStage | null>(null);
+  const [needsApiSetup, setNeedsApiSetup] = useState(false);
 
   // Auto-scroll
   useEffect(() => {
@@ -533,6 +553,19 @@ function ChatPanel({
       
       try {
         const result = await window.wovly.welcome.generate();
+        
+        // Track onboarding state
+        if (result.needsApiSetup) {
+          setNeedsApiSetup(true);
+          setOnboardingStage("api_setup");
+        } else if (result.onboardingStage) {
+          setOnboardingStage(result.onboardingStage);
+          setNeedsApiSetup(false);
+        } else {
+          setOnboardingStage("completed");
+          setNeedsApiSetup(false);
+        }
+        
         setMessages([{
           id: "welcome",
           role: "assistant",
@@ -592,6 +625,7 @@ function ChatPanel({
         conflicts?: FactConflict[];
         originalInput?: string;
         suggestTask?: boolean;
+        executeInline?: boolean;  // Execute steps inline without creating a formal task
         decomposition?: DecompositionResult;
         clarification_needed?: boolean;
         clarification_questions?: Array<{ question: string }>;
@@ -599,6 +633,46 @@ function ChatPanel({
         executedInline?: boolean;
         detectedFacts?: ExtractedFact[];  // Facts detected during clarification (captured silently)
       };
+
+      // Check if this should be executed inline (no formal task needed)
+      // This must be checked BEFORE result.response since executeInline responses don't have a response field
+      if (result.ok && result.executeInline && result.decomposition) {
+        console.log("[Chat] Executing inline - no task needed");
+        const decomposition = result.decomposition as DecompositionResult;
+        
+        // Show a brief "working on it" message
+        const workingMessage = {
+          id: crypto.randomUUID(),
+          role: "assistant" as const,
+          content: `Working on: **${decomposition.title}**...`,
+          source: "decomposed" as const
+        };
+        setMessages(prev => [...prev, workingMessage]);
+        
+        // Execute the steps inline
+        const inlineResult = await window.wovly.chat.executeInline(
+          decomposition,
+          userMessage.content
+        );
+        
+        // Update the message with the result
+        if (inlineResult.ok) {
+          setMessages(prev => prev.map(m => 
+            m.id === workingMessage.id 
+              ? { ...m, content: inlineResult.response || `Completed: **${decomposition.title}**` }
+              : m
+          ));
+        } else {
+          setMessages(prev => prev.map(m => 
+            m.id === workingMessage.id 
+              ? { ...m, content: `Error: ${inlineResult.error}` }
+              : m
+          ));
+        }
+        
+        setIsLoading(false);
+        return;
+      }
 
       if (result.ok && result.response) {
         const responseText = result.response;
@@ -720,6 +794,8 @@ function ChatPanel({
         title: pendingDecomposition.title,
         originalRequest: originalUserRequest,
         plan: pendingDecomposition.steps.map(s => s.action),
+        // Pass structured plan with tool calls for direct execution
+        structuredPlan: pendingDecomposition.plan,
         taskType: taskType,
         pollFrequency: selectedPollFrequency,
         // For continuous tasks, pass monitoring info
@@ -938,6 +1014,54 @@ function ChatPanel({
         )}
         {error && <div className="chat-error">{error}</div>}
         
+        {/* Onboarding: Go to Settings when API keys needed */}
+        {needsApiSetup && (
+          <div className="onboarding-action-panel">
+            <button 
+              className="btn-primary"
+              onClick={() => onNavigate("settings")}
+            >
+              Go to Settings
+            </button>
+            <button 
+              className="btn-secondary"
+              onClick={async () => {
+                await window.wovly.onboarding.skip();
+                setNeedsApiSetup(false);
+                setOnboardingStage("completed");
+              }}
+            >
+              Skip for Now
+            </button>
+          </div>
+        )}
+        
+        {/* Onboarding: Go to Integrations when at integrations stage */}
+        {onboardingStage === "integrations" && !needsApiSetup && (
+          <div className="onboarding-action-panel">
+            <button 
+              className="btn-primary"
+              onClick={() => onNavigate("integrations")}
+            >
+              Go to Integrations
+            </button>
+            <button 
+              className="btn-secondary"
+              onClick={async () => {
+                await window.wovly.onboarding.setStage("completed");
+                setOnboardingStage("completed");
+                setMessages(prev => [...prev, {
+                  id: crypto.randomUUID(),
+                  role: "assistant",
+                  content: "Great! You've completed the onboarding. Feel free to explore and ask me anything!"
+                }]);
+              }}
+            >
+              Skip
+            </button>
+          </div>
+        )}
+        
         {/* Task Suggestion from Query Decomposition */}
         {pendingDecomposition && (
           <div className="task-suggestion-actions">
@@ -977,7 +1101,7 @@ function ChatPanel({
               onClick={handleDismissTaskSuggestion}
               disabled={isCreatingTask}
             >
-              No, Help Me Directly
+              Run Now
             </button>
           </div>
         )}
@@ -2787,6 +2911,7 @@ type TaskType = {
   lastUpdated: string;
   nextCheck: number | null;
   autoSend?: boolean;
+  notificationsDisabled?: boolean;
   pollFrequency?: PollFrequency;
   originalRequest: string;
   plan: string[];
@@ -2799,6 +2924,7 @@ type TaskType = {
   executionLog: Array<{ timestamp: string; message: string }>;
   contextMemory: Record<string, string>;
   pendingMessages?: PendingMessageType[];
+  filePath?: string; // Path to the task markdown file
 };
 
 function TaskEditModal({ taskId, onClose }: { taskId: string; onClose: () => void }) {
@@ -2906,13 +3032,15 @@ function CountdownTimer({ targetTime }: { targetTime: number }) {
   }
 }
 
+type TaskTab = "activity" | "plan" | "context" | "settings";
+
 function TasksPage() {
   const [tasks, setTasks] = useState<TaskType[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedTask, setExpandedTask] = useState<string | null>(null);
   const [editingTask, setEditingTask] = useState<string | null>(null);
-  const [executing, setExecuting] = useState<string | null>(null);
   const [, setTick] = useState(0); // Force re-render for countdown updates
+  const [activeTab, setActiveTab] = useState<Record<string, TaskTab>>({}); // Track active tab per task
   
   // Pending message state
   const [editingMessage, setEditingMessage] = useState<{ taskId: string; messageId: string; content: string } | null>(null);
@@ -2978,14 +3106,6 @@ function TasksPage() {
     }
   };
 
-  const handleExecute = async (taskId: string) => {
-    if (!window.wovly) return;
-    setExecuting(taskId);
-    await window.wovly.tasks.execute(taskId);
-    await loadTasks();
-    setExecuting(null);
-  };
-
   // Approve and send a pending message
   const handleApproveMessage = async (taskId: string, messageId: string) => {
     if (!window.wovly) return;
@@ -3031,6 +3151,27 @@ function TasksPage() {
     } else {
       alert(result.error || "Failed to update auto-send setting");
     }
+  };
+
+  // Toggle notifications for a task
+  const handleToggleNotifications = async (taskId: string, currentValue: boolean) => {
+    if (!window.wovly) return;
+    
+    const newValue = !currentValue;
+    const result = await window.wovly.tasks.setNotificationsDisabled(taskId, newValue);
+    if (result.ok) {
+      await loadTasks();
+    } else {
+      alert(result.error || "Failed to update notification setting");
+    }
+  };
+
+  // Get active tab for a task (default to activity)
+  const getActiveTab = (taskId: string): TaskTab => activeTab[taskId] || "activity";
+  
+  // Set active tab for a task
+  const setTaskTab = (taskId: string, tab: TaskTab) => {
+    setActiveTab(prev => ({ ...prev, [taskId]: tab }));
   };
 
   // Update poll frequency for a task
@@ -3149,73 +3290,28 @@ function TasksPage() {
 
               {expandedTask === task.id && (
                 <div className="task-details">
-                  <div className="task-section">
-                    <h4>Original Request</h4>
-                    <p className="task-request">{task.originalRequest}</p>
-                  </div>
-
-                  <div className="task-section">
-                    <h4>Plan</h4>
-                    <ol className="task-plan">
-                      {task.plan.map((step, index) => (
-                        <li 
-                          key={index} 
-                          className={index + 1 === task.currentStep.step ? "current-step" : ""}
-                        >
-                          {step}
-                          {index + 1 === task.currentStep.step && (
-                            <span className="current-indicator"> ← Current</span>
-                          )}
-                        </li>
-                      ))}
-                    </ol>
-                  </div>
-
-                  {task.nextCheck && task.status === "waiting" && (
-                    <div className="task-section next-check-section">
-                      <h4>Next Check</h4>
-                      <div className="next-check-display">
+                  {/* Top Section: Original Request + Next Check */}
+                  <div className="task-top-info">
+                    <div className="task-request-section">
+                      <span className="task-request-label">Request:</span>
+                      <span className="task-request-text">{task.originalRequest}</span>
+                    </div>
+                    {task.nextCheck && (task.status === "waiting" || task.status === "active" || task.status === "pending") && (
+                      <div className="task-next-check">
+                        <span className="next-check-label">NEXT CHECK:</span>
                         <CountdownTimer targetTime={task.nextCheck} />
-                        <span className="next-check-time">({formatDate(new Date(task.nextCheck).toISOString())})</span>
                       </div>
-                    </div>
-                  )}
+                    )}
+                  </div>
 
-                  {task.executionLog.length > 0 && (
-                    <div className="task-section">
-                      <h4>Recent Activity</h4>
-                      <ul className="execution-log">
-                        {task.executionLog.slice(-5).map((entry, index) => (
-                          <li key={index}>
-                            <span className="log-time">{formatDate(entry.timestamp)}</span>
-                            <span className="log-message">{entry.message}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-
-                  {Object.keys(task.contextMemory).length > 0 && (
-                    <div className="task-section">
-                      <h4>Context</h4>
-                      <ul className="context-list">
-                        {Object.entries(task.contextMemory).map(([key, value]) => (
-                          <li key={key}>
-                            <strong>{key}:</strong> {value}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-
-                  {/* Pending Messages Section */}
+                  {/* Pending Messages Alert (always visible when present) */}
                   {task.pendingMessages && task.pendingMessages.length > 0 && (
-                    <div className="task-section pending-messages-section">
-                      <h4>⚠️ Messages Awaiting Approval</h4>
+                    <div className="task-pending-alert">
                       <div className="pending-messages-list">
                         {task.pendingMessages.map((msg) => (
                           <div key={msg.id} className="pending-message-card">
                             <div className="pending-message-header">
+                              <span className="pending-badge">⚠️ Awaiting Approval</span>
                               <span className="platform-badge">{msg.platform}</span>
                               <span className="recipient">To: {msg.recipient}</span>
                             </div>
@@ -3239,10 +3335,7 @@ function TasksPage() {
                             <div className="pending-message-actions">
                               {editingMessage?.messageId === msg.id ? (
                                 <>
-                                  <button
-                                    className="secondary small"
-                                    onClick={() => setEditingMessage(null)}
-                                  >
+                                  <button className="secondary small" onClick={() => setEditingMessage(null)}>
                                     Cancel Edit
                                   </button>
                                   <button
@@ -3261,10 +3354,7 @@ function TasksPage() {
                                   >
                                     Edit
                                   </button>
-                                  <button
-                                    className="danger small"
-                                    onClick={() => handleRejectMessage(task.id, msg.id)}
-                                  >
+                                  <button className="danger small" onClick={() => handleRejectMessage(task.id, msg.id)}>
                                     Discard
                                   </button>
                                   <button
@@ -3283,74 +3373,173 @@ function TasksPage() {
                     </div>
                   )}
 
-                  {/* Auto-send Toggle */}
-                  <div className="task-section auto-send-section">
-                    <label className="auto-send-toggle">
-                      <input
-                        type="checkbox"
-                        checked={task.autoSend || false}
-                        onChange={() => handleToggleAutoSend(task.id, task.autoSend || false)}
-                      />
-                      <span className="toggle-label">
-                        Auto-send messages
-                        <span className="toggle-hint">(Skip approval for future messages from this task)</span>
-                      </span>
-                    </label>
+                  {/* Tab Navigation */}
+                  <div className="task-tabs">
+                    <button
+                      className={`task-tab ${getActiveTab(task.id) === "activity" ? "active" : ""}`}
+                      onClick={() => setTaskTab(task.id, "activity")}
+                    >
+                      Recent Activity
+                    </button>
+                    <button
+                      className={`task-tab ${getActiveTab(task.id) === "plan" ? "active" : ""}`}
+                      onClick={() => setTaskTab(task.id, "plan")}
+                    >
+                      Plan
+                    </button>
+                    <button
+                      className={`task-tab ${getActiveTab(task.id) === "context" ? "active" : ""}`}
+                      onClick={() => setTaskTab(task.id, "context")}
+                    >
+                      Context
+                    </button>
+                    <button
+                      className={`task-tab ${getActiveTab(task.id) === "settings" ? "active" : ""}`}
+                      onClick={() => setTaskTab(task.id, "settings")}
+                    >
+                      Settings
+                    </button>
                   </div>
 
-                  {/* Poll Frequency Selector */}
-                  <div className="task-section poll-frequency-section">
-                    <label className="poll-frequency-label">
-                      <span>Check frequency:</span>
-                      <select 
-                        value={getPollFrequencyKey(task)}
-                        onChange={(e) => handleChangePollFrequency(task.id, e.target.value)}
-                        className="poll-frequency-select"
-                      >
-                        <option value="1min">Every 1 minute</option>
-                        <option value="5min">Every 5 minutes</option>
-                        <option value="15min">Every 15 minutes</option>
-                        <option value="30min">Every 30 minutes</option>
-                        <option value="1hour">Every hour</option>
-                        <option value="daily">Daily</option>
-                        <option value="on_login">On login only</option>
-                      </select>
-                    </label>
-                    {task.pollFrequency?.type === "event" && (
-                      <span className="poll-frequency-hint">Task will run once when you log in</span>
+                  {/* Tab Content */}
+                  <div className="task-tab-content">
+                    {/* Recent Activity Tab */}
+                    {getActiveTab(task.id) === "activity" && (
+                      <div className="tab-panel activity-panel">
+                        {task.executionLog.length > 0 ? (
+                          <ul className="execution-log">
+                            {task.executionLog.slice(-10).reverse().map((entry, index) => (
+                              <li key={index}>
+                                <span className="log-time">{formatDate(entry.timestamp)}</span>
+                                <span className="log-message">{entry.message}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="empty-state">No activity yet</p>
+                        )}
+                      </div>
                     )}
-                  </div>
 
-                  <div className="task-actions">
-                    {(task.status === "pending" || task.status === "active" || task.status === "waiting") && (
-                      <>
-                        <button 
-                          className="secondary small"
-                          onClick={() => handleExecute(task.id)}
-                          disabled={executing === task.id}
-                        >
-                          {executing === task.id ? "Running..." : "Run Now"}
-                        </button>
-                        <button 
-                          className="danger small"
-                          onClick={() => handleCancel(task.id)}
-                        >
-                          Cancel Task
-                        </button>
-                      </>
+                    {/* Plan Tab */}
+                    {getActiveTab(task.id) === "plan" && (
+                      <div className="tab-panel plan-panel">
+                        <ol className="task-plan">
+                          {task.plan.map((step, index) => (
+                            <li 
+                              key={index} 
+                              className={index + 1 === task.currentStep.step ? "current-step" : index + 1 < task.currentStep.step ? "completed-step" : ""}
+                            >
+                              {step}
+                              {index + 1 === task.currentStep.step && (
+                                <span className="current-indicator"> ← Current</span>
+                              )}
+                            </li>
+                          ))}
+                        </ol>
+                      </div>
                     )}
-                    <button 
-                      className="secondary small"
-                      onClick={() => setEditingTask(task.id)}
-                    >
-                      Edit
-                    </button>
-                    <button 
-                      className="secondary small"
-                      onClick={() => handleHide(task.id)}
-                    >
-                      Remove
-                    </button>
+
+                    {/* Context Tab */}
+                    {getActiveTab(task.id) === "context" && (
+                      <div className="tab-panel context-panel">
+                        {Object.keys(task.contextMemory).length > 0 ? (
+                          <>
+                            <div className="context-scroll-area">
+                              <ul className="context-list">
+                                {Object.entries(task.contextMemory).slice(-20).map(([key, value]) => (
+                                  <li key={key}>
+                                    <strong>{key}:</strong>{" "}
+                                    <span className="context-value">
+                                      {String(value).length > 200 ? String(value).substring(0, 200) + "..." : String(value)}
+                                    </span>
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                            {task.filePath && (
+                              <div className="context-file-link">
+                                <a href="#" onClick={(e) => { e.preventDefault(); setEditingTask(task.id); }}>
+                                  View full task file →
+                                </a>
+                              </div>
+                            )}
+                          </>
+                        ) : (
+                          <p className="empty-state">No context stored yet</p>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Settings Tab */}
+                    {getActiveTab(task.id) === "settings" && (
+                      <div className="tab-panel settings-panel">
+                        {/* Auto-send Toggle */}
+                        <div className="setting-item">
+                          <label className="setting-toggle">
+                            <input
+                              type="checkbox"
+                              checked={task.autoSend || false}
+                              onChange={() => handleToggleAutoSend(task.id, task.autoSend || false)}
+                            />
+                            <span className="toggle-label">
+                              Auto-send messages
+                              <span className="toggle-hint">Skip approval for future messages</span>
+                            </span>
+                          </label>
+                        </div>
+
+                        {/* Notifications Toggle */}
+                        <div className="setting-item">
+                          <label className="setting-toggle">
+                            <input
+                              type="checkbox"
+                              checked={task.notificationsDisabled || false}
+                              onChange={() => handleToggleNotifications(task.id, task.notificationsDisabled || false)}
+                            />
+                            <span className="toggle-label">
+                              Disable notifications
+                              <span className="toggle-hint">Stop chat alerts for this task</span>
+                            </span>
+                          </label>
+                        </div>
+
+                        {/* Poll Frequency Selector */}
+                        <div className="setting-item">
+                          <label className="setting-select">
+                            <span className="setting-label">Check frequency:</span>
+                            <select 
+                              value={getPollFrequencyKey(task)}
+                              onChange={(e) => handleChangePollFrequency(task.id, e.target.value)}
+                              className="poll-frequency-select"
+                            >
+                              <option value="1min">Every 1 minute</option>
+                              <option value="5min">Every 5 minutes</option>
+                              <option value="15min">Every 15 minutes</option>
+                              <option value="30min">Every 30 minutes</option>
+                              <option value="1hour">Every hour</option>
+                              <option value="daily">Daily</option>
+                              <option value="on_login">On login only</option>
+                            </select>
+                          </label>
+                        </div>
+
+                        {/* Action Buttons */}
+                        <div className="settings-actions">
+                          <button className="secondary small" onClick={() => setEditingTask(task.id)}>
+                            Edit Task File
+                          </button>
+                          {(task.status === "pending" || task.status === "active" || task.status === "waiting") && (
+                            <button className="danger small" onClick={() => handleCancel(task.id)}>
+                              Cancel Task
+                            </button>
+                          )}
+                          <button className="secondary small" onClick={() => handleHide(task.id)}>
+                            Remove
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
@@ -3383,7 +3572,7 @@ type Skill = {
   keywords: string[];
   procedure: string[];
   constraints: string[];
-  tools: string[];
+  // Note: tools field removed - Builder auto-selects tools
 };
 
 function SkillsPage() {
@@ -3477,76 +3666,6 @@ function SkillsPage() {
     setNewSkillId("");
   };
 
-  const [showToolsRef, setShowToolsRef] = useState(false);
-
-  // Available tools reference data
-  const availableTools = [
-    {
-      category: "Google Calendar",
-      tools: [
-        { name: "get_calendar_events", desc: "Get events from calendar (specify days)" },
-        { name: "create_calendar_event", desc: "Create event with title, time, attendees" },
-        { name: "delete_calendar_event", desc: "Delete an event by ID" },
-      ]
-    },
-    {
-      category: "Gmail",
-      tools: [
-        { name: "send_email", desc: "Send or reply to an email" },
-        { name: "list_emails", desc: "List recent emails (optionally filter by from/to)" },
-        { name: "search_emails", desc: "Search emails by query" },
-        { name: "get_email_content", desc: "Get full content of a specific email" },
-        { name: "create_draft", desc: "Create an email draft" },
-      ]
-    },
-    {
-      category: "iMessage (macOS)",
-      tools: [
-        { name: "send_imessage", desc: "Send a text message to a contact" },
-        { name: "lookup_contact", desc: "Find contact by name, returns phone number" },
-        { name: "get_recent_messages", desc: "Get recent messages with a contact" },
-      ]
-    },
-    {
-      category: "Slack",
-      tools: [
-        { name: "send_slack_message", desc: "Send message to channel or user" },
-        { name: "list_slack_channels", desc: "List available channels" },
-        { name: "list_slack_messages", desc: "Get messages from a channel" },
-        { name: "search_slack_users", desc: "Find Slack users by name" },
-      ]
-    },
-    {
-      category: "Weather",
-      tools: [
-        { name: "get_current_weather", desc: "Current conditions for a location" },
-        { name: "get_weather_forecast", desc: "Multi-day forecast" },
-        { name: "search_location", desc: "Find location coordinates" },
-      ]
-    },
-    {
-      category: "Tasks",
-      tools: [
-        { name: "create_task", desc: "Create an autonomous background task" },
-        { name: "list_tasks", desc: "List all active tasks" },
-        { name: "cancel_task", desc: "Cancel a running task" },
-      ]
-    },
-    {
-      category: "Browser Automation",
-      tools: [
-        { name: "browser_navigate", desc: "Navigate to a URL and return page snapshot" },
-        { name: "browser_snapshot", desc: "Get current page screenshot and element refs" },
-        { name: "browser_click", desc: "Click an element by its ref (e.g., 'e5')" },
-        { name: "browser_type", desc: "Type text into an input field" },
-        { name: "browser_press", desc: "Press keyboard key (Enter, Tab, etc.)" },
-        { name: "browser_scroll", desc: "Scroll page up or down" },
-        { name: "browser_back", desc: "Navigate back to previous page" },
-        { name: "browser_fill_credential", desc: "Securely fill login form with saved credential" },
-      ]
-    },
-  ];
-
   // Editing/Creating modal
   if (editingSkill || isCreating) {
     return (
@@ -3596,45 +3715,16 @@ keyword1, keyword2
 2. Second step
 
 ## Constraints
-- Important rule
-
-## Tools
-tool1, tool2`}</pre>
+- Important rule`}</pre>
               </div>
               
-              <div className="tools-reference">
-                <button 
-                  className="tools-reference-toggle"
-                  onClick={() => setShowToolsRef(!showToolsRef)}
-                >
-                  {showToolsRef ? "▼" : "▶"} Available Tools Reference
-                </button>
-                
-                {showToolsRef && (
-                  <div className="tools-reference-content">
-                    {availableTools.map(category => (
-                      <div key={category.category} className="tool-category">
-                        <h5>{category.category}</h5>
-                        <ul>
-                          {category.tools.map(tool => (
-                            <li key={tool.name}>
-                              <code 
-                                className="tool-name" 
-                                onClick={() => {
-                                  navigator.clipboard.writeText(tool.name);
-                                }}
-                                title="Click to copy"
-                              >
-                                {tool.name}
-                              </code>
-                              <span className="tool-desc">{tool.desc}</span>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    ))}
-                  </div>
-                )}
+              <div className="editor-info">
+                <p><strong>How Skills Work:</strong></p>
+                <ul>
+                  <li>Skills provide domain expertise to the Architect</li>
+                  <li>Constraints are enforced by the Builder</li>
+                  <li>Tools are auto-selected - no need to specify</li>
+                </ul>
               </div>
             </div>
           </div>
@@ -3649,8 +3739,8 @@ tool1, tool2`}</pre>
         <div>
           <h1>Skills Library</h1>
           <p className="page-description">
-            Skills provide procedural knowledge for the AI. In chat, skills give advisory guidance. 
-            In tasks, skills become execution plans.
+            Skills provide domain knowledge and constraints. The Architect uses procedures as guidance, 
+            while the Builder enforces constraints during tool selection.
           </p>
         </div>
         <button className="btn-primary" onClick={handleCreate}>+ New Skill</button>
@@ -3708,15 +3798,6 @@ tool1, tool2`}</pre>
                     ))}
                     {skill.constraints.length > 2 && <li className="more">...and {skill.constraints.length - 2} more</li>}
                   </ul>
-                </div>
-              )}
-              
-              {skill.tools.length > 0 && (
-                <div className="skill-tools">
-                  <span className="tools-label">Tools:</span>
-                  {skill.tools.map((tool, i) => (
-                    <code key={i} className="tool-name">{tool}</code>
-                  ))}
                 </div>
               )}
             </div>
@@ -5931,6 +6012,10 @@ export default function App() {
   
   // Pending task approvals count (for notification badge)
   const [pendingApprovalsCount, setPendingApprovalsCount] = useState(0);
+  
+  // Onboarding resume banner state
+  const [showOnboardingBanner, setShowOnboardingBanner] = useState(false);
+  const [onboardingStatus, setOnboardingStatus] = useState<OnboardingStatus | null>(null);
 
   // Check auth session on mount
   useEffect(() => {
@@ -5953,6 +6038,49 @@ export default function App() {
   const handleLogin = (user: AuthUser) => {
     setCurrentUser(user);
     setIsLoggedIn(true);
+  };
+
+  // Check onboarding status when logged in
+  useEffect(() => {
+    if (!isLoggedIn) return;
+    
+    const checkOnboarding = async () => {
+      try {
+        const status = await window.wovly.onboarding.getStatus();
+        if (status.ok) {
+          setOnboardingStatus(status);
+          // Show banner if onboarding not completed
+          if (status.stage !== "completed") {
+            setShowOnboardingBanner(true);
+          }
+        }
+      } catch (err) {
+        console.error("[Onboarding] Status check failed:", err);
+      }
+    };
+    checkOnboarding();
+  }, [isLoggedIn]);
+
+  const handleResumeOnboarding = () => {
+    setShowOnboardingBanner(false);
+    setNavItem("chat");
+    // Reset chat to regenerate the welcome message with onboarding context
+    setChatMessages([]);
+    setChatInitialized(false);
+  };
+
+  const handleDismissOnboardingBanner = async () => {
+    setShowOnboardingBanner(false);
+  };
+
+  const handleSkipOnboarding = async () => {
+    try {
+      await window.wovly.onboarding.skip();
+      setShowOnboardingBanner(false);
+      setOnboardingStatus(prev => prev ? { ...prev, stage: "completed" } : null);
+    } catch (err) {
+      console.error("[Onboarding] Skip failed:", err);
+    }
   };
 
   const handleLogout = async () => {
@@ -6162,6 +6290,27 @@ export default function App() {
       </nav>
 
       <main className="main-content">
+        {/* Onboarding Resume Banner */}
+        {showOnboardingBanner && onboardingStatus && onboardingStatus.stage !== "completed" && navItem !== "chat" && (
+          <div className="onboarding-resume-banner">
+            <div className="banner-content">
+              <span className="banner-icon">🚀</span>
+              <span className="banner-text">Welcome back! Want to continue setting up Wovly?</span>
+            </div>
+            <div className="banner-actions">
+              <button className="btn-resume" onClick={handleResumeOnboarding}>
+                Continue
+              </button>
+              <button className="btn-dismiss" onClick={handleDismissOnboardingBanner}>
+                Later
+              </button>
+              <button className="btn-dismiss" onClick={handleSkipOnboarding}>
+                Skip
+              </button>
+            </div>
+          </div>
+        )}
+        
         {navItem === "chat" && (
           <div className="content-grid">
             <AgendaPanel />
@@ -6170,6 +6319,7 @@ export default function App() {
               setMessages={setChatMessages}
               initialized={chatInitialized}
               setInitialized={setChatInitialized}
+              onNavigate={setNavItem}
             />
           </div>
         )}

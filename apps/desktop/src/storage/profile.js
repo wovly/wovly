@@ -44,11 +44,15 @@ const getUserProfilePath = async (username) => {
 ## System
 - **User ID**: ${userId}
 - **Created**: ${new Date().toISOString()}
-- **Onboarding Completed**: false
+- **Onboarding Stage**: api_setup
+- **Onboarding Skipped At**: 
 `;
   await fs.writeFile(profilePath, defaultProfile, "utf8");
   return profilePath;
 };
+
+// Valid onboarding stages
+const ONBOARDING_STAGES = ["api_setup", "profile", "task_demo", "skill_demo", "integrations", "completed"];
 
 // Parse user profile markdown
 const parseUserProfile = (markdown) => {
@@ -62,7 +66,8 @@ const parseUserProfile = (markdown) => {
     homeLife: "",
     userId: "",
     created: "",
-    onboardingCompleted: false,
+    onboardingStage: "api_setup", // Default to api_setup for new users
+    onboardingSkippedAt: null,
     notes: [] // Custom facts and notes
   };
 
@@ -106,7 +111,20 @@ const parseUserProfile = (markdown) => {
         case "Home Life": profile.homeLife = value; break;
         case "User ID": profile.userId = value; break;
         case "Created": profile.created = value; break;
-        case "Onboarding Completed": profile.onboardingCompleted = value.toLowerCase() === "true"; break;
+        // Legacy field - convert to new stage system
+        case "Onboarding Completed": 
+          if (value.toLowerCase() === "true") {
+            profile.onboardingStage = "completed";
+          }
+          break;
+        case "Onboarding Stage": 
+          if (ONBOARDING_STAGES.includes(value)) {
+            profile.onboardingStage = value;
+          }
+          break;
+        case "Onboarding Skipped At":
+          profile.onboardingSkippedAt = value || null;
+          break;
       }
     }
   }
@@ -142,7 +160,8 @@ const serializeUserProfile = (profile) => {
 ## System
 - **User ID**: ${profile.userId || ""}
 - **Created**: ${profile.created || ""}
-- **Onboarding Completed**: ${profile.onboardingCompleted ? "true" : "false"}
+- **Onboarding Stage**: ${profile.onboardingStage || "api_setup"}
+- **Onboarding Skipped At**: ${profile.onboardingSkippedAt || ""}
 `;
 
   return markdown;
@@ -151,5 +170,6 @@ const serializeUserProfile = (profile) => {
 module.exports = {
   getUserProfilePath,
   parseUserProfile,
-  serializeUserProfile
+  serializeUserProfile,
+  ONBOARDING_STAGES
 };
