@@ -756,8 +756,17 @@ const startTaskScheduler = () => {
                 }
               }
               
-              // Check if we have a valid conversation ID (not null or string "null")
-              const hasValidConversationId = conversationId && conversationId !== "null" && conversationId !== "undefined";
+              // Check if we have a valid conversation ID (not null, string "null", or unresolved template)
+              const isUnresolvedTemplate = typeof conversationId === 'string' && 
+                conversationId.startsWith('{{') && conversationId.endsWith('}}');
+              const hasValidConversationId = conversationId && 
+                conversationId !== "null" && 
+                conversationId !== "undefined" && 
+                !isUnresolvedTemplate;
+              
+              if (isUnresolvedTemplate) {
+                console.log(`[Tasks] WARNING: conversation_id is unresolved template "${conversationId}" - will match any thread`);
+              }
               console.log(`[Tasks] Checking ${integration.name} for reply from ${waitingForContact}${hasValidConversationId ? ` (thread: ${conversationId})` : ' (any thread)'}`);
               
               // Normalize: pass null if conversationId is invalid string
@@ -10174,7 +10183,18 @@ Generate ONLY the welcome message, nothing else.`;
           // Handle wait_for_reply action - sets up polling for message replies
           if (toolResult && toolResult.action === "wait_for_reply") {
             const pollIntervalMs = (toolResult.poll_interval_minutes || 5) * 60000;
-            const effectiveConversationId = toolResult.conversation_id || task.contextMemory?.conversation_id || null;
+            
+            // Check if conversation_id is an unresolved template variable (e.g., "{{step_1.threadId}}")
+            // If so, fall back to the captured value in contextMemory
+            let effectiveConversationId = toolResult.conversation_id;
+            if (!effectiveConversationId || 
+                (typeof effectiveConversationId === 'string' && effectiveConversationId.startsWith('{{') && effectiveConversationId.endsWith('}}'))) {
+              effectiveConversationId = task.contextMemory?.conversation_id || null;
+              if (toolResult.conversation_id?.startsWith('{{')) {
+                console.log(`[Tasks] conversation_id was unresolved template "${toolResult.conversation_id}", using captured value: ${effectiveConversationId}`);
+              }
+            }
+            
             console.log(`[Tasks] Task ${taskId} waiting for reply from ${toolResult.contact} via ${toolResult.platform}`);
             console.log(`[Tasks] Poll interval: ${pollIntervalMs}ms, Followup after: ${toolResult.followup_after_hours}h, Max: ${toolResult.max_followups}`);
             console.log(`[Tasks] Using conversation_id: ${effectiveConversationId || '(none - will match any email from contact)'}`);
@@ -10196,7 +10216,7 @@ Generate ONLY the welcome message, nothing else.`;
                 waiting_for_contact: toolResult.contact,
                 original_request: toolResult.original_request,
                 success_criteria: toolResult.success_criteria,
-                conversation_id: toolResult.conversation_id || task.contextMemory?.conversation_id || null,
+                conversation_id: effectiveConversationId,
                 // Timing
                 first_message_time: task.contextMemory?.first_message_time || new Date().toISOString(),
                 last_message_time: new Date().toISOString(),
@@ -10805,7 +10825,18 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
             // Handle wait_for_reply action - sets up polling for message replies
             if (toolResult && toolResult.action === "wait_for_reply") {
               const pollIntervalMs = (toolResult.poll_interval_minutes || 5) * 60000;
-              const effectiveConversationId = toolResult.conversation_id || task.contextMemory?.conversation_id || null;
+              
+              // Check if conversation_id is an unresolved template variable (e.g., "{{step_1.threadId}}")
+              // If so, fall back to the captured value in contextMemory
+              let effectiveConversationId = toolResult.conversation_id;
+              if (!effectiveConversationId || 
+                  (typeof effectiveConversationId === 'string' && effectiveConversationId.startsWith('{{') && effectiveConversationId.endsWith('}}'))) {
+                effectiveConversationId = task.contextMemory?.conversation_id || null;
+                if (toolResult.conversation_id?.startsWith('{{')) {
+                  console.log(`[Tasks] conversation_id was unresolved template "${toolResult.conversation_id}", using captured value: ${effectiveConversationId}`);
+                }
+              }
+              
               console.log(`[Tasks] Task ${taskId} waiting for reply from ${toolResult.contact} via ${toolResult.platform}`);
               console.log(`[Tasks] Using conversation_id: ${effectiveConversationId || '(none - will match any email from contact)'}`);
               
@@ -10824,7 +10855,7 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
                   waiting_for_contact: toolResult.contact,
                   original_request: toolResult.original_request,
                   success_criteria: toolResult.success_criteria,
-                  conversation_id: toolResult.conversation_id || task.contextMemory?.conversation_id || null,
+                  conversation_id: effectiveConversationId,
                   first_message_time: task.contextMemory?.first_message_time || new Date().toISOString(),
                   last_message_time: new Date().toISOString(),
                   poll_interval_minutes: toolResult.poll_interval_minutes || 5,

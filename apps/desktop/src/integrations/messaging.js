@@ -270,10 +270,11 @@ const checkForNewEmails = async (accessToken, fromEmail, afterTimestamp, threadI
         if (msgResponse.ok) {
           const msgData = await msgResponse.json();
           
-          // If threadId is specified (and not null/"null"), filter to only messages in the same thread
+          // If threadId is specified (and not null/"null"/unresolved template), filter to only messages in the same thread
           // This ensures we only detect replies to our original email, not other emails from this contact
-          // Note: threadId can be actual null, string "null", or undefined - all mean "don't filter by thread"
-          const hasValidThreadId = threadId && threadId !== "null" && threadId !== "undefined";
+          // Note: threadId can be actual null, string "null", undefined, or unresolved template - all mean "don't filter by thread"
+          const isUnresolvedTemplate = typeof threadId === 'string' && threadId.startsWith('{{') && threadId.endsWith('}}');
+          const hasValidThreadId = threadId && threadId !== "null" && threadId !== "undefined" && !isUnresolvedTemplate;
           if (hasValidThreadId && msgData.threadId !== threadId) {
             console.log(`[Messaging] Skipping email ${msg.id} - different thread (${msgData.threadId} vs ${threadId})`);
             continue;
