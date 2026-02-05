@@ -756,12 +756,17 @@ const startTaskScheduler = () => {
                 }
               }
               
-              console.log(`[Tasks] Checking ${integration.name} for reply from ${waitingForContact}${conversationId ? ` (conversation: ${conversationId})` : ''}`);
+              // Check if we have a valid conversation ID (not null or string "null")
+              const hasValidConversationId = conversationId && conversationId !== "null" && conversationId !== "undefined";
+              console.log(`[Tasks] Checking ${integration.name} for reply from ${waitingForContact}${hasValidConversationId ? ` (thread: ${conversationId})` : ' (any thread)'}`);
+              
+              // Normalize: pass null if conversationId is invalid string
+              const threadIdToPass = hasValidConversationId ? conversationId : null;
               const check = await integration.checkForNewMessages(
                 waitingForContact, 
                 new Date(lastMessageTime).getTime(),
                 accessToken,
-                conversationId  // Pass conversation ID for thread-specific filtering
+                threadIdToPass  // Pass null if no valid thread ID, so it matches ANY email from contact
               );
               
               if (!check.hasNew) {
