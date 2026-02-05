@@ -5390,6 +5390,18 @@ Generate ONLY the welcome message, nothing else.`;
                            currentStepDesc.includes('follow up') ||
                            currentStepDesc.includes('until');
       
+      console.log(`[Tasks] DEBUG approvePendingMessage: currentStepDesc = "${currentStepDesc}", isWaitingStep = ${isWaitingStep}`);
+      
+      // Capture conversation/thread ID from send result BEFORE the branching logic
+      // This ensures it's available for both waiting and non-waiting steps
+      const conversationId = sendResult?.chatId ||     // iMessage chat_id
+                             sendResult?.channel ||    // Slack channel
+                             sendResult?.threadId ||   // Email thread
+                             null;
+      
+      console.log(`[Tasks] DEBUG approvePendingMessage: sendResult =`, JSON.stringify(sendResult).slice(0, 300));
+      console.log(`[Tasks] DEBUG approvePendingMessage: captured conversationId = ${conversationId}`);
+      
       if (task.pendingMessages.length === 0) {
         if (isWaitingStep) {
           // This step requires waiting for a response - don't advance
@@ -5400,13 +5412,6 @@ Generate ONLY the welcome message, nothing else.`;
           // Use the task's poll frequency or default to 5 minutes
           const pollInterval = task.pollFrequency?.value || 300000; // Default 5 minutes
           task.nextCheck = Date.now() + pollInterval;
-          
-          // Capture conversation/thread ID from send result for thread-specific reply checking
-          // This ensures we only monitor replies in THIS conversation, not from other threads
-          const conversationId = sendResult?.chatId ||     // iMessage chat_id
-                                 sendResult?.channel ||    // Slack channel
-                                 sendResult?.threadId ||   // Email thread
-                                 null;
           
           // Store context about what we're waiting for
           task.contextMemory = {
@@ -5419,6 +5424,8 @@ Generate ONLY the welcome message, nothing else.`;
             ...(conversationId ? { conversation_id: conversationId } : {})
           };
           
+          console.log(`[Tasks] DEBUG approvePendingMessage: contextMemory.conversation_id = ${task.contextMemory.conversation_id}`);
+          
           console.log(`[Tasks] Message sent for waiting step "${currentStepDesc}" - staying on step ${task.currentStep.step}, waiting for response${conversationId ? ` (conversation: ${conversationId})` : ''}, next check in ${pollInterval/1000}s`);
           
           task.executionLog.push({
@@ -5428,6 +5435,17 @@ Generate ONLY the welcome message, nothing else.`;
         } else {
           // Non-waiting step - can advance (e.g., simple notification)
           task.status = "active";
+          
+          // IMPORTANT: Still capture the conversation_id for any subsequent wait_for_reply steps
+          // This ensures the next step has access to the threadId even if current step doesn't wait
+          if (conversationId) {
+            task.contextMemory = {
+              ...task.contextMemory,
+              conversation_id: conversationId,
+              last_message_time: new Date().toISOString()
+            };
+            console.log(`[Tasks] Captured conversation_id ${conversationId} for next step`);
+          }
           
           const currentStep = task.currentStep.step;
           const nextStep = currentStep + 1;
@@ -10144,6 +10162,12 @@ Generate ONLY the welcome message, nothing else.`;
           const conversationIdFromResult = toolResult?.threadId || toolResult?.chatId || toolResult?.channel || toolResult?.chat_id || toolResult?.channel_id;
           const isMessagingTool = ["send_email", "send_imessage", "send_slack_message", "send_telegram_message", "send_discord_message"].includes(tool);
           
+          // Debug logging for messaging tools
+          if (isMessagingTool) {
+            console.log(`[Tasks] DEBUG: ${tool} result:`, JSON.stringify(toolResult).slice(0, 300));
+            console.log(`[Tasks] DEBUG: conversationIdFromResult = ${conversationIdFromResult}`);
+          }
+          
           if (toolResult && conversationIdFromResult && isMessagingTool) {
             console.log(`[Tasks] Captured conversation_id from ${tool}: ${conversationIdFromResult}`);
             task.contextMemory = {
@@ -10184,14 +10208,24 @@ Generate ONLY the welcome message, nothing else.`;
           if (toolResult && toolResult.action === "wait_for_reply") {
             const pollIntervalMs = (toolResult.poll_interval_minutes || 5) * 60000;
             
+            // Helper to check if a value is an unresolved template
+            const isUnresolvedTemplate = (val) => 
+              typeof val === 'string' && val.startsWith('{{') && val.endsWith('}}');
+            
             // Check if conversation_id is an unresolved template variable (e.g., "{{step_1.threadId}}")
-            // If so, fall back to the captured value in contextMemory
+            // If so, fall back to the captured value in contextMemory (also checking if THAT is valid)
             let effectiveConversationId = toolResult.conversation_id;
-            if (!effectiveConversationId || 
-                (typeof effectiveConversationId === 'string' && effectiveConversationId.startsWith('{{') && effectiveConversationId.endsWith('}}'))) {
-              effectiveConversationId = task.contextMemory?.conversation_id || null;
-              if (toolResult.conversation_id?.startsWith('{{')) {
-                console.log(`[Tasks] conversation_id was unresolved template "${toolResult.conversation_id}", using captured value: ${effectiveConversationId}`);
+            
+            if (!effectiveConversationId || isUnresolvedTemplate(effectiveConversationId)) {
+              // Fall back to contextMemory, but ONLY if contextMemory value is also valid
+              const ctxConvId = task.contextMemory?.conversation_id;
+              if (ctxConvId && !isUnresolvedTemplate(ctxConvId)) {
+                effectiveConversationId = ctxConvId;
+                console.log(`[Tasks] conversation_id "${toolResult.conversation_id}" not valid, using captured value: ${effectiveConversationId}`);
+              } else {
+                // Both are invalid - use null (will match any message from contact)
+                effectiveConversationId = null;
+                console.log(`[Tasks] No valid conversation_id available (from tool: "${toolResult.conversation_id}", from context: "${ctxConvId}") - will match any message from contact`);
               }
             }
             
@@ -10826,18 +10860,29 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
             if (toolResult && toolResult.action === "wait_for_reply") {
               const pollIntervalMs = (toolResult.poll_interval_minutes || 5) * 60000;
               
+              // Helper to check if a value is an unresolved template
+              const isUnresolvedTemplate = (val) => 
+                typeof val === 'string' && val.startsWith('{{') && val.endsWith('}}');
+              
               // Check if conversation_id is an unresolved template variable (e.g., "{{step_1.threadId}}")
-              // If so, fall back to the captured value in contextMemory
+              // If so, fall back to the captured value in contextMemory (also checking if THAT is valid)
               let effectiveConversationId = toolResult.conversation_id;
-              if (!effectiveConversationId || 
-                  (typeof effectiveConversationId === 'string' && effectiveConversationId.startsWith('{{') && effectiveConversationId.endsWith('}}'))) {
-                effectiveConversationId = task.contextMemory?.conversation_id || null;
-                if (toolResult.conversation_id?.startsWith('{{')) {
-                  console.log(`[Tasks] conversation_id was unresolved template "${toolResult.conversation_id}", using captured value: ${effectiveConversationId}`);
+              
+              if (!effectiveConversationId || isUnresolvedTemplate(effectiveConversationId)) {
+                // Fall back to contextMemory, but ONLY if contextMemory value is also valid
+                const ctxConvId = task.contextMemory?.conversation_id;
+                if (ctxConvId && !isUnresolvedTemplate(ctxConvId)) {
+                  effectiveConversationId = ctxConvId;
+                  console.log(`[Tasks] conversation_id "${toolResult.conversation_id}" not valid, using captured value: ${effectiveConversationId}`);
+                } else {
+                  // Both are invalid - use null (will match any message from contact)
+                  effectiveConversationId = null;
+                  console.log(`[Tasks] No valid conversation_id available (from tool: "${toolResult.conversation_id}", from context: "${ctxConvId}") - will match any message from contact`);
                 }
               }
               
               console.log(`[Tasks] Task ${taskId} waiting for reply from ${toolResult.contact} via ${toolResult.platform}`);
+              console.log(`[Tasks] Poll interval: ${pollIntervalMs}ms, Followup after: ${toolResult.followup_after_hours}h, Max: ${toolResult.max_followups}`);
               console.log(`[Tasks] Using conversation_id: ${effectiveConversationId || '(none - will match any email from contact)'}`);
               
               await updateTask(taskId, {
