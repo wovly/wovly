@@ -7256,8 +7256,13 @@ Generate ONLY the welcome message, nothing else.`;
             channelId = channel.id;
           }
 
-          await sendSlackMessage(accessToken, channelId, message);
-          return { success: true, message: `Message sent to ${toolInput.channel}` };
+          const sendResult = await sendSlackMessage(accessToken, channelId, message);
+          return { 
+            success: true, 
+            message: `Message sent to ${toolInput.channel}`,
+            channel: channelId,  // Return the resolved channel ID for conversation tracking
+            ts: sendResult?.ts   // Slack message timestamp (can be used for thread replies)
+          };
         }
 
         case "search_slack_users": {
@@ -7370,7 +7375,12 @@ Generate ONLY the welcome message, nothing else.`;
           if (!data.ok) {
             return { error: data.description || "Failed to send message" };
           }
-          return { success: true, message: `Message sent to ${toolInput.chat_id}`, message_id: data.result.message_id };
+          return { 
+            success: true, 
+            message: `Message sent to ${toolInput.chat_id}`, 
+            message_id: data.result.message_id,
+            chat_id: toolInput.chat_id  // Return chat_id for conversation tracking
+          };
         }
 
         case "get_telegram_updates": {
@@ -7548,7 +7558,12 @@ Generate ONLY the welcome message, nothing else.`;
             return { error: err.message || "Failed to send message" };
           }
           const data = await response.json();
-          return { success: true, message: `Message sent`, message_id: data.id };
+          return { 
+            success: true, 
+            message: `Message sent`, 
+            message_id: data.id,
+            channel_id: toolInput.channel_id  // Return channel_id for conversation tracking
+          };
         }
 
         case "get_discord_messages": {
@@ -10106,15 +10121,19 @@ Generate ONLY the welcome message, nothing else.`;
             lastScreenshot = toolResult.screenshot;
           }
           
-          // Capture threadId from email sends for later use by wait_for_reply
-          // Gmail returns threadId when sending emails - we need this to filter replies to the same conversation
-          if (toolResult && toolResult.threadId && tool === "send_email") {
-            console.log(`[Tasks] Captured email threadId: ${toolResult.threadId}`);
+          // Capture conversation_id from ANY messaging tool for later use by wait_for_reply
+          // Each platform returns its own identifier: threadId (email), chatId (iMessage), channel (Slack), chat_id (Telegram), channel_id (Discord)
+          const conversationIdFromResult = toolResult?.threadId || toolResult?.chatId || toolResult?.channel || toolResult?.chat_id || toolResult?.channel_id;
+          const isMessagingTool = ["send_email", "send_imessage", "send_slack_message", "send_telegram_message", "send_discord_message"].includes(tool);
+          
+          if (toolResult && conversationIdFromResult && isMessagingTool) {
+            console.log(`[Tasks] Captured conversation_id from ${tool}: ${conversationIdFromResult}`);
             task.contextMemory = {
               ...task.contextMemory,
-              conversation_id: toolResult.threadId,
-              last_email_thread_id: toolResult.threadId,
-              last_email_message_id: toolResult.messageId
+              conversation_id: conversationIdFromResult,
+              // Also store platform-specific fields for debugging
+              [`last_${tool.replace('send_', '')}_conversation_id`]: conversationIdFromResult,
+              last_message_id: toolResult.messageId || toolResult.message_id
             };
             // Persist to database immediately so it's available for wait_for_reply
             await updateTask(taskId, {
@@ -10732,14 +10751,17 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
             };
             toolResult = await executeTool(toolUse.name, toolUse.input, taskContext);
             
-            // Capture threadId from email sends for later use by wait_for_reply
-            if (toolResult && toolResult.threadId && toolUse.name === "send_email") {
-              console.log(`[Tasks] Captured email threadId: ${toolResult.threadId}`);
+            // Capture conversation_id from ANY messaging tool for later use by wait_for_reply
+            const conversationIdFromResult = toolResult?.threadId || toolResult?.chatId || toolResult?.channel || toolResult?.chat_id || toolResult?.channel_id;
+            const isMessagingTool = ["send_email", "send_imessage", "send_slack_message", "send_telegram_message", "send_discord_message"].includes(toolUse.name);
+            
+            if (toolResult && conversationIdFromResult && isMessagingTool) {
+              console.log(`[Tasks] Captured conversation_id from ${toolUse.name}: ${conversationIdFromResult}`);
               task.contextMemory = {
                 ...task.contextMemory,
-                conversation_id: toolResult.threadId,
-                last_email_thread_id: toolResult.threadId,
-                last_email_message_id: toolResult.messageId
+                conversation_id: conversationIdFromResult,
+                [`last_${toolUse.name.replace('send_', '')}_conversation_id`]: conversationIdFromResult,
+                last_message_id: toolResult.messageId || toolResult.message_id
               };
               await updateTask(taskId, {
                 contextMemory: task.contextMemory
