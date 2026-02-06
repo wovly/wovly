@@ -594,12 +594,65 @@ async function sendFollowupMessage(params, username) {
           return { success: false, error: "Google credentials not available for email follow-up" };
         }
         
-        // Build email content
-        const subject = conversationId 
-          ? `Re: ${task?.contextMemory?.original_subject || task?.contextMemory?.original_request?.substring(0, 50) || "Follow-up"}`
+        // To properly reply in the same thread, we need to fetch the latest message
+        // in the thread to get its Message-ID header and original subject
+        let replyToMessageId = task?.contextMemory?.last_message_id;
+        let originalSubject = task?.contextMemory?.original_subject;
+        
+        // If we have a threadId, fetch the latest message to get proper threading info
+        if (conversationId) {
+          try {
+            // Get all messages in the thread
+            const threadResponse = await fetch(
+              `https://gmail.googleapis.com/gmail/v1/users/me/threads/${conversationId}?format=metadata&metadataHeaders=Message-ID&metadataHeaders=Subject`,
+              { headers: { "Authorization": `Bearer ${googleAccessToken}` } }
+            );
+            
+            if (threadResponse.ok) {
+              const threadData = await threadResponse.json();
+              const messages = threadData.messages || [];
+              
+              if (messages.length > 0) {
+                // Get the latest message in the thread
+                const latestMessage = messages[messages.length - 1];
+                const headers = latestMessage.payload?.headers || [];
+                
+                // Extract Message-ID for In-Reply-To header
+                const messageIdHeader = headers.find(h => h.name.toLowerCase() === 'message-id');
+                if (messageIdHeader) {
+                  replyToMessageId = messageIdHeader.value;
+                }
+                
+                // Extract Subject (use first message for original subject)
+                if (!originalSubject) {
+                  const firstMessage = messages[0];
+                  const firstHeaders = firstMessage.payload?.headers || [];
+                  const subjectHeader = firstHeaders.find(h => h.name.toLowerCase() === 'subject');
+                  if (subjectHeader) {
+                    originalSubject = subjectHeader.value.replace(/^Re:\s*/i, ''); // Remove existing Re: prefix
+                  }
+                }
+              }
+            }
+          } catch (err) {
+            console.log(`[WaitForReply] Warning: Could not fetch thread info: ${err.message}`);
+          }
+        }
+        
+        // Build subject - ensure it starts with "Re: " for proper threading
+        const subject = originalSubject 
+          ? `Re: ${originalSubject}`
           : `Re: ${task?.contextMemory?.original_request?.substring(0, 50) || "Follow-up"}`;
         
+        // Build email content with proper headers for threading
         let emailContent = `To: ${contact}\r\n`;
+        
+        // Add In-Reply-To and References headers for proper threading
+        if (replyToMessageId) {
+          emailContent += `In-Reply-To: ${replyToMessageId}\r\n`;
+          emailContent += `References: ${replyToMessageId}\r\n`;
+        }
+        
         emailContent += `Subject: ${subject}\r\n`;
         emailContent += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
         emailContent += message;
@@ -612,6 +665,8 @@ async function sendFollowupMessage(params, username) {
         if (conversationId) {
           requestBody.threadId = conversationId;
         }
+        
+        console.log(`[WaitForReply] Sending reply in thread ${conversationId}, subject: "${subject}", replyTo: ${replyToMessageId?.substring(0, 30)}...`);
         
         const response = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
           method: "POST",
@@ -630,7 +685,7 @@ async function sendFollowupMessage(params, username) {
         const apiResult = await response.json();
         result = { 
           success: true, 
-          message: `Follow-up email sent to ${contact}`,
+          message: `Follow-up email sent to ${contact} (thread: ${apiResult.threadId})`,
           messageId: apiResult.id,
           threadId: apiResult.threadId
         };
@@ -5458,7 +5513,13 @@ Generate ONLY the welcome message, nothing else.`;
             last_message_time: new Date().toISOString(),
             new_reply_detected: false,
             // Store conversation ID for thread-specific reply checking
-            ...(conversationId ? { conversation_id: conversationId } : {})
+            ...(conversationId ? { conversation_id: conversationId } : {}),
+            // Store original subject for email threading (strip "Re: " prefix if present)
+            ...(pendingMsg.platform === 'email' && pendingMsg.subject ? { 
+              original_subject: pendingMsg.subject.replace(/^Re:\s*/i, '') 
+            } : {}),
+            // Store message ID from send result for reply threading
+            ...(sendResult?.messageId ? { last_message_id: sendResult.messageId } : {})
           };
           
           console.log(`[Tasks] DEBUG approvePendingMessage: contextMemory.conversation_id = ${task.contextMemory.conversation_id}`);
@@ -5475,11 +5536,17 @@ Generate ONLY the welcome message, nothing else.`;
           
           // IMPORTANT: Still capture the conversation_id for any subsequent wait_for_reply steps
           // This ensures the next step has access to the threadId even if current step doesn't wait
-          if (conversationId) {
+          if (conversationId || pendingMsg.platform === 'email') {
             task.contextMemory = {
               ...task.contextMemory,
-              conversation_id: conversationId,
-              last_message_time: new Date().toISOString()
+              ...(conversationId ? { conversation_id: conversationId } : {}),
+              last_message_time: new Date().toISOString(),
+              // Store original subject for email threading
+              ...(pendingMsg.platform === 'email' && pendingMsg.subject ? { 
+                original_subject: pendingMsg.subject.replace(/^Re:\s*/i, '') 
+              } : {}),
+              // Store message ID from send result for reply threading
+              ...(sendResult?.messageId ? { last_message_id: sendResult.messageId } : {})
             };
             console.log(`[Tasks] Captured conversation_id ${conversationId} for next step`);
           }
@@ -10212,7 +10279,11 @@ Generate ONLY the welcome message, nothing else.`;
               conversation_id: conversationIdFromResult,
               // Also store platform-specific fields for debugging
               [`last_${tool.replace('send_', '')}_conversation_id`]: conversationIdFromResult,
-              last_message_id: toolResult.messageId || toolResult.message_id
+              last_message_id: toolResult.messageId || toolResult.message_id,
+              // Store original subject for email threading (strip "Re: " prefix if present)
+              ...(tool === 'send_email' && resolvedArgs?.subject ? { 
+                original_subject: resolvedArgs.subject.replace(/^Re:\s*/i, '') 
+              } : {})
             };
             // Persist to database immediately so it's available for wait_for_reply
             await updateTask(taskId, {
@@ -10861,7 +10932,11 @@ IMPORTANT: Only advance if the step's condition is truly met. A reply alone does
                 ...task.contextMemory,
                 conversation_id: conversationIdFromResult,
                 [`last_${toolUse.name.replace('send_', '')}_conversation_id`]: conversationIdFromResult,
-                last_message_id: toolResult.messageId || toolResult.message_id
+                last_message_id: toolResult.messageId || toolResult.message_id,
+                // Store original subject for email threading (strip "Re: " prefix if present)
+                ...(toolUse.name === 'send_email' && toolUse.input?.subject ? { 
+                  original_subject: toolUse.input.subject.replace(/^Re:\s*/i, '') 
+                } : {})
               };
               await updateTask(taskId, {
                 contextMemory: task.contextMemory
