@@ -594,24 +594,46 @@ async function sendFollowupMessage(params, username) {
           return { success: false, error: "Google credentials not available for email follow-up" };
         }
         
-        // Send reply to the same thread
-        const { sendEmail, sendReply } = require("./src/integrations/google-integration");
+        // Build email content
+        const subject = conversationId 
+          ? `Re: ${task?.contextMemory?.original_subject || task?.contextMemory?.original_request?.substring(0, 50) || "Follow-up"}`
+          : `Re: ${task?.contextMemory?.original_request?.substring(0, 50) || "Follow-up"}`;
         
+        let emailContent = `To: ${contact}\r\n`;
+        emailContent += `Subject: ${subject}\r\n`;
+        emailContent += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
+        emailContent += message;
+        
+        const encodedEmail = Buffer.from(emailContent).toString("base64")
+          .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+        
+        // Build request body - include threadId for replies
+        const requestBody = { raw: encodedEmail };
         if (conversationId) {
-          // Reply to existing thread
-          result = await sendReply(googleAccessToken, {
-            threadId: conversationId,
-            to: contact,
-            body: message
-          });
-        } else {
-          // Send new email if no thread ID
-          result = await sendEmail(googleAccessToken, {
-            to: contact,
-            subject: `Re: ${task?.contextMemory?.original_request?.substring(0, 50) || "Follow-up"}`,
-            body: message
-          });
+          requestBody.threadId = conversationId;
         }
+        
+        const response = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${googleAccessToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(requestBody)
+        });
+        
+        if (!response.ok) {
+          const errData = await response.text();
+          throw new Error(`Failed to send email: ${errData}`);
+        }
+        
+        const apiResult = await response.json();
+        result = { 
+          success: true, 
+          message: `Follow-up email sent to ${contact}`,
+          messageId: apiResult.id,
+          threadId: apiResult.threadId
+        };
         break;
       }
       
