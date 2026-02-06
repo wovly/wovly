@@ -14959,21 +14959,81 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             const argsStr = JSON.stringify(args);
             const substituted = argsStr.replace(/\{\{step_(\d+)\.(\w+)\}\}/g, (match, stepNum, field) => {
               const prevResult = results[`step_${stepNum}`];
+              
+              // Helper to format value for JSON string substitution
+              const formatValue = (value) => {
+                if (Array.isArray(value)) {
+                  if (value.length > 0 && typeof value[0] === 'object') {
+                    return value.map(item => {
+                      if (item.text && item.from && item.date) {
+                        return `[${item.date}] ${item.from}: ${item.text}`;
+                      }
+                      return JSON.stringify(item);
+                    }).join('\\n');
+                  }
+                  return value.join(', ');
+                } else if (typeof value === 'object' && value !== null) {
+                  return JSON.stringify(value);
+                }
+                return String(value);
+              };
+              
+              // Direct field match
               if (prevResult && prevResult[field] !== undefined) {
-                return JSON.stringify(prevResult[field]).slice(1, -1); // Remove quotes
+                return formatValue(prevResult[field]);
               }
+              
+              // Field name variations
+              const fieldVariations = {
+                'recent_messages': 'messages',
+                'imessages': 'messages',
+                'slack_messages': 'messages',
+                'email_messages': 'messages',
+                'text_messages': 'messages',
+                'formatted_messages': 'formatted',
+                'formatted': 'formatted_messages',
+                'result': 'message',
+                'message': 'result'
+              };
+              
+              if (prevResult && fieldVariations[field] && prevResult[fieldVariations[field]] !== undefined) {
+                console.log(`[Chat] Using field variation: ${field} -> ${fieldVariations[field]}`);
+                return formatValue(prevResult[fieldVariations[field]]);
+              }
+              
+              // Fallback for any *_messages field
+              if (prevResult && (field.endsWith('_messages') || field.endsWith('messages')) && prevResult.messages !== undefined) {
+                console.log(`[Chat] Using fallback: ${field} -> messages`);
+                return formatValue(prevResult.messages);
+              }
+              
+              // Last resort: use first array field
+              if (prevResult) {
+                const arrayField = Object.entries(prevResult).find(([k, v]) => Array.isArray(v));
+                if (arrayField) {
+                  console.log(`[Chat] Using first array field: ${field} -> ${arrayField[0]}`);
+                  return formatValue(arrayField[1]);
+                }
+              }
+              
+              console.log(`[Chat] Template variable not found: step_${stepNum}.${field}, available:`, prevResult ? Object.keys(prevResult) : 'no result');
               return match;
             });
-            resolvedArgs = JSON.parse(substituted);
+            try {
+              resolvedArgs = JSON.parse(substituted);
+            } catch (e) {
+              console.log(`[Chat] Failed to parse substituted args: ${e.message}`);
+            }
           }
           
           try {
             // Execute the tool
             const result = await toolExecutor.executeTool(tool, resolvedArgs);
             
-            // Store result for variable substitution
+            // Store result for variable substitution - use step index from loop
+            const stepIndex = decomposition.plan.indexOf(planStep) + 1;
+            results[`step_${stepIndex}`] = result;
             if (output_var) {
-              results[`step_${planStep.step_id}`] = result;
               results[output_var] = result;
             }
             lastResult = result;
