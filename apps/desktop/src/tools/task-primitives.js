@@ -638,21 +638,46 @@ async function executeTaskPrimitiveTool(toolName, toolInput, context = {}) {
           return { success: false, error: "template is required" };
         }
         
+        // Helper to format a value for string interpolation
+        const formatValue = (value) => {
+          if (value === null || value === undefined) return '';
+          if (Array.isArray(value)) {
+            // Format arrays nicely
+            if (value.length > 0 && typeof value[0] === 'object') {
+              // For message objects with text/from/date fields
+              return value.map(item => {
+                if (item.text && item.from && item.date) {
+                  return `[${item.date}] ${item.from}: ${item.text}`;
+                }
+                // Generic object formatting
+                return Object.entries(item).map(([k, v]) => `${k}: ${v}`).join(', ');
+              }).join('\n');
+            }
+            return value.join(', ');
+          }
+          if (typeof value === 'object') {
+            return JSON.stringify(value, null, 2);
+          }
+          return String(value);
+        };
+        
         let result = template;
         if (variables && typeof variables === 'object') {
           for (const [key, value] of Object.entries(variables)) {
             const placeholder = new RegExp(`\\{${key}\\}`, 'g');
-            result = result.replace(placeholder, String(value ?? ''));
+            result = result.replace(placeholder, formatValue(value));
           }
         }
         
-        console.log(`[TaskPrimitive] Format string: "${template}" -> "${result}"`);
+        console.log(`[TaskPrimitive] Format string: "${template.slice(0, 50)}..." -> "${result.slice(0, 100)}..."`);
         return {
           success: true,
           result,
+          formatted: result,  // Also provide as 'formatted' for template flexibility
+          formatted_messages: result,  // And as 'formatted_messages' 
           template,
           variables_used: Object.keys(variables || {}),
-          message: `Formatted string: "${result}"`
+          message: `Formatted string: "${result.slice(0, 200)}..."`
         };
       }
       

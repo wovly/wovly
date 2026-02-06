@@ -10227,14 +10227,60 @@ Generate ONLY the welcome message, nothing else.`;
             const substituted = argsStr.replace(/\{\{step_(\d+)\.(\w+)\}\}/g, (match, stepNum, field) => {
               const prevResult = results[`step_${stepNum}`];
               if (prevResult && prevResult[field] !== undefined) {
-                return String(prevResult[field]);
+                const value = prevResult[field];
+                // Handle arrays and objects by stringifying them nicely
+                if (Array.isArray(value)) {
+                  // For message arrays, format them readably
+                  if (value.length > 0 && typeof value[0] === 'object') {
+                    return value.map(item => {
+                      if (item.text && item.from && item.date) {
+                        // Format message objects
+                        return `[${item.date}] ${item.from}: ${item.text}`;
+                      }
+                      return JSON.stringify(item);
+                    }).join('\\n');
+                  }
+                  return value.join(', ');
+                } else if (typeof value === 'object' && value !== null) {
+                  return JSON.stringify(value);
+                }
+                return String(value);
               }
+              // Try common field name variations (messages vs recent_messages, etc.)
+              const fieldVariations = {
+                'recent_messages': 'messages',
+                'messages': 'recent_messages',
+                'formatted_messages': 'formatted',
+                'formatted': 'formatted_messages',
+                'result': 'message',
+                'message': 'result'
+              };
+              if (prevResult && fieldVariations[field] && prevResult[fieldVariations[field]] !== undefined) {
+                const value = prevResult[fieldVariations[field]];
+                console.log(`[Tasks] Using field variation: ${field} -> ${fieldVariations[field]}`);
+                if (Array.isArray(value)) {
+                  if (value.length > 0 && typeof value[0] === 'object') {
+                    return value.map(item => {
+                      if (item.text && item.from && item.date) {
+                        return `[${item.date}] ${item.from}: ${item.text}`;
+                      }
+                      return JSON.stringify(item);
+                    }).join('\\n');
+                  }
+                  return value.join(', ');
+                } else if (typeof value === 'object' && value !== null) {
+                  return JSON.stringify(value);
+                }
+                return String(value);
+              }
+              console.log(`[Tasks] Template variable not found: step_${stepNum}.${field}, available:`, prevResult ? Object.keys(prevResult) : 'no result');
               return match;
             });
             try {
               resolvedArgs = JSON.parse(substituted);
             } catch (e) {
               console.log(`[Tasks] Failed to parse substituted args: ${e.message}`);
+              console.log(`[Tasks] Substituted string was: ${substituted.slice(0, 500)}`);
             }
           }
           
