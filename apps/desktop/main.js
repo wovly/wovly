@@ -588,9 +588,9 @@ async function sendFollowupMessage(params, username) {
     
     switch (platform) {
       case "email": {
-        // Get Gmail access token
-        const googleCreds = await getCredentials("google", username);
-        if (!googleCreds?.access_token) {
+        // Get Gmail access token using the correct function
+        const googleAccessToken = await getGoogleAccessToken(username);
+        if (!googleAccessToken) {
           return { success: false, error: "Google credentials not available for email follow-up" };
         }
         
@@ -599,14 +599,14 @@ async function sendFollowupMessage(params, username) {
         
         if (conversationId) {
           // Reply to existing thread
-          result = await sendReply(googleCreds.access_token, {
+          result = await sendReply(googleAccessToken, {
             threadId: conversationId,
             to: contact,
             body: message
           });
         } else {
           // Send new email if no thread ID
-          result = await sendEmail(googleCreds.access_token, {
+          result = await sendEmail(googleAccessToken, {
             to: contact,
             subject: `Re: ${task?.contextMemory?.original_request?.substring(0, 50) || "Follow-up"}`,
             body: message
@@ -622,36 +622,51 @@ async function sendFollowupMessage(params, username) {
       }
       
       case "slack": {
-        const slackCreds = await getCredentials("slack", username);
-        if (!slackCreds?.access_token) {
+        // Get Slack access token using the correct function
+        const slackAccessToken = await getSlackAccessToken(username);
+        if (!slackAccessToken) {
           return { success: false, error: "Slack credentials not available for follow-up" };
         }
         
         const { postMessage } = require("./src/integrations/slack-integration");
         // For Slack, the conversationId is the channel/DM ID
-        result = await postMessage(slackCreds.access_token, conversationId || contact, message);
+        result = await postMessage(slackAccessToken, conversationId || contact, message);
         break;
       }
       
       case "telegram": {
-        const telegramCreds = await getCredentials("telegram", username);
-        if (!telegramCreds?.bot_token) {
+        // Get Telegram bot token from settings
+        const settingsPath = await getSettingsPath(username);
+        let telegramBotToken = null;
+        try {
+          const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+          telegramBotToken = settings.telegramBotToken;
+        } catch { /* No settings */ }
+        
+        if (!telegramBotToken) {
           return { success: false, error: "Telegram credentials not available for follow-up" };
         }
         
         const { sendMessage: sendTelegramMessage } = require("./src/integrations/telegram-integration");
-        result = await sendTelegramMessage(telegramCreds.bot_token, conversationId || contact, message);
+        result = await sendTelegramMessage(telegramBotToken, conversationId || contact, message);
         break;
       }
       
       case "discord": {
-        const discordCreds = await getCredentials("discord", username);
-        if (!discordCreds?.bot_token) {
+        // Get Discord access token from settings
+        const settingsPath = await getSettingsPath(username);
+        let discordAccessToken = null;
+        try {
+          const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+          discordAccessToken = settings.discordTokens?.access_token;
+        } catch { /* No settings */ }
+        
+        if (!discordAccessToken) {
           return { success: false, error: "Discord credentials not available for follow-up" };
         }
         
         const { sendMessage: sendDiscordMessage } = require("./src/integrations/discord-integration");
-        result = await sendDiscordMessage(discordCreds.bot_token, conversationId || contact, message);
+        result = await sendDiscordMessage(discordAccessToken, conversationId || contact, message);
         break;
       }
       
