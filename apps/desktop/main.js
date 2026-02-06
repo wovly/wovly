@@ -10247,17 +10247,29 @@ Generate ONLY the welcome message, nothing else.`;
                 return String(value);
               }
               // Try common field name variations (messages vs recent_messages, etc.)
+              // This handles LLM generating templates with slightly different field names
               const fieldVariations = {
                 'recent_messages': 'messages',
+                'imessages': 'messages',
+                'slack_messages': 'messages',
+                'email_messages': 'messages',
+                'telegram_messages': 'messages',
+                'discord_messages': 'messages',
+                'text_messages': 'messages',
+                'sms_messages': 'messages',
                 'messages': 'recent_messages',
                 'formatted_messages': 'formatted',
                 'formatted': 'formatted_messages',
                 'result': 'message',
-                'message': 'result'
+                'message': 'result',
+                'content': 'text',
+                'text': 'content',
+                'body': 'text',
+                'data': 'result'
               };
-              if (prevResult && fieldVariations[field] && prevResult[fieldVariations[field]] !== undefined) {
-                const value = prevResult[fieldVariations[field]];
-                console.log(`[Tasks] Using field variation: ${field} -> ${fieldVariations[field]}`);
+              
+              // Helper to format value for string substitution
+              const formatValueForSubstitution = (value) => {
                 if (Array.isArray(value)) {
                   if (value.length > 0 && typeof value[0] === 'object') {
                     return value.map(item => {
@@ -10272,7 +10284,30 @@ Generate ONLY the welcome message, nothing else.`;
                   return JSON.stringify(value);
                 }
                 return String(value);
+              };
+              
+              // Try direct variation mapping first
+              if (prevResult && fieldVariations[field] && prevResult[fieldVariations[field]] !== undefined) {
+                const value = prevResult[fieldVariations[field]];
+                console.log(`[Tasks] Using field variation: ${field} -> ${fieldVariations[field]}`);
+                return formatValueForSubstitution(value);
               }
+              
+              // Fallback: if field ends with "_messages" or "messages", try just "messages"
+              if (prevResult && (field.endsWith('_messages') || field.endsWith('messages')) && prevResult.messages !== undefined) {
+                console.log(`[Tasks] Using fallback: ${field} -> messages`);
+                return formatValueForSubstitution(prevResult.messages);
+              }
+              
+              // Last resort: try the first array field in the result
+              if (prevResult) {
+                const arrayField = Object.entries(prevResult).find(([k, v]) => Array.isArray(v));
+                if (arrayField) {
+                  console.log(`[Tasks] Using first array field: ${field} -> ${arrayField[0]}`);
+                  return formatValueForSubstitution(arrayField[1]);
+                }
+              }
+              
               console.log(`[Tasks] Template variable not found: step_${stepNum}.${field}, available:`, prevResult ? Object.keys(prevResult) : 'no result');
               return match;
             });
