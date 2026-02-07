@@ -14957,9 +14957,9 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
           let resolvedArgs = { ...args };
           if (args) {
             const argsStr = JSON.stringify(args);
-            const substituted = argsStr.replace(/\{\{step_(\d+)\.(\w+)\}\}/g, (match, stepNum, field) => {
+            const substituted = argsStr.replace(/\{\{step_(\d+)\.(\w+(?:\.\w+)?)\}\}/g, (match, stepNum, field) => {
               const prevResult = results[`step_${stepNum}`];
-              
+
               // Helper to format value for JSON string substitution
               const formatValue = (value) => {
                 if (Array.isArray(value)) {
@@ -14977,47 +14977,73 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
                 }
                 return String(value);
               };
-              
-              // Direct field match
-              if (prevResult && prevResult[field] !== undefined) {
-                return formatValue(prevResult[field]);
-              }
-              
-              // Field name variations
-              const fieldVariations = {
-                'recent_messages': 'messages',
-                'imessages': 'messages',
-                'slack_messages': 'messages',
-                'email_messages': 'messages',
-                'text_messages': 'messages',
-                'formatted_messages': 'formatted',
-                'formatted': 'formatted_messages',
-                'result': 'message',
-                'message': 'result'
-              };
-              
-              if (prevResult && fieldVariations[field] && prevResult[fieldVariations[field]] !== undefined) {
-                console.log(`[Chat] Using field variation: ${field} -> ${fieldVariations[field]}`);
-                return formatValue(prevResult[fieldVariations[field]]);
-              }
-              
-              // Fallback for any *_messages field
-              if (prevResult && (field.endsWith('_messages') || field.endsWith('messages')) && prevResult.messages !== undefined) {
-                console.log(`[Chat] Using fallback: ${field} -> messages`);
-                return formatValue(prevResult.messages);
-              }
-              
-              // Last resort: use first array field
-              if (prevResult) {
-                const arrayField = Object.entries(prevResult).find(([k, v]) => Array.isArray(v));
-                if (arrayField) {
-                  console.log(`[Chat] Using first array field: ${field} -> ${arrayField[0]}`);
-                  return formatValue(arrayField[1]);
+
+              // Handle nested field access (e.g., "retrieved_emails.length")
+              const fields = field.split('.');
+              let value = prevResult;
+
+              for (let i = 0; i < fields.length; i++) {
+                const f = fields[i];
+
+                if (!value) {
+                  console.log(`[Chat] Template variable path failed at ${f}: step_${stepNum}.${fields.slice(0, i + 1).join('.')}`);
+                  break;
                 }
+
+                // Direct field match
+                if (value[f] !== undefined) {
+                  value = value[f];
+                  continue;
+                }
+
+                // Field name variations (only for first level)
+                if (i === 0) {
+                  const fieldVariations = {
+                    'recent_messages': 'messages',
+                    'imessages': 'messages',
+                    'slack_messages': 'messages',
+                    'email_messages': 'messages',
+                    'text_messages': 'messages',
+                    'retrieved_emails': 'messages',
+                    'retrieved_messages': 'messages',
+                    'todays_events': 'events',
+                    'formatted_messages': 'formatted',
+                    'formatted': 'formatted_messages',
+                    'result': 'message',
+                    'message': 'result'
+                  };
+
+                  if (fieldVariations[f] && value[fieldVariations[f]] !== undefined) {
+                    console.log(`[Chat] Using field variation: ${f} -> ${fieldVariations[f]}`);
+                    value = value[fieldVariations[f]];
+                    continue;
+                  }
+
+                  // Fallback for any *_messages field
+                  if ((f.endsWith('_messages') || f.endsWith('messages')) && value.messages !== undefined) {
+                    console.log(`[Chat] Using fallback: ${f} -> messages`);
+                    value = value.messages;
+                    continue;
+                  }
+
+                  // Last resort: use first array field if this looks like a messages field
+                  if ((f.includes('message') || f.includes('email') || f.includes('event'))) {
+                    const arrayField = Object.entries(value).find(([k, v]) => Array.isArray(v));
+                    if (arrayField) {
+                      console.log(`[Chat] Using first array field: ${f} -> ${arrayField[0]}`);
+                      value = arrayField[1];
+                      continue;
+                    }
+                  }
+                }
+
+                // If we couldn't resolve this field, give up
+                console.log(`[Chat] Template variable not found: step_${stepNum}.${field}, available at level ${i}:`, value ? Object.keys(value) : 'no value');
+                return match;
               }
-              
-              console.log(`[Chat] Template variable not found: step_${stepNum}.${field}, available:`, prevResult ? Object.keys(prevResult) : 'no result');
-              return match;
+
+              // Successfully resolved all fields, format the final value
+              return formatValue(value);
             });
             try {
               resolvedArgs = JSON.parse(substituted);
@@ -15066,6 +15092,50 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
         } else if (lastResult?.url) {
           response = `✅ **${decomposition.title}**\n\nNavigated to: ${lastResult.url}`;
         }
+
+        // Substitute any remaining template variables in the final response
+        response = response.replace(/\{\{step_(\d+)\.(\w+(?:\.\w+)?)\}\}/g, (match, stepNum, field) => {
+          const prevResult = results[`step_${stepNum}`];
+
+          if (!prevResult) {
+            console.log(`[Chat] Template variable not found in response: step_${stepNum} (no result)`);
+            return '0';
+          }
+
+          // Handle nested field access (e.g., "messages.length")
+          const fields = field.split('.');
+          let value = prevResult;
+
+          for (const f of fields) {
+            if (value && value[f] !== undefined) {
+              value = value[f];
+            } else {
+              // Try field variations
+              const fieldVariations = {
+                'retrieved_emails': 'messages',
+                'retrieved_messages': 'messages',
+                'todays_events': 'events',
+                'recent_messages': 'messages',
+                'imessages': 'messages',
+                'emails': 'messages'
+              };
+
+              if (value && fieldVariations[f] && value[fieldVariations[f]] !== undefined) {
+                console.log(`[Chat] Using field variation in response: ${f} -> ${fieldVariations[f]}`);
+                value = value[fieldVariations[f]];
+              } else {
+                console.log(`[Chat] Template variable not found in response: step_${stepNum}.${field}, available:`, prevResult ? Object.keys(prevResult) : 'no result');
+                return '0';
+              }
+            }
+          }
+
+          // Return the value (number, string, or array length)
+          if (Array.isArray(value)) {
+            return String(value.length);
+          }
+          return String(value);
+        });
         
         // Check for skill demo completion (Marco/Polo test) after inline execution
         await checkSkillDemoCompletionShared(originalMessage, response, currentUser?.username, win);
