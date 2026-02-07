@@ -9588,10 +9588,25 @@ Generate ONLY the welcome message, nothing else.`;
             return { success: false, error: "messageIds must be a non-empty array", emails: [] };
           }
 
-          const idsToFetch = messageIds.slice(0, maxEmails);
+          console.log(`[Gmail] Batch fetching ${messageIds.length} emails (sample IDs):`, messageIds.slice(0, 3));
+
+          // Extract IDs if messageIds contains objects instead of strings
+          const idsToFetch = messageIds.slice(0, maxEmails).map(item => {
+            if (typeof item === 'string') return item;
+            if (item && typeof item === 'object' && item.id) return item.id;
+            return null;
+          }).filter(id => id !== null);
+
+          if (idsToFetch.length === 0) {
+            return { success: false, error: "No valid message IDs found", emails: [] };
+          }
+
+          console.log(`[Gmail] Extracted ${idsToFetch.length} valid IDs (sample):`, idsToFetch.slice(0, 3));
+
           const emails = [];
           let fetchedCount = 0;
           let errorCount = 0;
+          let firstError = null;
 
           // Fetch emails in parallel (batches of 10 to avoid overwhelming the API)
           const batchSize = 10;
@@ -9605,6 +9620,11 @@ Generate ONLY the welcome message, nothing else.`;
                 );
 
                 if (!response.ok) {
+                  const errorText = await response.text();
+                  if (!firstError) {
+                    firstError = `${response.status}: ${errorText.substring(0, 200)}`;
+                  }
+                  console.error(`[Gmail] Error fetching email ${id}: ${response.status} ${errorText.substring(0, 100)}`);
                   errorCount++;
                   return null;
                 }
@@ -9638,6 +9658,9 @@ Generate ONLY the welcome message, nothing else.`;
                   body: body.substring(0, 2000) // Limit body length per email
                 };
               } catch (err) {
+                if (!firstError) {
+                  firstError = err.message;
+                }
                 console.error(`[Gmail] Error fetching email ${id}:`, err.message);
                 errorCount++;
                 return null;
@@ -9648,13 +9671,17 @@ Generate ONLY the welcome message, nothing else.`;
             emails.push(...batchResults.filter(e => e !== null));
           }
 
-          console.log(`[Gmail] Batch fetched ${fetchedCount} emails (${errorCount} errors)`);
+          if (firstError) {
+            console.error(`[Gmail] Batch fetch first error: ${firstError}`);
+          }
+          console.log(`[Gmail] Batch fetched ${emails.length} emails (${errorCount} errors out of ${idsToFetch.length})`);
           return {
-            success: true,
+            success: emails.length > 0 || errorCount === 0,
             emails,
-            fetched: fetchedCount,
+            fetched: emails.length,
             errors: errorCount,
-            total: messageIds.length
+            total: messageIds.length,
+            firstError: errorCount > 0 ? firstError : null
           };
         }
 
