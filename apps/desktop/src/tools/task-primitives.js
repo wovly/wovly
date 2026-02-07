@@ -388,7 +388,7 @@ async function executeTaskPrimitiveTool(toolName, toolInput, context = {}) {
         if (!name) {
           return { success: false, error: "Variable name is required" };
         }
-        
+
         // Store in task context for the executor to persist
         const result = {
           success: true,
@@ -396,9 +396,10 @@ async function executeTaskPrimitiveTool(toolName, toolInput, context = {}) {
           name,
           value: String(value),
           description: description || null,
-          message: `Saved variable '${name}' = '${value}'`
+          // Don't include message - it shouldn't be displayed to users
+          stored: true
         };
-        
+
         // The executor will read this and update contextMemory
         console.log(`[TaskPrimitive] Saved variable: ${name} = ${value}`);
         return result;
@@ -473,8 +474,8 @@ async function executeTaskPrimitiveTool(toolName, toolInput, context = {}) {
         console.log(`[TaskPrimitive] Parsed time: ${time_string} -> ${parsed.hour}:${parsed.minute}`);
         return {
           success: true,
-          ...parsed,
-          message: `Parsed '${time_string}' as ${parsed.formatted_12h} (${parsed.formatted_24h})`
+          ...parsed
+          // No message field - formatted times are self-explanatory
         };
       }
       
@@ -592,8 +593,8 @@ async function executeTaskPrimitiveTool(toolName, toolInput, context = {}) {
         return {
           success: true,
           result,
-          expression,
-          message: `Condition '${expression}' evaluated to ${result}`
+          expression
+          // No message field - boolean results are self-explanatory
         };
       }
       
@@ -674,10 +675,10 @@ async function executeTaskPrimitiveTool(toolName, toolInput, context = {}) {
           success: true,
           result,
           formatted: result,  // Also provide as 'formatted' for template flexibility
-          formatted_messages: result,  // And as 'formatted_messages' 
+          formatted_messages: result,  // And as 'formatted_messages'
           template,
-          variables_used: Object.keys(variables || {}),
-          message: `Formatted string: "${result.slice(0, 200)}..."`
+          variables_used: Object.keys(variables || {})
+          // No message field - the formatted result speaks for itself
         };
       }
       
@@ -701,8 +702,8 @@ async function executeTaskPrimitiveTool(toolName, toolInput, context = {}) {
           value: String(current),
           previous: previousNum,
           current,
-          amount,
-          message: `Counter '${name}' incremented: ${previousNum} -> ${current}`
+          amount
+          // No message field - counts are self-explanatory
         };
       }
       
