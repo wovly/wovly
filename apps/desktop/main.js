@@ -15062,7 +15062,12 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
                     'formatted_messages': 'formatted',
                     'formatted': 'formatted_messages',
                     'result': 'message',
-                    'message': 'result'
+                    'message': 'result',
+                    'summary_report': 'formatted',
+                    'report': 'formatted',
+                    'summary': 'formatted',
+                    'output': 'formatted',
+                    'content': 'formatted'
                   };
 
                   if (fieldVariations[f] && value[fieldVariations[f]] !== undefined) {
@@ -15076,6 +15081,22 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
                     console.log(`[Chat] Using fallback: ${f} -> messages`);
                     value = value.messages;
                     continue;
+                  }
+
+                  // Fallback for output variable names (summary_report, report, etc.) - try common output fields
+                  if (f.includes('summary') || f.includes('report') || f.includes('output') || f.includes('content')) {
+                    // Try formatted first, then result, then message
+                    const tryFields = ['formatted', 'result', 'message', 'formatted_messages'];
+                    let found = false;
+                    for (const tryField of tryFields) {
+                      if (value[tryField] !== undefined) {
+                        console.log(`[Chat] Using output fallback: ${f} -> ${tryField}`);
+                        value = value[tryField];
+                        found = true;
+                        break;
+                      }
+                    }
+                    if (found) continue;
                   }
 
                   // Last resort: use first array field if this looks like a messages field
