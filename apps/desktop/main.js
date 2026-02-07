@@ -10564,7 +10564,19 @@ Generate ONLY the welcome message, nothing else.`;
                   return formatValueForSubstitution(arrayField[1]);
                 }
               }
-              
+
+              // Generic fallback for ANY unknown field name (like custom output_var names)
+              // Try standard output fields that tools typically return
+              if (prevResult) {
+                const standardFields = ['formatted', 'result', 'analysis', 'message', 'data', 'output', 'content', 'text'];
+                for (const tryField of standardFields) {
+                  if (prevResult[tryField] !== undefined) {
+                    console.log(`[Tasks] Using standard field fallback: ${field} -> ${tryField} (custom output_var not found)`);
+                    return formatValueForSubstitution(prevResult[tryField]);
+                  }
+                }
+              }
+
               console.log(`[Tasks] Template variable not found: step_${stepNum}.${field}, available:`, prevResult ? Object.keys(prevResult) : 'no result');
               return match;
             });
@@ -15408,6 +15420,22 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
                       value = arrayField[1];
                       continue;
                     }
+                  }
+
+                  // Generic fallback for ANY unknown field name (like custom output_var names)
+                  // Try standard output fields that tools typically return
+                  if (i === 0) { // Only for top-level access
+                    const standardFields = ['formatted', 'result', 'analysis', 'message', 'data', 'output', 'content'];
+                    let found = false;
+                    for (const tryField of standardFields) {
+                      if (value[tryField] !== undefined) {
+                        console.log(`[Chat] Using standard field fallback: ${f} -> ${tryField} (custom output_var not found)`);
+                        value = value[tryField];
+                        found = true;
+                        break;
+                      }
+                    }
+                    if (found) continue;
                   }
                 }
 
