@@ -346,23 +346,44 @@ This plan executes via POLLING - steps run repeatedly at intervals. Use these pa
 **For message reply workflows:**
 - wait_for_reply: Use IMMEDIATELY after sending any message (email, iMessage, Slack, etc.) when you need to wait for and evaluate a reply. This ONE tool handles the entire follow-up workflow - do NOT manually implement polling loops or conditional checking for replies. Args: platform, contact, original_request, success_criteria, conversation_id (optional), poll_interval_minutes (default 5), followup_after_hours (default 24), max_followups (default 3)
 
-**For email summarization/analysis:**
-IMPORTANT: When summarizing emails, you MUST follow this pattern:
+**For message/content summarization and analysis:**
+IMPORTANT: When summarizing ANY messages (emails, iMessages, Slack, etc.), you MUST follow this pattern:
+
+**EMAIL SUMMARIZATION:**
 1. search_emails - Returns {messages: [{id, threadId}, ...]} (NOT email content!)
 2. get_email_contents_batch - Fetch actual email bodies using the message IDs
-   - Reference the messages array: {"messageIds": "{{step_1.messages}}"}
-   - Returns {emails: [{id, subject, from, to, date, body}, ...]}
+   - Reference: {"messageIds": "{{step_1.messages}}"}
+   - Returns: {emails: [{id, subject, from, to, date, body}, ...]}
 3. analyze_with_llm - Use LLM to analyze the fetched emails
-   - Pass emails as stringified JSON: {"content": "{{step_2.emails}}", "instruction": "Summarize these emails highlighting: key senders, important subjects, action items, and main topics. Format as a clear, organized summary.", "format": "markdown"}
-   - Returns {analysis: "...summary text..."}
-4. send_chat_message - Display the LLM's analysis to the user
+   - Pass: {"content": "{{step_2.emails}}", "instruction": "Summarize these emails highlighting: key senders, important subjects, action items, and main topics. Format as a clear, organized summary.", "format": "markdown"}
+   - Returns: {analysis: "...summary text..."}
+4. send_chat_message - Display the LLM's analysis
    - Use: {"message": "{{step_3.analysis}}", "format": "markdown"}
 
-CRITICAL RULES:
-- NEVER send raw email IDs or JSON to users (no {{step_1.messages}} in send_chat_message)
-- ALWAYS fetch email content with get_email_contents_batch before summarizing
-- ALWAYS use analyze_with_llm to generate human-readable summaries
-- ONLY send analyzed/formatted content to users, not raw data
+**iMESSAGE SUMMARIZATION:**
+1. get_recent_messages or search_messages - Fetch messages
+   - Returns: {messages: [{from, text, date}, ...]}
+2. analyze_with_llm - Analyze the messages
+   - Pass: {"content": "{{step_1.messages}}", "instruction": "Summarize these text messages highlighting: key contacts, important topics, action items, and urgent messages.", "format": "markdown"}
+   - Returns: {analysis: "...summary text..."}
+3. send_chat_message - Display summary
+   - Use: {"message": "{{step_2.analysis}}", "format": "markdown"}
+
+**SLACK MESSAGE SUMMARIZATION:**
+1. get_slack_messages - Fetch messages from channel
+   - Returns: {messages: [{user, text, timestamp}, ...]}
+2. analyze_with_llm - Analyze the messages
+   - Pass: {"content": "{{step_1.messages}}", "instruction": "Summarize these Slack messages highlighting: key participants, decisions made, action items, and important discussions.", "format": "markdown"}
+   - Returns: {analysis: "...summary text..."}
+3. send_chat_message - Display summary
+   - Use: {"message": "{{step_2.analysis}}", "format": "markdown"}
+
+**CRITICAL RULES FOR ALL MESSAGE TYPES:**
+- NEVER send raw message IDs or JSON objects to users
+- ALWAYS fetch message content before summarizing (don't skip the fetch step)
+- ALWAYS use analyze_with_llm to generate human-readable summaries from raw data
+- ONLY send analyzed/formatted content to users, not raw data structures
+- analyze_with_llm can handle ANY content type: emails, texts, Slack messages, documents, etc.
 
 # Tool Definitions
 ${toolDefsJson}
