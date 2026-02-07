@@ -6087,6 +6087,50 @@ Generate ONLY the welcome message, nothing else.`;
       }
     },
     {
+      name: "get_email_contents_batch",
+      description: "Get the contents of multiple emails in batch. More efficient than calling get_email_content multiple times. Use this when you need to fetch content for multiple emails (e.g., to summarize a list of emails).",
+      input_schema: {
+        type: "object",
+        properties: {
+          messageIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of email message IDs to fetch"
+          },
+          maxEmails: {
+            type: "number",
+            description: "Maximum number of emails to fetch (default: 50)",
+            default: 50
+          }
+        },
+        required: ["messageIds"]
+      }
+    },
+    {
+      name: "analyze_with_llm",
+      description: "Use the LLM to analyze, summarize, or extract information from text content. Useful for generating summaries, answering questions about content, or performing analysis that requires understanding and reasoning.",
+      input_schema: {
+        type: "object",
+        properties: {
+          content: {
+            type: "string",
+            description: "The text content to analyze (can be a single text or JSON stringified array of items)"
+          },
+          instruction: {
+            type: "string",
+            description: "What you want the LLM to do with the content (e.g., 'Summarize these emails', 'Extract key action items', 'List the main senders and topics')"
+          },
+          format: {
+            type: "string",
+            description: "Desired output format: 'text' (plain text), 'markdown' (formatted markdown), or 'json' (structured data)",
+            enum: ["text", "markdown", "json"],
+            default: "markdown"
+          }
+        },
+        required: ["content", "instruction"]
+      }
+    },
+    {
       name: "send_email",
       description: "Send an email or reply to an existing email thread. Always confirm with user before sending. When replying to an email, use threadId and replyToMessageId to keep the conversation in the same thread.",
       input_schema: {
@@ -9500,18 +9544,18 @@ Generate ONLY the welcome message, nothing else.`;
 
         case "get_email_content": {
           const { messageId } = toolInput;
-          
+
           const response = await fetch(
             `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full`,
             { headers: { "Authorization": `Bearer ${accessToken}` } }
           );
-          
+
           if (!response.ok) throw new Error("Failed to get email");
           const email = await response.json();
-          
+
           const headers = email.payload?.headers || [];
           const getHeader = (name) => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || "";
-          
+
           let body = "";
           const extractBody = (part) => {
             if (part.body?.data) {
@@ -9524,7 +9568,7 @@ Generate ONLY the welcome message, nothing else.`;
             }
           };
           extractBody(email.payload);
-          
+
           return {
             id: email.id,
             threadId: email.threadId, // For replying in the same thread
@@ -9535,6 +9579,122 @@ Generate ONLY the welcome message, nothing else.`;
             date: getHeader("Date"),
             body: body.substring(0, 2000)
           };
+        }
+
+        case "get_email_contents_batch": {
+          const { messageIds, maxEmails = 50 } = toolInput;
+
+          if (!Array.isArray(messageIds) || messageIds.length === 0) {
+            return { success: false, error: "messageIds must be a non-empty array", emails: [] };
+          }
+
+          const idsToFetch = messageIds.slice(0, maxEmails);
+          const emails = [];
+          let fetchedCount = 0;
+          let errorCount = 0;
+
+          // Fetch emails in parallel (batches of 10 to avoid overwhelming the API)
+          const batchSize = 10;
+          for (let i = 0; i < idsToFetch.length; i += batchSize) {
+            const batch = idsToFetch.slice(i, i + batchSize);
+            const batchPromises = batch.map(async (id) => {
+              try {
+                const response = await fetch(
+                  `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
+                  { headers: { "Authorization": `Bearer ${accessToken}` } }
+                );
+
+                if (!response.ok) {
+                  errorCount++;
+                  return null;
+                }
+
+                const email = await response.json();
+                const headers = email.payload?.headers || [];
+                const getHeader = (name) => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || "";
+
+                let body = "";
+                const extractBody = (part) => {
+                  if (part.body?.data) {
+                    body = Buffer.from(part.body.data, "base64").toString("utf8");
+                  }
+                  if (part.parts) {
+                    for (const p of part.parts) {
+                      if (p.mimeType === "text/plain") extractBody(p);
+                    }
+                  }
+                };
+                extractBody(email.payload);
+
+                fetchedCount++;
+                return {
+                  id: email.id,
+                  threadId: email.threadId,
+                  messageId: getHeader("Message-ID"),
+                  subject: getHeader("Subject"),
+                  from: getHeader("From"),
+                  to: getHeader("To"),
+                  date: getHeader("Date"),
+                  body: body.substring(0, 2000) // Limit body length per email
+                };
+              } catch (err) {
+                console.error(`[Gmail] Error fetching email ${id}:`, err.message);
+                errorCount++;
+                return null;
+              }
+            });
+
+            const batchResults = await Promise.all(batchPromises);
+            emails.push(...batchResults.filter(e => e !== null));
+          }
+
+          console.log(`[Gmail] Batch fetched ${fetchedCount} emails (${errorCount} errors)`);
+          return {
+            success: true,
+            emails,
+            fetched: fetchedCount,
+            errors: errorCount,
+            total: messageIds.length
+          };
+        }
+
+        case "analyze_with_llm": {
+          const { content, instruction, format = "markdown" } = toolInput;
+
+          if (!content || !instruction) {
+            return { success: false, error: "content and instruction are required" };
+          }
+
+          try {
+            // Call the LLM with the analysis request
+            const analysisPrompt = `${instruction}\n\n${format === "json" ? "Respond with valid JSON only, no other text." : ""}\n\nContent to analyze:\n${content}`;
+
+            const response = await anthropic.messages.create({
+              model: "claude-sonnet-4-5-20250929",
+              max_tokens: 4000,
+              messages: [{
+                role: "user",
+                content: analysisPrompt
+              }]
+            });
+
+            const analysis = response.content[0].text;
+
+            console.log(`[LLM] Analysis completed (${analysis.length} chars)`);
+            return {
+              success: true,
+              analysis,
+              result: analysis, // Alias for template compatibility
+              formatted: analysis, // Alias for template compatibility
+              tokens_used: response.usage.input_tokens + response.usage.output_tokens
+            };
+          } catch (err) {
+            console.error(`[LLM] Analysis error:`, err.message);
+            return {
+              success: false,
+              error: err.message
+            };
+          }
         }
 
         case "send_email": {

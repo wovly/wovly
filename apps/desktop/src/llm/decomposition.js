@@ -346,6 +346,24 @@ This plan executes via POLLING - steps run repeatedly at intervals. Use these pa
 **For message reply workflows:**
 - wait_for_reply: Use IMMEDIATELY after sending any message (email, iMessage, Slack, etc.) when you need to wait for and evaluate a reply. This ONE tool handles the entire follow-up workflow - do NOT manually implement polling loops or conditional checking for replies. Args: platform, contact, original_request, success_criteria, conversation_id (optional), poll_interval_minutes (default 5), followup_after_hours (default 24), max_followups (default 3)
 
+**For email summarization/analysis:**
+IMPORTANT: When summarizing emails, you MUST follow this pattern:
+1. search_emails - Returns {messages: [{id, threadId}, ...]} (NOT email content!)
+2. get_email_contents_batch - Fetch actual email bodies using the message IDs
+   - Reference the messages array: {"messageIds": "{{step_1.messages}}"}
+   - Returns {emails: [{id, subject, from, to, date, body}, ...]}
+3. analyze_with_llm - Use LLM to analyze the fetched emails
+   - Pass emails as stringified JSON: {"content": "{{step_2.emails}}", "instruction": "Summarize these emails highlighting: key senders, important subjects, action items, and main topics. Format as a clear, organized summary.", "format": "markdown"}
+   - Returns {analysis: "...summary text..."}
+4. send_chat_message - Display the LLM's analysis to the user
+   - Use: {"message": "{{step_3.analysis}}", "format": "markdown"}
+
+CRITICAL RULES:
+- NEVER send raw email IDs or JSON to users (no {{step_1.messages}} in send_chat_message)
+- ALWAYS fetch email content with get_email_contents_batch before summarizing
+- ALWAYS use analyze_with_llm to generate human-readable summaries
+- ONLY send analyzed/formatted content to users, not raw data
+
 # Tool Definitions
 ${toolDefsJson}
 
