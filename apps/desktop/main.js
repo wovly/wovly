@@ -14296,18 +14296,90 @@ ${skill.constraints.map(c => `- ${c}`).join("\n")}
 Use this as advisory guidance. When the user asks about this topic, explain the recommended process and offer to help them through each step. If they want you to execute the full process autonomously, suggest creating a task.`;
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Connected Integrations Context
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Check additional integrations
+    let slackAccessToken = null;
+    let hasSlackTools = false;
+    let slackTeamName = null;
+    try {
+      slackAccessToken = await getSlackAccessToken(currentUser?.username);
+      hasSlackTools = !!slackAccessToken;
+      if (hasSlackTools) {
+        // Get Slack team info
+        try {
+          const teamResponse = await fetch("https://slack.com/api/team.info", {
+            headers: { "Authorization": `Bearer ${slackAccessToken}` }
+          });
+          if (teamResponse.ok) {
+            const teamData = await teamResponse.json();
+            slackTeamName = teamData.team?.name;
+          }
+        } catch (err) {
+          console.log("[Context] Could not fetch Slack team name:", err.message);
+        }
+      }
+    } catch {
+      // No Slack
+    }
+
+    let integrationsInfo = "\n\n## Connected Integrations\n";
+    let hasAnyIntegration = false;
+
     if (hasGoogleTools) {
-      systemPrompt += `\n\nYou have access to Google Workspace tools (calendar, email, drive). Use them when relevant.`;
+      hasAnyIntegration = true;
+      // Get Google user email
+      let googleEmail = null;
+      try {
+        const userInfoResponse = await fetch("https://www.googleapis.com/oauth2/v1/userinfo?alt=json", {
+          headers: { "Authorization": `Bearer ${accessToken}` }
+        });
+        if (userInfoResponse.ok) {
+          const userInfo = await userInfoResponse.json();
+          googleEmail = userInfo.email;
+        }
+      } catch (err) {
+        console.log("[Context] Could not fetch Google email:", err.message);
+      }
+
+      integrationsInfo += `\n**Google Workspace** (Email, Calendar, Drive)`;
+      if (googleEmail) {
+        integrationsInfo += `\n- Connected account: ${googleEmail}`;
+        integrationsInfo += `\n- IMPORTANT: When user asks to "check emails" or "summarize emails" without specifying an account, use ${googleEmail} (the ONLY connected email account)`;
+      }
+      integrationsInfo += `\n- Tools: search_emails, get_email_content, get_email_contents_batch, send_email, get_calendar_events, create_calendar_event, list_drive_files\n`;
     }
 
     if (hasIMessageTools) {
-      systemPrompt += `\n\nYou have access to iMessage/SMS tools:
-- lookup_contact: Look up phone numbers from Apple Contacts by name. Use this to find someone's phone number.
-- send_imessage: Send a text message. You can use a contact name directly (e.g., "Adaira") and it will auto-lookup their phone number from Contacts.
-- get_recent_messages: Read recent text messages.
-- search_messages: Search through message history.
+      hasAnyIntegration = true;
+      integrationsInfo += `\n**iMessage/SMS** (Apple Messages)`;
+      integrationsInfo += `\n- Device: This Mac (Darwin platform)`;
+      integrationsInfo += `\n- IMPORTANT: When user asks to "send a text" or "check messages" without specifying a platform, use iMessage (the primary messaging platform on this device)`;
+      integrationsInfo += `\n- Tools: lookup_contact, send_imessage, get_recent_messages, search_messages`;
+      integrationsInfo += `\n- Note: Can send messages by contact name (auto-looks up phone number from Apple Contacts)\n`;
+    }
 
-When sending messages: You can pass a contact name directly to send_imessage - it will automatically look up their phone number. Always confirm with the user before sending.`;
+    if (hasSlackTools) {
+      hasAnyIntegration = true;
+      integrationsInfo += `\n**Slack** (Team Messaging)`;
+      if (slackTeamName) {
+        integrationsInfo += `\n- Connected workspace: ${slackTeamName}`;
+        integrationsInfo += `\n- IMPORTANT: When user asks to "send a slack message" or "check slack" without specifying a workspace, use ${slackTeamName} (the ONLY connected workspace)`;
+      }
+      integrationsInfo += `\n- Tools: list_slack_channels, get_slack_messages, send_slack_message, search_slack_users`;
+      integrationsInfo += `\n- Note: Always confirm before sending messages\n`;
+    }
+
+    if (hasAnyIntegration) {
+      systemPrompt += integrationsInfo;
+      systemPrompt += `\n**Key Rule**: When user requests an action without specifying which integration to use, automatically use the ONLY connected integration of that type. Don't ask unnecessary clarifying questions if there's only one option available.\n\nExamples:`;
+      systemPrompt += `\n- "check my emails" → Use ${hasGoogleTools ? 'the connected Google account' : 'N/A'} (only one email account)`;
+      systemPrompt += `\n- "send a text" → Use ${hasIMessageTools ? 'iMessage' : 'N/A'} (only one SMS platform)`;
+      if (hasSlackTools && slackTeamName) {
+        systemPrompt += `\n- "send a slack message" → Use ${slackTeamName} workspace (only one Slack workspace)`;
+      }
     }
 
     // Add memory tool instructions
