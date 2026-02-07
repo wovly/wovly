@@ -18,8 +18,8 @@ const {
 const CONTEXT_LIMITS = {
   TODAY_MAX_CHARS: 6000,      // ~1500 tokens - most recent conversations today
   YESTERDAY_MAX_CHARS: 3000,  // ~750 tokens - summary or recent from yesterday
-  SUMMARIES_MAX_CHARS: 2000,  // ~500 tokens - summaries from past 2 weeks
-  TOTAL_MAX_CHARS: 10000      // ~2500 tokens - hard cap on total context
+  SUMMARIES_MAX_CHARS: 4000,  // ~1000 tokens - summaries from past 30 days (increased from 2000)
+  TOTAL_MAX_CHARS: 12000      // ~3000 tokens - hard cap on total context (increased from 10000)
 };
 
 const getMemoryDailyDir = async (username) => {
@@ -203,11 +203,31 @@ const loadConversationContext = async (username) => {
   let yesterdayMessages = "";
   let recentSummaries = "";
 
-  // Load today's messages (truncate to limit)
+  // Load today's messages (take most recent to stay within limit)
   try {
     const todayPath = path.join(dailyDir, `${today}.md`);
     const fullContent = await fs.readFile(todayPath, "utf8");
-    todayMessages = truncateToLimit(fullContent, CONTEXT_LIMITS.TODAY_MAX_CHARS, "today's messages");
+
+    // If content is too long, take the MOST RECENT messages (tail, not head)
+    if (fullContent.length > CONTEXT_LIMITS.TODAY_MAX_CHARS) {
+      // Find conversation boundaries (entries separated by \n---\n)
+      const entries = fullContent.split(/\n---\n/);
+
+      // Build from end until we hit the limit
+      let truncated = "";
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const candidate = entries.slice(i).join("\n---\n");
+        if (candidate.length > CONTEXT_LIMITS.TODAY_MAX_CHARS) {
+          break;
+        }
+        truncated = candidate;
+      }
+
+      todayMessages = truncated || entries[entries.length - 1].slice(-CONTEXT_LIMITS.TODAY_MAX_CHARS);
+      console.log(`[Memory] Truncated today's messages from ${fullContent.length} to ${todayMessages.length} chars (keeping most recent)`);
+    } else {
+      todayMessages = fullContent;
+    }
   } catch {
     // No messages today yet
   }
@@ -243,9 +263,9 @@ const loadConversationContext = async (username) => {
       
       // Skip if it's yesterday (already loaded above)
       if (dateStr === yesterday) continue;
-      
-      // Only include files from 2-14 days ago
-      if (!isWithinDaysRange(dateStr, 2, 14)) continue;
+
+      // Only include files from 2-30 days ago (increased from 14)
+      if (!isWithinDaysRange(dateStr, 2, 30)) continue;
 
       try {
         const filePath = path.join(longtermDir, file);

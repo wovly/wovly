@@ -1162,6 +1162,38 @@ const stopTaskScheduler = () => {
   }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Memory Processing Scheduler
+// ─────────────────────────────────────────────────────────────────────────────
+
+let memorySchedulerInterval = null;
+
+const startMemoryScheduler = () => {
+  if (memorySchedulerInterval) {
+    clearInterval(memorySchedulerInterval);
+  }
+
+  console.log("[Memory] Starting memory scheduler (checking every 4 hours)");
+
+  memorySchedulerInterval = setInterval(async () => {
+    try {
+      if (!currentUser?.username) return;
+      console.log("[Memory] Scheduled memory processing for", currentUser.username);
+      await processOldMemoryFiles(currentUser.username);
+    } catch (err) {
+      console.error("[Memory] Scheduler error:", err.message);
+    }
+  }, 14400000); // 4 hours
+};
+
+const stopMemoryScheduler = () => {
+  if (memorySchedulerInterval) {
+    clearInterval(memorySchedulerInterval);
+    memorySchedulerInterval = null;
+    console.log("[Memory] Stopped memory scheduler");
+  }
+};
+
 // Resume tasks on app startup
 const resumeTasksOnStartup = async (username) => {
   console.log("[Tasks] Checking for tasks to resume...");
@@ -2110,8 +2142,9 @@ app.whenReady().then(async () => {
   // Process old memory files (summarize and move to longterm) - deferred until user logs in
   // This will be triggered after login via auth:login handler
 
-  // Start task scheduler (tasks are resumed after user login)
+  // Start schedulers
   startTaskScheduler();
+  startMemoryScheduler();
   
   // Auto-reconnect WhatsApp if previously connected
   try {
@@ -12862,20 +12895,29 @@ ${formatDecomposedSteps(steps)}
       }
       // Memory tools
       if (memoryTools.find(t => t.name === toolName)) {
+        console.log(`[Memory] Tool used: ${toolName} with input:`, JSON.stringify(toolInput));
+        let result;
         switch (toolName) {
           case "search_memory":
-            return await executeMemorySearch(toolInput.query, toolInput.date_range);
+            result = await executeMemorySearch(toolInput.query, toolInput.date_range);
+            break;
           case "get_conversations_for_date":
-            return await executeGetConversationsForDate(toolInput.date);
+            result = await executeGetConversationsForDate(toolInput.date);
+            break;
           case "search_memory_between_dates":
-            return await executeSearchMemoryBetweenDates(toolInput.query, toolInput.start_date, toolInput.end_date);
+            result = await executeSearchMemoryBetweenDates(toolInput.query, toolInput.start_date, toolInput.end_date);
+            break;
           case "list_memory_dates":
-            return await executeListMemoryDates(toolInput.limit);
+            result = await executeListMemoryDates(toolInput.limit);
+            break;
           case "get_conversation_summary":
-            return await executeGetConversationSummary(toolInput.date);
+            result = await executeGetConversationSummary(toolInput.date);
+            break;
           default:
-            return { error: `Unknown memory tool: ${toolName}` };
+            result = { error: `Unknown memory tool: ${toolName}` };
         }
+        console.log(`[Memory] Tool ${toolName} result:`, result.found !== undefined ? `found=${result.found}` : 'completed');
+        return result;
       }
       // Documentation tools
       if (documentationTools.find(t => t.name === toolName)) {
@@ -13508,9 +13550,14 @@ ${formatDecomposedSteps(steps)}
     try {
       if (currentUser?.username) {
         conversationContext = await loadConversationContext(currentUser.username);
+        if (!conversationContext.todayMessages && !conversationContext.yesterdayMessages && !conversationContext.recentSummaries) {
+          console.log("[Memory] No conversation history found (new user or first conversation)");
+        }
       }
     } catch (err) {
       console.error("[Memory] Error loading conversation context:", err.message);
+      // Continue with empty context rather than failing the chat
+      conversationContext = { todayMessages: "", yesterdayMessages: "", recentSummaries: "" };
     }
 
     // Get calendar events for today (if Google is connected) - helps with time references
@@ -14023,7 +14070,7 @@ For detailed documentation, use the fetch_documentation tool to look up specific
       }
       
       if (conversationContext.recentSummaries) {
-        systemPrompt += `\n\n### Summary of Recent Days (past 2 weeks):\n${conversationContext.recentSummaries}`;
+        systemPrompt += `\n\n### Summary of Recent Days (past 30 days):\n${conversationContext.recentSummaries}`;
       }
     }
 
@@ -14056,6 +14103,24 @@ Use this as advisory guidance. When the user asks about this topic, explain the 
 
 When sending messages: You can pass a contact name directly to send_imessage - it will automatically look up their phone number. Always confirm with the user before sending.`;
     }
+
+    // Add memory tool instructions
+    systemPrompt += `\n\n## MEMORY & HISTORICAL CONVERSATIONS
+
+You have access to a complete conversation history with memory search tools. Use them proactively when:
+- User asks about past conversations: "what did we discuss about X?", "when did I mention Y?"
+- User asks for information that might be in past chats: "what was that link?", "what did I decide about Z?"
+- You need context from more than 2 weeks ago (your passive context only goes back 2 weeks)
+- User wants to see conversations from specific dates or time ranges
+
+Available memory tools:
+- search_memory: Search all past conversations by keyword (use for "did we ever discuss...")
+- get_conversations_for_date: Get full conversation from specific date (use for "what did we talk about yesterday/Monday/Jan 15?")
+- search_memory_between_dates: Search within date range (use for "what did we discuss last week/month?")
+- list_memory_dates: See all dates with conversation history (use for "when did we first chat?")
+- get_conversation_summary: Get AI summary for specific date (faster than full conversation, use for "summarize yesterday's chat")
+
+When user asks about past conversations, USE THESE TOOLS. Don't just say "I don't recall" - actively search the memory.`;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Conversation Style Context - Inject user's voice/style into prompt
@@ -14952,33 +15017,19 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
         for (const planStep of decomposition.plan) {
           const { tool, args, output_var, description } = planStep;
           console.log(`[Chat] Direct exec: ${tool} - ${description}`);
-          
-          // Substitute variables from previous results
+
+          // Substitute variables from previous results using object-level substitution
           let resolvedArgs = { ...args };
           if (args) {
-            const argsStr = JSON.stringify(args);
-            const substituted = argsStr.replace(/\{\{step_(\d+)\.(\w+(?:\.\w+)?)\}\}/g, (match, stepNum, field) => {
+            // Helper to resolve a template variable
+            const resolveVariable = (match, stepNum, field) => {
               const prevResult = results[`step_${stepNum}`];
+              if (!prevResult) {
+                console.log(`[Chat] Template variable not found: step_${stepNum} (no result)`);
+                return null;
+              }
 
-              // Helper to format value for JSON string substitution
-              const formatValue = (value) => {
-                if (Array.isArray(value)) {
-                  if (value.length > 0 && typeof value[0] === 'object') {
-                    return value.map(item => {
-                      if (item.text && item.from && item.date) {
-                        return `[${item.date}] ${item.from}: ${item.text}`;
-                      }
-                      return JSON.stringify(item);
-                    }).join('\\n');
-                  }
-                  return value.join(', ');
-                } else if (typeof value === 'object' && value !== null) {
-                  return JSON.stringify(value);
-                }
-                return String(value);
-              };
-
-              // Handle nested field access (e.g., "retrieved_emails.length")
+              // Handle nested field access (e.g., "retrieved_emails.messages")
               const fields = field.split('.');
               let value = prevResult;
 
@@ -14987,7 +15038,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
 
                 if (!value) {
                   console.log(`[Chat] Template variable path failed at ${f}: step_${stepNum}.${fields.slice(0, i + 1).join('.')}`);
-                  break;
+                  return null;
                 }
 
                 // Direct field match
@@ -15006,6 +15057,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
                     'text_messages': 'messages',
                     'retrieved_emails': 'messages',
                     'retrieved_messages': 'messages',
+                    'email_results': 'messages',
                     'todays_events': 'events',
                     'formatted_messages': 'formatted',
                     'formatted': 'formatted_messages',
@@ -15020,14 +15072,14 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
                   }
 
                   // Fallback for any *_messages field
-                  if ((f.endsWith('_messages') || f.endsWith('messages')) && value.messages !== undefined) {
+                  if ((f.endsWith('_messages') || f.endsWith('messages') || f.endsWith('_results') || f.endsWith('results')) && value.messages !== undefined) {
                     console.log(`[Chat] Using fallback: ${f} -> messages`);
                     value = value.messages;
                     continue;
                   }
 
                   // Last resort: use first array field if this looks like a messages field
-                  if ((f.includes('message') || f.includes('email') || f.includes('event'))) {
+                  if ((f.includes('message') || f.includes('email') || f.includes('event') || f.includes('result'))) {
                     const arrayField = Object.entries(value).find(([k, v]) => Array.isArray(v));
                     if (arrayField) {
                       console.log(`[Chat] Using first array field: ${f} -> ${arrayField[0]}`);
@@ -15039,17 +15091,56 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
 
                 // If we couldn't resolve this field, give up
                 console.log(`[Chat] Template variable not found: step_${stepNum}.${field}, available at level ${i}:`, value ? Object.keys(value) : 'no value');
-                return match;
+                return null;
               }
 
-              // Successfully resolved all fields, format the final value
-              return formatValue(value);
-            });
-            try {
-              resolvedArgs = JSON.parse(substituted);
-            } catch (e) {
-              console.log(`[Chat] Failed to parse substituted args: ${e.message}`);
-            }
+              return value;
+            };
+
+            // Recursively substitute templates in the args object
+            const substituteInObject = (obj) => {
+              if (typeof obj === 'string') {
+                // Check if entire string is a template variable
+                const fullMatch = obj.match(/^\{\{step_(\d+)\.(\w+(?:\.\w+)?)\}\}$/);
+                if (fullMatch) {
+                  const value = resolveVariable(fullMatch[0], fullMatch[1], fullMatch[2]);
+                  return value !== null ? value : obj; // Keep original if resolution fails
+                }
+
+                // Otherwise do string substitution for embedded templates
+                return obj.replace(/\{\{step_(\d+)\.(\w+(?:\.\w+)?)\}\}/g, (match, stepNum, field) => {
+                  const value = resolveVariable(match, stepNum, field);
+                  if (value === null) return match;
+
+                  // Format for string embedding
+                  if (Array.isArray(value)) {
+                    if (value.length > 0 && typeof value[0] === 'object') {
+                      return value.map(item => {
+                        if (item.text && item.from && item.date) {
+                          return `[${item.date}] ${item.from}: ${item.text}`;
+                        }
+                        return JSON.stringify(item);
+                      }).join('\n');
+                    }
+                    return value.join(', ');
+                  } else if (typeof value === 'object' && value !== null) {
+                    return JSON.stringify(value);
+                  }
+                  return String(value);
+                });
+              } else if (Array.isArray(obj)) {
+                return obj.map(item => substituteInObject(item));
+              } else if (typeof obj === 'object' && obj !== null) {
+                const result = {};
+                for (const [key, value] of Object.entries(obj)) {
+                  result[key] = substituteInObject(value);
+                }
+                return result;
+              }
+              return obj;
+            };
+
+            resolvedArgs = substituteInObject(args);
           }
           
           try {
@@ -15681,6 +15772,10 @@ ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
 });
 
 app.on("window-all-closed", async () => {
+  // Clean up schedulers
+  stopTaskScheduler();
+  stopMemoryScheduler();
+
   // Clean up browser controller before quitting
   if (browserController) {
     try {
