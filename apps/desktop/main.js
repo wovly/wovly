@@ -9700,8 +9700,27 @@ Generate ONLY the welcome message, nothing else.`;
           }
 
           try {
+            // Format content properly - handle arrays and objects
+            let formattedContent = content;
+            if (Array.isArray(content)) {
+              // Array of objects (like emails) - format as readable text
+              if (content.length > 0 && typeof content[0] === 'object') {
+                formattedContent = JSON.stringify(content, null, 2);
+              } else {
+                formattedContent = content.join('\n');
+              }
+            } else if (typeof content === 'object' && content !== null) {
+              // Single object - stringify it
+              formattedContent = JSON.stringify(content, null, 2);
+            } else if (typeof content !== 'string') {
+              // Other types - convert to string
+              formattedContent = String(content);
+            }
+
+            console.log(`[LLM] Analyzing content: ${formattedContent.length} chars, type: ${Array.isArray(content) ? 'array' : typeof content}`);
+
             // Call the LLM with the analysis request
-            const analysisPrompt = `${instruction}\n\n${format === "json" ? "Respond with valid JSON only, no other text." : ""}\n\nContent to analyze:\n${content}`;
+            const analysisPrompt = `${instruction}\n\n${format === "json" ? "Respond with valid JSON only, no other text." : ""}\n\nContent to analyze:\n${formattedContent}`;
 
             const response = await fetch("https://api.anthropic.com/v1/messages", {
               method: "POST",
