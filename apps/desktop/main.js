@@ -9442,7 +9442,7 @@ Generate ONLY the welcome message, nothing else.`;
   };
 
   // Execute Google tool
-  const executeGoogleTool = async (toolName, toolInput, accessToken) => {
+  const executeGoogleTool = async (toolName, toolInput, accessToken, apiKeys = null) => {
     try {
       switch (toolName) {
         case "get_calendar_events": {
@@ -9665,20 +9665,38 @@ Generate ONLY the welcome message, nothing else.`;
             return { success: false, error: "content and instruction are required" };
           }
 
+          if (!apiKeys?.anthropic) {
+            return {
+              success: false,
+              error: "Anthropic API key not available"
+            };
+          }
+
           try {
             // Call the LLM with the analysis request
             const analysisPrompt = `${instruction}\n\n${format === "json" ? "Respond with valid JSON only, no other text." : ""}\n\nContent to analyze:\n${content}`;
 
-            const response = await anthropic.messages.create({
-              model: "claude-sonnet-4-5-20250929",
-              max_tokens: 4000,
-              messages: [{
-                role: "user",
-                content: analysisPrompt
-              }]
+            const response = await fetch("https://api.anthropic.com/v1/messages", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-api-key": apiKeys.anthropic,
+                "anthropic-version": "2023-06-01"
+              },
+              body: JSON.stringify({
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 4000,
+                messages: [{ role: "user", content: analysisPrompt }]
+              })
             });
 
-            const analysis = response.content[0].text;
+            if (!response.ok) {
+              const errorText = await response.text();
+              throw new Error(`API error: ${response.status} ${errorText}`);
+            }
+
+            const data = await response.json();
+            const analysis = data.content[0].text;
 
             console.log(`[LLM] Analysis completed (${analysis.length} chars)`);
             return {
@@ -9686,7 +9704,7 @@ Generate ONLY the welcome message, nothing else.`;
               analysis,
               result: analysis, // Alias for template compatibility
               formatted: analysis, // Alias for template compatibility
-              tokens_used: response.usage.input_tokens + response.usage.output_tokens
+              tokens_used: data.usage.input_tokens + data.usage.output_tokens
             };
           } catch (err) {
             console.error(`[LLM] Analysis error:`, err.message);
@@ -12963,6 +12981,7 @@ ${formatDecomposedSteps(steps)}
       asanaAccessToken = null,
       redditAccessToken = null,
       spotifyAccessToken = null,
+      apiKeys = null, // Add apiKeys for LLM-based tools
       includeProfileTools = true,
       includeTaskTools = true,
       includeMemoryTools = true,
@@ -13085,7 +13104,7 @@ ${formatDecomposedSteps(steps)}
       }
       // Google tools
       if (googleAccessToken && googleWorkspaceTools.find(t => t.name === toolName)) {
-        return await executeGoogleTool(toolName, toolInput, googleAccessToken);
+        return await executeGoogleTool(toolName, toolInput, googleAccessToken, apiKeys);
       }
       // iMessage tools
       if (iMessageEnabled && iMessageTools.find(t => t.name === toolName)) {
@@ -14927,7 +14946,8 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             slackAccessToken,
             weatherEnabled,
             iMessageEnabled: hasIMessageTools,
-            browserEnabled: hasBrowserTools
+            browserEnabled: hasBrowserTools,
+            apiKeys
           });
 
           for (const toolUse of toolUseBlocks) {
@@ -15156,17 +15176,20 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
         const slackAccessToken = await getSlackAccessToken(currentUser?.username).catch(() => null);
         const settingsPath = await getSettingsPath(currentUser?.username);
         let hasBrowserTools = false;
+        let apiKeys = {};
         try {
           const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
           hasBrowserTools = settings.browserEnabled === true;
+          apiKeys = settings.apiKeys || {};
         } catch { /* default */ }
-        
+
         const toolExecutor = buildToolsAndExecutor({
           googleAccessToken: accessToken,
           slackAccessToken,
           weatherEnabled: true,
           iMessageEnabled: process.platform === "darwin",
-          browserEnabled: hasBrowserTools
+          browserEnabled: hasBrowserTools,
+          apiKeys
         });
         
         const results = {};
@@ -15576,7 +15599,8 @@ Be concise. Execute the step and provide the answer.` }
             slackAccessToken,
             weatherEnabled,
             iMessageEnabled: process.platform === "darwin",
-            browserEnabled: hasBrowserTools
+            browserEnabled: hasBrowserTools,
+            apiKeys
           });
           
           console.log(`[Chat] Step ${stepNum} tools available: ${allTools.length}`, allTools.map(t => t.name));
