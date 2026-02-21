@@ -162,6 +162,62 @@ apps/desktop/
 - ❌ **NO utils dumping ground** - Create specific modules
 - ✅ Co-located `__tests__` folders are acceptable for unit tests
 
+### Development Files Organization - CRITICAL
+
+**ALL development, planning, and test files MUST go in `.dev-notes/` directory:**
+
+```
+.dev-notes/                        # ⚠️ EXCLUDED FROM GIT
+├── plans/                         # Planning documents
+│   ├── feature-name-plan.md
+│   ├── migration-summary.md
+│   ├── implementation-status.md
+│   └── session-notes.md
+├── test-files/                    # Development test scripts
+│   ├── test-feature.js
+│   ├── test-integration.js
+│   └── manual-test-scripts/
+└── backups/                       # Backup files
+    └── *.bak
+```
+
+**What goes in `.dev-notes/`:**
+- ✅ Planning documents (`*_PLAN.md`, `*_SUMMARY.md`, `*_STATUS.md`)
+- ✅ Progress tracking (`PHASE_*.md`, `*_PROGRESS.md`)
+- ✅ Session notes and implementation guides
+- ✅ Development test scripts (`test-*.js` for manual testing)
+- ✅ Backup files (`*.bak`, `*.backup`)
+- ✅ Migration logs and roadmaps
+- ✅ Any temporary development documentation
+
+**What does NOT go in `.dev-notes/`:**
+- ❌ Production test suites (use `tests/` directory)
+- ❌ User-facing documentation (use `docs/` or `README.md`)
+- ❌ Configuration files needed for builds
+- ❌ Source code (always in `src/`)
+
+**Why this matters:**
+- Keeps GitHub repository clean and focused on production code
+- Development notes remain accessible locally for your use
+- Reduces repository size and clutter
+- Makes it clear what's production vs development
+
+**Before committing, verify:**
+```bash
+# Check that no dev files are staged
+git status | grep -E "(PLAN|SUMMARY|STATUS|PROGRESS|test-.*\.js|\.bak)"
+
+# If any found, move to .dev-notes/
+mv FEATURE_PLAN.md .dev-notes/plans/
+mv test-something.js .dev-notes/test-files/
+```
+
+**.gitignore MUST include:**
+```gitignore
+# Development notes and test files
+.dev-notes/
+```
+
 ### File Naming Conventions
 
 ```
@@ -691,6 +747,7 @@ function updateUser(user: User): User {
 
 Before any commit, AI assistant MUST verify:
 
+- [ ] **No dev files in commit** - All plan/test/backup files in `.dev-notes/`
 - [ ] TypeScript compiles without errors (`npm run type-check`)
 - [ ] ESLint passes (`npm run lint`)
 - [ ] All tests pass (`npm run test`)
