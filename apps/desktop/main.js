@@ -9,6 +9,13 @@ const QRCode = require("qrcode");
 const { spawn, exec, execSync } = require("child_process");
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Import performance and caching utilities
+// ─────────────────────────────────────────────────────────────────────────────
+const { PerformanceTracker } = require("./dist/utils/performance");
+const { callLLMWithRetry } = require("./dist/utils/retry");
+const { responseCache, entityCache } = require("./dist/utils/cache");
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Import modular components from src/
 // ─────────────────────────────────────────────────────────────────────────────
 const {
@@ -50,6 +57,14 @@ const {
   getUserProfilePath,
   parseUserProfile,
   serializeUserProfile,
+  // Insights
+  saveInsights,
+  loadTodayInsights,
+  getLastCheckTimestamp,
+  getLastCheckData,
+  saveLastCheckTimestamp,
+  calculateGoalsHash,
+  processMessagesAndGenerateInsights,
   // Skills
   getSkillsDir,
   parseSkill,
@@ -107,6 +122,7 @@ const {
   parseTimeString,
   // LLM - Architect-Builder Decomposition
   CLASSIFIER_MODELS,
+  classifyQueryComplexity,
   decomposeQuery,
   architectDecompose,
   builderMapToTools,
@@ -115,6 +131,37 @@ const {
   formatArchitectSteps,
   formatBuilderPlan,
   getToolCategories,
+  // Clarification utilities
+  detectClarificationResponse,
+  buildEnrichedQueryFromClarification,
+  filterSensitiveQuestions,
+  formatClarificationQuestions,
+  // Streaming
+  streamAnthropicResponse,
+  streamOpenAIResponse,
+  // Services
+  SettingsService,
+  ProfileService,
+  CredentialsService,
+  AuthService,
+  OnboardingService,
+  SkillsService,
+  TasksService,
+  IntegrationsService,
+  CalendarService,
+  InsightsService,
+  TelegramService,
+  WhatsAppService,
+  DiscordService,
+  XService,
+  NotionService,
+  SpotifyService,
+  GitHubService,
+  AsanaService,
+  RedditService,
+  GoogleOAuthService,
+  SlackOAuthService,
+  WelcomeService,
 } = require("./src");
 
 // Tutorial / Onboarding
@@ -1194,6 +1241,150 @@ const stopMemoryScheduler = () => {
   }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Insights Scheduler
+// ─────────────────────────────────────────────────────────────────────────────
+
+let insightsSchedulerInterval = null;
+let insightsCheckRunning = false;
+
+const runInsightsCheck = async (limit = 5) => {
+  try {
+    // Prevent concurrent executions
+    if (insightsCheckRunning) {
+      console.log("[Insights] Check already running, skipping duplicate request");
+      return;
+    }
+
+    insightsCheckRunning = true;
+
+    if (!currentUser?.username) {
+      console.log("[Insights] No user logged in, skipping insights check");
+      insightsCheckRunning = false;
+      return;
+    }
+
+    console.log(`[Insights] Running hourly check (limit: ${limit})`);
+
+    // Load user profile to get current goals
+    const profilePath = await getUserProfilePath(currentUser.username);
+    const profileContent = await fs.readFile(profilePath, "utf8");
+    const profile = parseUserProfile(profileContent);
+    const userGoals = profile.goals || [];
+
+    console.log(`[Insights] User has ${userGoals.length} goals`);
+
+    // Get last check data (timestamp + goals hash)
+    const lastCheckData = await getLastCheckData(currentUser.username);
+    const lastCheckTimestamp = lastCheckData.lastCheckTimestamp;
+    const lastGoalsHash = lastCheckData.goalsHash;
+
+    // Calculate current goals hash
+    const currentGoalsHash = calculateGoalsHash(userGoals);
+    const goalsChanged = currentGoalsHash !== lastGoalsHash;
+
+    if (goalsChanged) {
+      console.log("[Insights] Goals have changed - will re-analyze recent messages");
+    }
+
+    // Determine lookback window
+    // If goals changed: analyze last 24 hours to catch goal-relevant insights we might have missed
+    // If goals unchanged: only process new messages since last check
+    let sinceTimestamp;
+    if (goalsChanged) {
+      // Re-analyze last 24 hours with new goal priorities
+      sinceTimestamp = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      console.log(`[Insights] Re-analyzing last 24 hours due to goal changes`);
+    } else {
+      // Normal operation: only new messages since last check
+      sinceTimestamp = lastCheckTimestamp || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    }
+
+    console.log(`[Insights] Processing messages since ${sinceTimestamp}`);
+
+    // Get access tokens
+    const googleToken = await getGoogleAccessToken(currentUser.username);
+    const slackToken = await getSlackAccessToken(currentUser.username);
+    const accessTokens = {
+      google: googleToken,
+      slack: slackToken
+    };
+
+    // Get API keys from settings
+    let apiKeys = {};
+    try {
+      const settingsPath = await getSettingsPath(currentUser.username);
+      const settingsData = await fs.readFile(settingsPath, "utf8");
+      const settings = JSON.parse(settingsData);
+      apiKeys = settings.apiKeys || {};
+    } catch (err) {
+      console.log("[Insights] No settings found, using empty API keys");
+    }
+
+    // Process messages and generate insights (goal-aware)
+    const insights = await processMessagesAndGenerateInsights(
+      currentUser.username,
+      accessTokens,
+      apiKeys,
+      sinceTimestamp,
+      userGoals,
+      limit
+    );
+
+    // Save insights
+    await saveInsights(currentUser.username, insights);
+
+    // Save new last check timestamp and goals hash
+    await saveLastCheckTimestamp(currentUser.username, new Date().toISOString(), userGoals);
+
+    console.log(`[Insights] Check complete. Generated ${insights.length} insights.`);
+
+    // Notify UI
+    if (win && win.webContents) {
+      win.webContents.send("insights:updated", { insights });
+    }
+  } catch (err) {
+    console.error("[Insights] Error during check:", err);
+  } finally {
+    // Always release the lock
+    insightsCheckRunning = false;
+  }
+};
+
+const startInsightsScheduler = () => {
+  if (insightsSchedulerInterval) {
+    clearInterval(insightsSchedulerInterval);
+  }
+
+  console.log("[Insights] Starting insights scheduler (checking every hour)");
+
+  // Note: Initial check runs on login/session restore
+  // Then runs every hour
+  insightsSchedulerInterval = setInterval(async () => {
+    // Load user's preferred insights limit from settings
+    let limit = 5; // default
+    try {
+      if (currentUser?.username) {
+        const settingsPath = await getSettingsPath(currentUser.username);
+        const settingsData = await fs.readFile(settingsPath, "utf8");
+        const settings = JSON.parse(settingsData);
+        limit = settings.insightsLimit || 5;
+      }
+    } catch (err) {
+      // Use default if settings not found
+    }
+    await runInsightsCheck(limit);
+  }, 60 * 60 * 1000); // 1 hour
+};
+
+const stopInsightsScheduler = () => {
+  if (insightsSchedulerInterval) {
+    clearInterval(insightsSchedulerInterval);
+    insightsSchedulerInterval = null;
+    console.log("[Insights] Stopped insights scheduler");
+  }
+};
+
 // Resume tasks on app startup
 const resumeTasksOnStartup = async (username) => {
   console.log("[Tasks] Checking for tasks to resume...");
@@ -1883,7 +2074,7 @@ const disconnectWhatsApp = async () => {
   }
   whatsappStatus = "disconnected";
   whatsappQR = null;
-  
+
   // Clear auth state
   try {
     const authDir = await getWhatsAppAuthDir();
@@ -1894,8 +2085,19 @@ const disconnectWhatsApp = async () => {
   } catch (e) {
     console.error("Failed to clear auth:", e);
   }
-  
+
   notifyWhatsAppStatus();
+};
+
+// WhatsApp connector for service dependency injection
+const whatsappConnector = {
+  connect: connectWhatsApp,
+  disconnect: disconnectWhatsApp,
+  getStatus: () => whatsappStatus,
+  getQR: () => whatsappQR,
+  getSocket: () => whatsappSocket,
+  getSelfChatJid: () => whatsappSelfChatJid,
+  getAuthDir: () => getWhatsAppAuthDir(currentUser?.username)
 };
 
 const notifyWhatsAppStatus = () => {
@@ -2111,10 +2313,10 @@ const disconnectTelegramInterface = async () => {
 
 function createWindow() {
   win = new BrowserWindow({
-    width: 1440,
-    height: 900,
-    minWidth: 1024,
-    minHeight: 700,
+    width: 1872, // 30% wider than 1440
+    height: 1170, // 30% taller than 900
+    minWidth: 1331, // 30% wider than 1024
+    minHeight: 910, // 30% taller than 700
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -2145,7 +2347,8 @@ app.whenReady().then(async () => {
   // Start schedulers
   startTaskScheduler();
   startMemoryScheduler();
-  
+  startInsightsScheduler();
+
   // Auto-reconnect WhatsApp if previously connected
   try {
     const authDir = await getWhatsAppAuthDir();
@@ -2387,418 +2590,102 @@ app.whenReady().then(async () => {
   }, 1000);
 
   // Settings handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Settings Service Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
   ipcMain.handle("settings:get", async () => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: true, settings: {} };
-      }
-      const settingsPath = await getSettingsPath(currentUser.username);
-      const data = await fs.readFile(settingsPath, "utf8");
-      return { ok: true, settings: JSON.parse(data) };
-    } catch {
-      return { ok: true, settings: {} };
-    }
+    return await SettingsService.getSettings(currentUser?.username);
   });
 
   ipcMain.handle("settings:set", async (_event, { settings }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const settingsPath = await getSettingsPath(currentUser.username);
-      let existing = {};
-      try {
-        existing = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch {
-        // No existing settings
-      }
-      const merged = { ...existing, ...settings };
-      await fs.writeFile(settingsPath, JSON.stringify(merged, null, 2));
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await SettingsService.updateSettings(currentUser?.username, settings);
   });
 
-  // Profile handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Profile Service Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
   ipcMain.handle("profile:get", async () => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const profilePath = await getUserProfilePath(currentUser.username);
-      const markdown = await fs.readFile(profilePath, "utf8");
-      const profile = parseUserProfile(markdown);
-      return { ok: true, profile };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await ProfileService.getProfile(currentUser?.username);
   });
 
   ipcMain.handle("profile:update", async (_event, { updates }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const profilePath = await getUserProfilePath(currentUser.username);
-      const markdown = await fs.readFile(profilePath, "utf8");
-      const profile = parseUserProfile(markdown);
-      Object.assign(profile, updates);
-      const newMarkdown = serializeUserProfile(profile);
-      await fs.writeFile(profilePath, newMarkdown, "utf8");
-      return { ok: true, profile };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await ProfileService.updateProfile(currentUser?.username, updates);
   });
 
   ipcMain.handle("profile:needsOnboarding", async () => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: true, needsOnboarding: false };
-      }
-      const profilePath = await getUserProfilePath(currentUser.username);
-      const markdown = await fs.readFile(profilePath, "utf8");
-      const profile = parseUserProfile(markdown);
-      
-      // Use the new onboardingStage field
-      const needsOnboarding = profile.onboardingStage !== "completed";
-      
-      return { ok: true, needsOnboarding, profile };
-    } catch {
-      return { ok: true, needsOnboarding: false };
-    }
+    return await ProfileService.needsOnboarding(currentUser?.username);
   });
 
-  // Add facts to profile (with conflict resolution)
   ipcMain.handle("profile:addFacts", async (_event, { facts, conflictResolutions }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const profilePath = await getUserProfilePath(currentUser.username);
-      const markdown = await fs.readFile(profilePath, "utf8");
-      const profile = parseUserProfile(markdown);
-      profile.notes = profile.notes || [];
-      
-      // Handle conflict resolutions (remove old notes that are being replaced)
-      if (conflictResolutions && conflictResolutions.length > 0) {
-        for (const resolution of conflictResolutions) {
-          if (resolution.keepNew) {
-            // Remove the old conflicting note
-            const existingIndex = profile.notes.findIndex(n => n === resolution.existingNote);
-            if (existingIndex > -1) {
-              console.log(`[Profile] Removing conflicting note: "${resolution.existingNote}"`);
-              profile.notes.splice(existingIndex, 1);
-            }
-          }
-        }
-      }
-      
-      // Add facts (skip those where user chose to keep existing)
-      for (const fact of facts) {
-        const conflictRes = conflictResolutions?.find(r => r.newFact === fact.summary);
-        if (conflictRes && !conflictRes.keepNew) {
-          console.log(`[Profile] Skipping fact (user kept existing): "${fact.summary}"`);
-          continue; // User chose to keep existing, don't add new
-        }
-        console.log(`[Profile] Adding fact: "${fact.summary}"`);
-        profile.notes.push(fact.summary);
-      }
-      
-      await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
-      console.log(`[Profile] Saved profile with ${profile.notes.length} notes`);
-      return { ok: true };
-    } catch (err) {
-      console.error("[Profile] Error adding facts:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await ProfileService.addFacts(currentUser?.username, facts, conflictResolutions);
   });
 
-  // Get raw profile markdown (for About Me page)
   ipcMain.handle("profile:getMarkdown", async () => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const profilePath = await getUserProfilePath(currentUser.username);
-      const markdown = await fs.readFile(profilePath, "utf8");
-      return { ok: true, markdown };
-    } catch (err) {
-      console.error("[Profile] Error reading markdown:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await ProfileService.getMarkdown(currentUser?.username);
   });
 
-  // Save raw profile markdown (for About Me page editor)
   ipcMain.handle("profile:saveMarkdown", async (_event, markdown) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const profilePath = await getUserProfilePath(currentUser.username);
-      await fs.writeFile(profilePath, markdown, "utf8");
-      console.log("[Profile] Saved profile markdown");
-      return { ok: true };
-    } catch (err) {
-      console.error("[Profile] Error saving markdown:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await ProfileService.saveMarkdown(currentUser?.username, markdown);
   });
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Insights Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("insights:setLimit", async (event, { limit = 5 } = {}) => {
+    return await InsightsService.setLimit(currentUser?.username, limit);
+  });
+
+  ipcMain.handle("insights:getToday", async (event, { limit = 5 } = {}) => {
+    return await InsightsService.getToday(currentUser?.username, limit);
+  });
+
+  ipcMain.handle("insights:refresh", async (event, { limit = 5 } = {}) => {
+    return await InsightsService.refresh(currentUser?.username, limit, runInsightsCheck);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // Onboarding handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
   ipcMain.handle("onboarding:getStatus", async () => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      
-      // Check if any API keys are configured
-      const settingsPath = await getSettingsPath(currentUser.username);
-      let hasApiKeys = false;
-      try {
-        const settingsData = await fs.readFile(settingsPath, "utf8");
-        const settings = JSON.parse(settingsData);
-        // Check for any LLM API keys
-        hasApiKeys = !!(
-          settings.anthropicApiKey || 
-          settings.openaiApiKey || 
-          settings.googleApiKey ||
-          settings.deepseekApiKey ||
-          settings.ollamaEndpoint
-        );
-      } catch {
-        // No settings file means no API keys
-      }
-      
-      // Get current onboarding stage from profile
-      const profilePath = await getUserProfilePath(currentUser.username);
-      const markdown = await fs.readFile(profilePath, "utf8");
-      const profile = parseUserProfile(markdown);
-      
-      // Check if they have any integrations connected
-      let hasIntegrations = false;
-      try {
-        const settingsData = await fs.readFile(settingsPath, "utf8");
-        const settings = JSON.parse(settingsData);
-        hasIntegrations = !!(
-          settings.googleAccessToken ||
-          settings.slackAccessToken ||
-          settings.weatherEnabled ||
-          settings.browserEnabled ||
-          settings.telegramToken ||
-          settings.discordAccessToken ||
-          settings.notionAccessToken ||
-          settings.githubAccessToken
-        );
-      } catch {
-        // No settings
-      }
-      
-      // Check if they have any tasks
-      let hasTask = false;
-      try {
-        const tasksDir = await getTasksDir(currentUser.username);
-        const files = await fs.readdir(tasksDir);
-        hasTask = files.some(f => f.endsWith('.md'));
-      } catch {
-        // No tasks
-      }
-      
-      // Check if they have any skills
-      let hasSkill = false;
-      try {
-        const skillsDir = await getSkillsDir(currentUser.username);
-        const files = await fs.readdir(skillsDir);
-        hasSkill = files.some(f => f.endsWith('.md'));
-      } catch {
-        // No skills
-      }
-      
-      console.log(`[Onboarding] Status: stage=${profile.onboardingStage}, hasApiKeys=${hasApiKeys}, hasTask=${hasTask}, hasSkill=${hasSkill}, hasIntegrations=${hasIntegrations}`);
-      
-      return { 
-        ok: true, 
-        stage: profile.onboardingStage,
-        skippedAt: profile.onboardingSkippedAt,
-        hasApiKeys,
-        hasTask,
-        hasSkill,
-        hasIntegrations,
-        profileComplete: !!(profile.firstName && profile.firstName !== "User" && profile.occupation)
-      };
-    } catch (err) {
-      console.error("[Onboarding] Error getting status:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await OnboardingService.getStatus(currentUser?.username);
   });
 
   ipcMain.handle("onboarding:setStage", async (_event, { stage }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      
-      if (!ONBOARDING_STAGES.includes(stage)) {
-        return { ok: false, error: `Invalid stage: ${stage}. Valid stages: ${ONBOARDING_STAGES.join(", ")}` };
-      }
-      
-      const profilePath = await getUserProfilePath(currentUser.username);
-      const markdown = await fs.readFile(profilePath, "utf8");
-      const profile = parseUserProfile(markdown);
-      
-      profile.onboardingStage = stage;
-      // Clear skipped status when advancing
-      if (stage !== profile.onboardingStage) {
-        profile.onboardingSkippedAt = null;
-      }
-      
-      await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
-      console.log(`[Onboarding] Set stage to: ${stage}`);
-      
-      return { ok: true, stage };
-    } catch (err) {
-      console.error("[Onboarding] Error setting stage:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await OnboardingService.setStage(currentUser?.username, stage);
   });
 
   ipcMain.handle("onboarding:skip", async () => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      
-      const profilePath = await getUserProfilePath(currentUser.username);
-      const markdown = await fs.readFile(profilePath, "utf8");
-      const profile = parseUserProfile(markdown);
-      
-      profile.onboardingStage = "completed";
-      profile.onboardingSkippedAt = new Date().toISOString();
-      
-      await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
-      console.log("[Onboarding] Skipped onboarding");
-      
-      return { ok: true };
-    } catch (err) {
-      console.error("[Onboarding] Error skipping:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await OnboardingService.skip(currentUser?.username);
   });
 
   // Skills handlers
   ipcMain.handle("skills:list", async () => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: true, skills: [] };
-      }
-      const skills = await loadAllSkills(currentUser.username);
-      return { ok: true, skills };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await SkillsService.listSkills(currentUser?.username);
   });
 
   ipcMain.handle("skills:get", async (_event, { skillId }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const skillsDir = await getSkillsDir(currentUser.username);
-      const filePath = path.join(skillsDir, `${skillId}.md`);
-      const content = await fs.readFile(filePath, "utf8");
-      const skill = parseSkill(content, `${skillId}.md`);
-      return { ok: true, skill, content };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await SkillsService.getSkill(currentUser?.username, skillId);
   });
 
   ipcMain.handle("skills:save", async (_event, { skillId, content }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const skillsDir = await getSkillsDir(currentUser.username);
-      const filePath = path.join(skillsDir, `${skillId}.md`);
-      await fs.writeFile(filePath, content, "utf8");
-      const skill = parseSkill(content, `${skillId}.md`);
-      return { ok: true, skill };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await SkillsService.saveSkill(currentUser?.username, skillId, content);
   });
 
   ipcMain.handle("skills:delete", async (_event, { skillId }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const skillsDir = await getSkillsDir(currentUser.username);
-      const filePath = path.join(skillsDir, `${skillId}.md`);
-      await fs.unlink(filePath);
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await SkillsService.deleteSkill(currentUser?.username, skillId);
   });
 
   ipcMain.handle("skills:getTemplate", async () => {
-    const template = `# New Skill
-
-## Description
-Describe what this skill does and when it should be used.
-
-## Keywords
-keyword1, keyword2, keyword3
-
-## Procedure
-1. First step
-2. Second step
-3. Third step
-
-## Constraints
-- Important constraint or rule
-- Another constraint
-`;
-    return { ok: true, template };
+    return SkillsService.getTemplate();
   });
 
   // LLM-powered welcome message generator
   ipcMain.handle("welcome:generate", async () => {
     try {
-      // Get current time info
-      const now = new Date();
-      const hour = now.getHours();
-      const dayOfWeek = now.toLocaleDateString("en-US", { weekday: "long" });
-      const dateStr = now.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
-      const timeStr = now.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
-
-      // Determine time of day
-      let timeOfDay;
-      if (hour >= 5 && hour < 12) {
-        timeOfDay = "morning";
-      } else if (hour >= 12 && hour < 17) {
-        timeOfDay = "afternoon";
-      } else if (hour >= 17 && hour < 21) {
-        timeOfDay = "evening";
-      } else {
-        timeOfDay = "night";
-      }
-
-      // Get user profile
-      let profile = null;
-      try {
-        const profilePath = await getUserProfilePath(currentUser?.username);
-        const markdown = await fs.readFile(profilePath, "utf8");
-        profile = parseUserProfile(markdown);
-      } catch {
-        // Profile not available
-      }
-
-      // Check if any API keys are configured
+      // Load settings for API keys and models
       const settingsPath = await getSettingsPath(currentUser?.username);
-      let hasApiKeys = false;
       let apiKeys = {};
       let models = {};
       let activeProvider = "anthropic";
@@ -2807,277 +2694,25 @@ keyword1, keyword2, keyword3
         apiKeys = settings.apiKeys || {};
         models = settings.models || {};
         activeProvider = settings.activeProvider || "anthropic";
-        hasApiKeys = !!(
-          apiKeys.anthropic || 
-          apiKeys.openai || 
-          apiKeys.google ||
-          apiKeys.deepseek ||
-          settings.ollamaEndpoint
-        );
       } catch {
         // No settings file
       }
 
-      // ONBOARDING STAGE 0: API Setup
-      // If no API keys, show API setup message
-      if (!hasApiKeys) {
-        console.log("[Onboarding] No API keys configured, showing setup message");
-        return {
-          ok: true,
-          message: `Welcome to Wovly! I'm your AI assistant.\n\nTo get started, you'll need to connect me to an AI provider. Head to **Settings** and add an API key from Anthropic, OpenAI, or Google.\n\nOnce configured, I'll help you set up your profile and show you what I can do!`,
-          needsApiSetup: true,
-          onboardingStage: "api_setup",
-          timeOfDay,
-          profile
-        };
-      }
-
-      // Check onboarding stage
-      const onboardingStage = profile?.onboardingStage || "api_setup";
-      
-      // ONBOARDING STAGE 1: Profile Questions
-      if (onboardingStage === "api_setup" || onboardingStage === "profile") {
-        // If they have API keys but are still in api_setup stage, advance to profile
-        if (onboardingStage === "api_setup" && hasApiKeys) {
-          console.log("[Onboarding] API keys configured, advancing to profile stage");
-          // Update the profile to reflect new stage
-          if (profile) {
-            profile.onboardingStage = "profile";
-            const profilePath = await getUserProfilePath(currentUser?.username);
-            await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
-          }
+      // Call WelcomeService to generate personalized welcome message
+      return await WelcomeService.generate(
+        currentUser?.username,
+        apiKeys,
+        models,
+        activeProvider,
+        {
+          getUserProfilePath,
+          parseUserProfile,
+          getGoogleAccessToken,
+          getSettingsPath
         }
-        
-        const greeting = timeOfDay === "morning" ? "Good morning" : 
-                        timeOfDay === "afternoon" ? "Good afternoon" : 
-                        timeOfDay === "evening" ? "Good evening" : "Hey there";
-        
-        console.log("[Onboarding] Starting profile questions");
-        return {
-          ok: true,
-          message: `${greeting}! Great, you're all set up! Let me get to know you a bit.\n\nWhat should I call you? (Just your first name is fine!)`,
-          needsOnboarding: true,
-          onboardingStage: "profile",
-          timeOfDay,
-          profile
-        };
-      }
-
-      // ONBOARDING STAGE 2: Task Demo
-      if (onboardingStage === "task_demo") {
-        console.log("[Onboarding] Starting task demo");
-        return {
-          ok: true,
-          message: `Now let's see Wovly in action! Try creating your first task.\n\nType something like: **"Remind me to eat lunch at 12pm tomorrow"**\n\nTasks run in the background and can monitor, remind, and take actions for you.`,
-          needsOnboarding: true,
-          onboardingStage: "task_demo",
-          timeOfDay,
-          profile
-        };
-      }
-
-      // ONBOARDING STAGE 3: Skill Demo
-      if (onboardingStage === "skill_demo") {
-        console.log("[Onboarding] Starting skill demo");
-        return {
-          ok: true,
-          message: `Excellent! Now let's create a skill. Skills teach me custom procedures.\n\nTry: **"Create a skill where if I say marco you say polo"**`,
-          needsOnboarding: true,
-          onboardingStage: "skill_demo",
-          timeOfDay,
-          profile
-        };
-      }
-
-      // ONBOARDING STAGE 4: Integrations
-      if (onboardingStage === "integrations") {
-        console.log("[Onboarding] Starting integrations recommendations");
-        return {
-          ok: true,
-          message: `You're almost done! To unlock Wovly's full potential, connect some integrations:\n\n**Recommended:**\n- **Google Workspace** - Email and calendar management\n- **iMessage** (macOS) - Send and receive texts\n- **Slack** - Team messaging\n- **Browser Automation** - Web research and form filling\n\nHead to the **Integrations** page to connect these, or say "skip" to finish onboarding.`,
-          needsOnboarding: true,
-          onboardingStage: "integrations",
-          timeOfDay,
-          profile
-        };
-      }
-
-      // COMPLETED - Normal operation
-      // Get today's and tomorrow's agenda if Google is authorized
-      let todayEvents = [];
-      let tomorrowEvents = [];
-      
-      try {
-        const accessToken = await getGoogleAccessToken(currentUser?.username);
-        if (accessToken) {
-          // Today's events
-          const todayStart = new Date(now);
-          todayStart.setHours(0, 0, 0, 0);
-          const todayEnd = new Date(now);
-          todayEnd.setHours(23, 59, 59, 999);
-          todayEvents = await fetchCalendarEvents(accessToken, todayStart, todayEnd);
-
-          // Tomorrow's events
-          const tomorrowStart = new Date(now);
-          tomorrowStart.setDate(tomorrowStart.getDate() + 1);
-          tomorrowStart.setHours(0, 0, 0, 0);
-          const tomorrowEnd = new Date(tomorrowStart);
-          tomorrowEnd.setHours(23, 59, 59, 999);
-          tomorrowEvents = await fetchCalendarEvents(accessToken, tomorrowStart, tomorrowEnd);
-        }
-      } catch (err) {
-        console.error("Calendar fetch error:", err);
-      }
-
-      // Build context for LLM
-      const formatEvents = (events) => {
-        if (events.length === 0) return "No events scheduled.";
-        return events.map(e => {
-          const startTime = e.start.includes("T") 
-            ? new Date(e.start).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
-            : "All day";
-          return `- ${startTime}: ${e.title}`;
-        }).join("\n");
-      };
-
-      const llmPrompt = `You are Wovly, a warm and personable AI assistant. Generate a welcome message for the user based on the context below.
-
-CURRENT TIME: ${timeStr} on ${dayOfWeek}, ${dateStr}
-TIME OF DAY: ${timeOfDay}
-
-USER PROFILE:
-- Name: ${profile?.firstName || "Friend"} ${profile?.lastName || ""}
-- Occupation: ${profile?.occupation || "Not specified"}
-- City: ${profile?.city || "Not specified"}
-- Home Life: ${profile?.homeLife || "Not specified"}
-
-TODAY'S AGENDA (${dayOfWeek}):
-${formatEvents(todayEvents)}
-
-TOMORROW'S AGENDA:
-${formatEvents(tomorrowEvents)}
-
-INSTRUCTIONS:
-- Keep the message concise (2-4 sentences max)
-- Be warm and personable, like a supportive friend
-- Reference specific events or context when relevant
-- Adjust tone based on time of day:
-  * Morning: Energizing, mention what's ahead
-  * Afternoon: Encouraging, acknowledge progress on the day
-  * Evening: Supportive, mention winding down
-  * Night (after 9pm): Calm, reflective, hopeful about tomorrow
-- If it's late night and they have events tomorrow, mention being ready for tomorrow
-- If they have kids (mentioned in home life), reference kid-related events like pickups
-- Don't be overly formal or use exclamation marks excessively
-- End with an invitation to chat or ask for help
-
-Generate ONLY the welcome message, nothing else.`;
-
-      // Determine which provider to use for welcome
-      const useProvider = apiKeys[activeProvider] ? activeProvider : 
-                          apiKeys.anthropic ? "anthropic" : 
-                          apiKeys.openai ? "openai" : 
-                          apiKeys.google ? "google" : null;
-
-      // Call the LLM
-      let welcomeMessage = "";
-
-      if (useProvider === "anthropic" && apiKeys.anthropic) {
-        try {
-          const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
-          const response = await fetch("https://api.anthropic.com/v1/messages", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-api-key": apiKeys.anthropic,
-              "anthropic-version": "2023-06-01"
-            },
-            body: JSON.stringify({
-              model: anthropicModel,
-              max_tokens: 300,
-              messages: [{ role: "user", content: llmPrompt }]
-            })
-          });
-
-          if (response.ok) {
-            const data = await response.json();
-            welcomeMessage = data.content?.[0]?.text || "";
-          }
-        } catch (err) {
-          console.error("Anthropic API error:", err);
-        }
-      }
-
-      // OpenAI
-      if (!welcomeMessage && apiKeys.openai) {
-        try {
-          const openaiModel = models.openai || "gpt-4o";
-          const response = await fetch("https://api.openai.com/v1/chat/completions", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${apiKeys.openai}`
-            },
-            body: JSON.stringify({
-              model: openaiModel,
-              max_tokens: 300,
-              messages: [{ role: "user", content: llmPrompt }]
-            })
-          });
-
-          if (response.ok) {
-            const data = await response.json();
-            welcomeMessage = data.choices?.[0]?.message?.content || "";
-          }
-        } catch (err) {
-          console.error("OpenAI API error:", err);
-        }
-      }
-
-      // Google Gemini
-      if (!welcomeMessage && apiKeys.google) {
-        try {
-          const geminiModel = models.google || "gemini-1.5-pro";
-          const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKeys.google}`,
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                contents: [{ role: "user", parts: [{ text: llmPrompt }] }]
-              })
-            }
-          );
-
-          if (response.ok) {
-            const data = await response.json();
-            welcomeMessage = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-          }
-        } catch (err) {
-          console.error("Gemini API error:", err);
-        }
-      }
-
-      // Final fallback
-      if (!welcomeMessage) {
-        const firstName = profile?.firstName || "there";
-        welcomeMessage = `Hey ${firstName}! How can I help you today?`;
-      }
-
-      return {
-        ok: true,
-        message: welcomeMessage,
-        needsOnboarding: false,
-        timeOfDay,
-        hour,
-        dayOfWeek,
-        profile,
-        todayEventCount: todayEvents.length,
-        tomorrowEventCount: tomorrowEvents.length
-      };
-
+      );
     } catch (err) {
-      console.error("Welcome generation error:", err);
+      console.error("[Welcome] Error:", err);
       return {
         ok: false,
         error: err.message,
@@ -3088,186 +2723,46 @@ Generate ONLY the welcome message, nothing else.`;
 
   // Calendar events handler
   ipcMain.handle("calendar:getEvents", async (_event, { date }) => {
-    try {
-      const accessToken = await getGoogleAccessToken(currentUser?.username);
-      if (!accessToken) {
-        return { ok: false, error: "Google not authorized" };
-      }
-
-      // Parse date in local timezone (not UTC)
-      // "2026-01-31" should be midnight Jan 31 LOCAL time
-      const [year, month, day] = date.split('-').map(Number);
-      const startDate = new Date(year, month - 1, day, 0, 0, 0, 0);
-      const endDate = new Date(year, month - 1, day, 23, 59, 59, 999);
-
-      const events = await fetchCalendarEvents(accessToken, startDate, endDate);
-      return { ok: true, events };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await CalendarService.getEvents(getGoogleAccessToken, currentUser?.username, date);
   });
 
   // Integration test handlers
   ipcMain.handle("integrations:testGoogle", async () => {
-    try {
-      const accessToken = await getGoogleAccessToken(currentUser?.username);
-      if (!accessToken) {
-        return { ok: false, error: "Not authorized" };
-      }
-      
-      // Test basic connection
-      const response = await fetch("https://www.googleapis.com/oauth2/v1/userinfo?alt=json", {
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      
-      if (!response.ok) {
-        return { ok: false, error: "Failed to verify connection" };
-      }
-      
-      const userInfo = await response.json();
-      
-      // Also test calendar access specifically
-      const calendarTestUrl = new URL("https://www.googleapis.com/calendar/v3/calendars/primary");
-      const calendarResponse = await fetch(calendarTestUrl.toString(), {
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      
-      if (!calendarResponse.ok) {
-        const errorText = await calendarResponse.text();
-        console.error("[Google] Calendar test failed:", errorText);
-        
-        if (calendarResponse.status === 403) {
-          return { 
-            ok: false, 
-            error: `Connected as ${userInfo.email}, but Calendar access denied. Please: 1) Enable Google Calendar API in your Google Cloud Console, 2) Disconnect and reconnect Google to grant calendar permissions.`
-          };
-        }
-        
-        return { 
-          ok: false, 
-          error: `Connected as ${userInfo.email}, but Calendar API error: ${calendarResponse.status}`
-        };
-      }
-      
-      return { ok: true, message: `Connected as ${userInfo.email} (Calendar: ✓)` };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await IntegrationsService.testGoogle(getGoogleAccessToken, currentUser?.username);
   });
 
   // Note: testSlack handler is now defined in the Slack Integration section above
 
   ipcMain.handle("integrations:testIMessage", async () => {
-    if (process.platform !== "darwin") {
-      return { ok: false, error: "iMessage is only available on macOS" };
-    }
-    
-    const dbPath = path.join(os.homedir(), "Library", "Messages", "chat.db");
-    try {
-      await fs.access(dbPath);
-      return { ok: true, message: "iMessage database accessible" };
-    } catch {
-      return { ok: false, error: "Cannot access Messages database. Grant Full Disk Access to this app." };
-    }
+    return await IntegrationsService.testIMessage();
   });
 
   // Weather test handler
   ipcMain.handle("integrations:testWeather", async () => {
-    try {
-      // Test Open-Meteo API with a simple location query
-      const response = await fetch("https://api.open-meteo.com/v1/forecast?latitude=40.71&longitude=-74.01&current=temperature_2m&timezone=auto");
-      if (response.ok) {
-        const data = await response.json();
-        const temp = Math.round(data.current.temperature_2m * 9/5 + 32); // Convert to F
-        return { ok: true, message: `Weather API connected. Current: ${temp}°F in NYC` };
-      }
-      return { ok: false, error: "Failed to connect to weather API" };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await IntegrationsService.testWeather();
   });
 
   // Weather enable/disable handler
   ipcMain.handle("integrations:setWeatherEnabled", async (_event, { enabled }) => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch {
-        // No existing settings
-      }
-      settings.weatherEnabled = enabled;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await IntegrationsService.setWeatherEnabled(currentUser?.username, enabled);
   });
 
   ipcMain.handle("integrations:getWeatherEnabled", async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      return { ok: true, enabled: settings.weatherEnabled !== false };
-    } catch {
-      return { ok: true, enabled: true }; // Default to enabled
-    }
+    return await IntegrationsService.getWeatherEnabled(currentUser?.username);
   });
 
   // Browser Automation Settings (CDP)
   ipcMain.handle("integrations:getBrowserEnabled", async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      return { ok: true, enabled: settings.browserEnabled === true };
-    } catch {
-      return { ok: true, enabled: false };
-    }
+    return await IntegrationsService.getBrowserEnabled(currentUser?.username);
   });
 
   ipcMain.handle("integrations:setBrowserEnabled", async (_event, { enabled }) => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch {}
-      
-      settings.browserEnabled = enabled;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      
-      console.log(`[Settings] Browser automation ${enabled ? 'enabled' : 'disabled'}`);
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await IntegrationsService.setBrowserEnabled(currentUser?.username, enabled);
   });
 
   // Test CDP browser
   ipcMain.handle("integrations:testBrowser", async () => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const controller = await getBrowserController(currentUser.username);
-      const snapshot = await controller.navigate("test", "https://example.com");
-      
-      // Clean up test session
-      const { context } = controller.contexts.get("test") || {};
-      if (context) {
-        await context.close();
-        controller.contexts.delete("test");
-      }
-      
-      return { 
-        ok: true, 
-        message: `Browser working! Navigated to ${snapshot.title}. Found ${snapshot.elementCount} interactive elements.`,
-        screenshot: snapshot.screenshot
-      };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await IntegrationsService.testBrowser(getBrowserController, currentUser?.username);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -3275,134 +2770,34 @@ Generate ONLY the welcome message, nothing else.`;
   // Secure, local-only credential management for website logins
   // ─────────────────────────────────────────────────────────────────────────────
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Credentials Service Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
   ipcMain.handle("credentials:list", async () => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: true, credentials: [] };
-      }
-      const credentials = await loadCredentials(currentUser.username);
-      // Return credentials with passwords masked for display
-      const masked = Object.entries(credentials).map(([domain, cred]) => ({
-        domain: cred.domain || domain,
-        displayName: cred.displayName || domain,
-        username: cred.username || "",
-        hasPassword: !!cred.password,
-        notes: cred.notes || "",
-        lastUsed: cred.lastUsed || null,
-        created: cred.created || null
-      }));
-      return { ok: true, credentials: masked };
-    } catch (err) {
-      console.error("[Credentials] List error:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await CredentialsService.listCredentials(currentUser?.username);
   });
 
   ipcMain.handle("credentials:get", async (_event, { domain, includePassword = false }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const credential = await getCredentialForDomain(domain, currentUser.username);
-      if (!credential) {
-        return { ok: false, error: "Credential not found" };
-      }
-      
-      // Only include password if explicitly requested (for edit modal)
-      const result = {
-        domain: credential.domain,
-        displayName: credential.displayName || credential.domain,
-        username: credential.username || "",
-        notes: credential.notes || "",
-        lastUsed: credential.lastUsed || null,
-        created: credential.created || null
-      };
-      
-      if (includePassword) {
-        result.password = credential.password || "";
-      }
-      
-      return { ok: true, credential: result };
-    } catch (err) {
-      console.error("[Credentials] Get error:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await CredentialsService.getCredential(currentUser?.username, domain, includePassword);
   });
 
   ipcMain.handle("credentials:save", async (_event, { domain, displayName, username, password, notes }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      if (!domain || domain.trim() === "") {
-        return { ok: false, error: "Domain is required" };
-      }
-      
-      const credentials = await loadCredentials(currentUser.username);
-      const normalizedDomain = domain.toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
-      
-      const existingCred = credentials[normalizedDomain];
-      
-      credentials[normalizedDomain] = {
-        domain: normalizedDomain,
-        displayName: displayName || normalizedDomain,
-        username: username || "",
-        password: password || existingCred?.password || "", // Keep existing password if not provided
-        notes: notes || "",
-        lastUsed: existingCred?.lastUsed || null,
-        created: existingCred?.created || new Date().toISOString()
-      };
-      
-      await saveCredentials(credentials, currentUser.username);
-      
-      console.log(`[Credentials] Saved credential for ${normalizedDomain}`);
-      return { ok: true, domain: normalizedDomain };
-    } catch (err) {
-      console.error("[Credentials] Save error:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await CredentialsService.saveCredential(
+      currentUser?.username,
+      domain,
+      displayName,
+      username,
+      password,
+      notes
+    );
   });
 
   ipcMain.handle("credentials:delete", async (_event, { domain }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const credentials = await loadCredentials(currentUser.username);
-      const normalizedDomain = domain.toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
-      
-      if (!credentials[normalizedDomain]) {
-        return { ok: false, error: "Credential not found" };
-      }
-      
-      delete credentials[normalizedDomain];
-      await saveCredentials(credentials, currentUser.username);
-      
-      console.log(`[Credentials] Deleted credential for ${normalizedDomain}`);
-      return { ok: true };
-    } catch (err) {
-      console.error("[Credentials] Delete error:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await CredentialsService.deleteCredential(currentUser?.username, domain);
   });
 
   ipcMain.handle("credentials:updateLastUsed", async (_event, { domain }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const credentials = await loadCredentials(currentUser.username);
-      const normalizedDomain = domain.toLowerCase();
-      
-      if (credentials[normalizedDomain]) {
-        credentials[normalizedDomain].lastUsed = new Date().toISOString();
-        await saveCredentials(credentials, currentUser.username);
-      }
-      
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await CredentialsService.updateLastUsed(currentUser?.username, domain);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -3421,361 +2816,125 @@ Generate ONLY the welcome message, nothing else.`;
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // User Authentication System - Multi-user support with local passwords
+  // Auth Service Setup - Configure login/logout hooks
   // ─────────────────────────────────────────────────────────────────────────────
-  
+
   // currentUser is defined at module scope for cross-function access
-  
-  const getUsersPath = async () => {
-    const baseDir = await getWovlyDir();
-    return path.join(baseDir, "users.json");
-  };
-  
-  const loadUsers = async () => {
-    try {
-      const usersPath = await getUsersPath();
-      const data = await fs.readFile(usersPath, "utf8");
-      return JSON.parse(data);
-    } catch {
-      return {};
+
+  // Set up login hooks for background tasks
+  AuthService.setLoginHooks({
+    onLogin: async (username) => {
+      // Process old memory files (in background)
+      processOldMemoryFiles(username).catch(err => {
+        console.error("[Memory] Error processing old files:", err.message);
+      });
+
+      // Resume any pending tasks (in background)
+      resumeTasksOnStartup(username).catch(err => {
+        console.error("[Tasks] Error resuming tasks:", err.message);
+      });
+
+      // Run event-based tasks triggered by login (in background)
+      runOnLoginTasks(username).catch(err => {
+        console.error("[Tasks] Error running on-login tasks:", err.message);
+      });
+
+      // Run insights check after login (in background)
+      (async () => {
+        let limit = 5;
+        try {
+          const settingsPath = await getSettingsPath(username);
+          const settingsData = await fs.readFile(settingsPath, "utf8");
+          const settings = JSON.parse(settingsData);
+          limit = settings.insightsLimit || 5;
+        } catch (err) {
+          // Use default if settings not found
+        }
+        await runInsightsCheck(limit);
+      })().catch(err => {
+        console.error("[Insights] Error running initial check:", err.message);
+      });
+    },
+    onSessionRestore: async (username) => {
+      // Resume tasks in background
+      resumeTasksOnStartup(username).catch(err => {
+        console.error("[Tasks] Error resuming tasks:", err.message);
+      });
+
+      // Run on-login event tasks in background
+      runOnLoginTasks(username).catch(err => {
+        console.error("[Tasks] Error running on-login tasks:", err.message);
+      });
+
+      // Run insights check in background
+      (async () => {
+        let limit = 5;
+        try {
+          const settingsPath = await getSettingsPath(username);
+          const settingsData = await fs.readFile(settingsPath, "utf8");
+          const settings = JSON.parse(settingsData);
+          limit = settings.insightsLimit || 5;
+        } catch (err) {
+          // Use default if settings not found
+        }
+        await runInsightsCheck(limit);
+      })().catch(err => {
+        console.error("[Insights] Error running check:", err.message);
+      });
     }
-  };
-  
-  const saveUsers = async (users) => {
-    const usersPath = await getUsersPath();
-    await fs.writeFile(usersPath, JSON.stringify(users, null, 2));
-  };
-  
-  // Simple password hashing (for local use - not cryptographically secure for network)
-  const hashPassword = (password) => {
-    const crypto = require("crypto");
-    return crypto.createHash("sha256").update(password).digest("hex");
-  };
-  
-  // Check if any users exist
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Auth Service Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
   ipcMain.handle("auth:hasUsers", async () => {
-    try {
-      const users = await loadUsers();
-      return { ok: true, hasUsers: Object.keys(users).length > 0 };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await AuthService.hasUsers();
   });
-  
-  // List all usernames (for login screen)
+
   ipcMain.handle("auth:listUsers", async () => {
-    try {
-      const users = await loadUsers();
-      const userList = Object.entries(users).map(([username, data]) => ({
-        username,
-        displayName: data.displayName || username,
-        createdAt: data.createdAt
-      }));
-      return { ok: true, users: userList };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await AuthService.listUsers();
   });
-  
-  // Register a new user
+
   ipcMain.handle("auth:register", async (_event, { username, password, displayName }) => {
-    try {
-      if (!username || !password) {
-        return { ok: false, error: "Username and password are required" };
-      }
-      
-      const users = await loadUsers();
-      const normalizedUsername = username.toLowerCase().trim();
-      
-      if (users[normalizedUsername]) {
-        return { ok: false, error: "Username already exists" };
-      }
-      
-      users[normalizedUsername] = {
-        username: normalizedUsername,
-        displayName: displayName || username,
-        passwordHash: hashPassword(password),
-        createdAt: new Date().toISOString()
-      };
-      
-      await saveUsers(users);
-      console.log(`[Auth] User registered: ${normalizedUsername}`);
-      
-      return { ok: true, username: normalizedUsername };
-    } catch (err) {
-      console.error("[Auth] Register error:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await AuthService.register(username, password, displayName);
   });
   
   // Login
   ipcMain.handle("auth:login", async (_event, { username, password }) => {
-    try {
-      if (!username || !password) {
-        return { ok: false, error: "Username and password are required" };
-      }
-      
-      const users = await loadUsers();
-      const normalizedUsername = username.toLowerCase().trim();
-      const user = users[normalizedUsername];
-      
-      if (!user) {
-        return { ok: false, error: "User not found" };
-      }
-      
-      if (user.passwordHash !== hashPassword(password)) {
-        return { ok: false, error: "Incorrect password" };
-      }
-      
-      // Set current user
-      currentUser = {
-        username: normalizedUsername,
-        displayName: user.displayName
-      };
-      
-      // Update last login
-      users[normalizedUsername].lastLogin = new Date().toISOString();
-      await saveUsers(users);
-      
-      // Save session for persistence across app restarts
-      await saveSession(currentUser);
-      
-      console.log(`[Auth] User logged in: ${normalizedUsername}`);
-      
-      // Process old memory files for this user (in background)
-      processOldMemoryFiles(normalizedUsername).catch(err => {
-        console.error("[Memory] Error processing old files:", err.message);
-      });
-      
-      // Resume any pending tasks for this user (in background)
-      resumeTasksOnStartup(normalizedUsername).catch(err => {
-        console.error("[Tasks] Error resuming tasks:", err.message);
-      });
-      
-      // Run event-based tasks triggered by login (in background)
-      runOnLoginTasks(normalizedUsername).catch(err => {
-        console.error("[Tasks] Error running on-login tasks:", err.message);
-      });
-      
-      return { 
-        ok: true, 
-        user: {
-          username: currentUser.username,
-          displayName: currentUser.displayName
-        }
-      };
-    } catch (err) {
-      console.error("[Auth] Login error:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await AuthService.login(username, password, (user) => { currentUser = user; });
   });
   
   // Logout
   ipcMain.handle("auth:logout", async () => {
-    try {
-      const username = currentUser?.username;
-      currentUser = null;
-      // Clear session file
-      await clearSession();
-      // Clear user-specific caches
-      if (username) {
-        credentialsCache.delete(username);
-      }
-      contactNameCache.clear();
-      console.log(`[Auth] User logged out: ${username || "unknown"}`);
-      return { ok: true };
-    } catch (err) {
-      console.error("[Auth] Logout error:", err.message);
-      return { ok: false, error: err.message };
-    }
+    return await AuthService.logout(
+      currentUser,
+      (user) => { currentUser = user; },
+      [
+        () => { if (currentUser?.username) credentialsCache.delete(currentUser.username); },
+        () => { contactNameCache.clear(); }
+      ]
+    );
   });
   
   // Check current session - restores from file if not in memory
   ipcMain.handle("auth:checkSession", async () => {
-    try {
-      // If already logged in, return current user
-      if (currentUser) {
-        return { 
-          ok: true, 
-          loggedIn: true, 
-          user: {
-            username: currentUser.username,
-            displayName: currentUser.displayName
-          }
-        };
-      }
-      
-      // Try to restore session from file
-      const savedSession = await loadSession();
-      if (savedSession?.username) {
-        // Verify user still exists
-        const users = await loadUsers();
-        const user = users[savedSession.username];
-        if (user) {
-          // Restore the session
-          currentUser = {
-            username: savedSession.username,
-            displayName: savedSession.displayName || user.displayName
-          };
-          console.log(`[Auth] Session restored for ${currentUser.username}`);
-          
-          // Resume tasks in background
-          resumeTasksOnStartup(currentUser.username).catch(err => {
-            console.error("[Tasks] Error resuming tasks:", err.message);
-          });
-          
-          // Run on-login event tasks in background
-          runOnLoginTasks(currentUser.username).catch(err => {
-            console.error("[Tasks] Error running on-login tasks:", err.message);
-          });
-          
-          return { 
-            ok: true, 
-            loggedIn: true, 
-            user: {
-              username: currentUser.username,
-              displayName: currentUser.displayName
-            }
-          };
-        } else {
-          // User was deleted, clear the session
-          await clearSession();
-        }
-      }
-      
-      return { ok: true, loggedIn: false };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await AuthService.checkSession(currentUser, (user) => { currentUser = user; });
   });
   
   // Get current user
   ipcMain.handle("auth:getCurrentUser", async () => {
-    try {
-      if (!currentUser) {
-        return { ok: false, error: "Not logged in" };
-      }
-      return { 
-        ok: true, 
-        user: {
-          username: currentUser.username,
-          displayName: currentUser.displayName
-        }
-      };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return AuthService.getCurrentUser(currentUser);
   });
 
   // Google OAuth flow
+  // Google OAuth
   ipcMain.handle("integrations:startGoogleOAuth", async (_event, { clientId, clientSecret }) => {
-    return new Promise((resolve) => {
-      const redirectUri = "http://localhost:18923/oauth/callback";
-      const scopes = [
-        "https://www.googleapis.com/auth/calendar",
-        "https://www.googleapis.com/auth/calendar.events",
-        "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/gmail.send",
-        "https://www.googleapis.com/auth/gmail.compose",
-        "https://www.googleapis.com/auth/drive.readonly"
-      ].join(" ");
-
-      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
-        `client_id=${encodeURIComponent(clientId)}` +
-        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-        `&response_type=code` +
-        `&scope=${encodeURIComponent(scopes)}` +
-        `&access_type=offline` +
-        `&prompt=consent`;
-
-      // Create local server to handle callback
-      const server = http.createServer(async (req, res) => {
-        const url = new URL(req.url, `http://localhost:18923`);
-        
-        if (url.pathname === "/oauth/callback") {
-          const code = url.searchParams.get("code");
-          const error = url.searchParams.get("error");
-
-          if (error) {
-            res.writeHead(200, { "Content-Type": "text/html" });
-            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
-            server.close();
-            resolve({ ok: false, error });
-            return;
-          }
-
-          if (code) {
-            try {
-              // Exchange code for tokens
-              const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-                method: "POST",
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body: new URLSearchParams({
-                  code,
-                  client_id: clientId,
-                  client_secret: clientSecret,
-                  redirect_uri: redirectUri,
-                  grant_type: "authorization_code"
-                })
-              });
-
-              const tokenData = await tokenResponse.json();
-
-              if (tokenData.access_token) {
-                // Save tokens
-                const settingsPath = await getSettingsPath(currentUser?.username);
-                let settings = {};
-                try {
-                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-                } catch {
-                  // No existing settings
-                }
-
-                settings.googleTokens = {
-                  access_token: tokenData.access_token,
-                  refresh_token: tokenData.refresh_token,
-                  expires_at: Date.now() + (tokenData.expires_in * 1000),
-                  client_id: clientId,
-                  client_secret: clientSecret
-                };
-
-                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
-                server.close();
-                resolve({ ok: true });
-              } else {
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
-                server.close();
-                resolve({ ok: false, error: tokenData.error_description || "Token exchange failed" });
-              }
-            } catch (err) {
-              res.writeHead(200, { "Content-Type": "text/html" });
-              res.end("<h1>Error</h1><p>" + err.message + "</p>");
-              server.close();
-              resolve({ ok: false, error: err.message });
-            }
-          }
-        }
-      });
-
-      server.listen(18923, () => {
-        require("electron").shell.openExternal(authUrl);
-      });
-
-      // Timeout after 5 minutes
-      setTimeout(() => {
-        server.close();
-        resolve({ ok: false, error: "Authorization timed out" });
-      }, 300000);
-    });
+    return await GoogleOAuthService.startOAuth(currentUser?.username, clientId, clientSecret, electron.shell);
   });
 
   ipcMain.handle("integrations:checkGoogleAuth", async () => {
-    const accessToken = await getGoogleAccessToken(currentUser?.username);
-    return { ok: true, authorized: !!accessToken };
+    return await GoogleOAuthService.checkAuth(currentUser?.username, getGoogleAccessToken);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -3930,182 +3089,22 @@ Generate ONLY the welcome message, nothing else.`;
     return { ok: true, url: slackTunnelUrl };
   });
 
-  // Slack OAuth flow - using USER tokens to send messages as the user
+  // Slack OAuth
   ipcMain.handle("integrations:startSlackOAuth", async (_event, { clientId, clientSecret, tunnelUrl }) => {
-    return new Promise((resolve) => {
-      // Use tunnel URL if provided, otherwise fall back to localhost
-      const redirectUri = tunnelUrl ? `${tunnelUrl}/oauth/callback` : "http://localhost:18924/oauth/callback";
-      
-      // User scopes - these allow sending messages as the user (not as a bot)
-      const userScopes = [
-        "channels:history",
-        "channels:read", 
-        "channels:write",
-        "chat:write",
-        "groups:history",
-        "groups:read",
-        "groups:write",
-        "im:history",
-        "im:read",
-        "im:write",
-        "mpim:history",
-        "mpim:read",
-        "users:read",
-        "users:read.email"
-      ].join(",");
-
-      // Use user_scope instead of scope to get user token
-      const authUrl = `https://slack.com/oauth/v2/authorize?` +
-        `client_id=${encodeURIComponent(clientId)}` +
-        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-        `&user_scope=${encodeURIComponent(userScopes)}`;
-
-      // Create local server to handle callback
-      const server = http.createServer(async (req, res) => {
-        const url = new URL(req.url, `http://localhost:18924`);
-        
-        if (url.pathname === "/oauth/callback") {
-          const code = url.searchParams.get("code");
-          const error = url.searchParams.get("error");
-
-          if (error) {
-            res.writeHead(200, { "Content-Type": "text/html" });
-            res.end("<h1>Authorization Failed</h1><p>" + error + "</p><p>You can close this window.</p>");
-            server.close();
-            resolve({ ok: false, error });
-            return;
-          }
-
-          if (code) {
-            try {
-              // Exchange code for tokens
-              const tokenResponse = await fetch("https://slack.com/api/oauth.v2.access", {
-                method: "POST",
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body: new URLSearchParams({
-                  code,
-                  client_id: clientId,
-                  client_secret: clientSecret,
-                  redirect_uri: redirectUri
-                })
-              });
-
-              const tokenData = await tokenResponse.json();
-              console.log("Slack OAuth response:", tokenData.ok ? "success" : tokenData.error);
-
-              // Check for user token (authed_user.access_token) - this allows sending as the user
-              const userToken = tokenData.authed_user?.access_token;
-              const userId = tokenData.authed_user?.id;
-              
-              if (tokenData.ok && userToken) {
-                // Save user token (not bot token)
-                const settingsPath = await getSettingsPath(currentUser?.username);
-                let settings = {};
-                try {
-                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-                } catch {
-                  // No existing settings
-                }
-
-                settings.slackTokens = {
-                  access_token: userToken,  // User token, not bot token
-                  user_id: userId,
-                  team: tokenData.team,
-                  client_id: clientId,
-                  client_secret: clientSecret,
-                  is_user_token: true  // Flag to indicate this is a user token
-                };
-
-                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end(`<h1>Slack Connected!</h1><p>Workspace: ${tokenData.team?.name || "Unknown"}</p><p>Connected as user. Messages will be sent on your behalf.</p><p>You can close this window and return to Wovly.</p>`);
-                server.close();
-                resolve({ ok: true, team: tokenData.team });
-              } else {
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Authorization Failed</h1><p>" + (tokenData.error || "Unknown error") + "</p>");
-                server.close();
-                resolve({ ok: false, error: tokenData.error || "Token exchange failed" });
-              }
-            } catch (err) {
-              res.writeHead(200, { "Content-Type": "text/html" });
-              res.end("<h1>Error</h1><p>" + err.message + "</p>");
-              server.close();
-              resolve({ ok: false, error: err.message });
-            }
-          }
-        }
-      });
-
-      server.listen(18924, () => {
-        require("electron").shell.openExternal(authUrl);
-      });
-
-      // Timeout after 5 minutes
-      setTimeout(() => {
-        server.close();
-        resolve({ ok: false, error: "Authorization timed out" });
-      }, 300000);
-    });
+    return await SlackOAuthService.startOAuth(currentUser?.username, clientId, clientSecret, tunnelUrl, electron.shell);
   });
 
   ipcMain.handle("integrations:checkSlackAuth", async () => {
-    const accessToken = await getSlackAccessToken(currentUser?.username);
-    if (!accessToken) {
-      return { ok: true, authorized: false };
-    }
-    
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      return { 
-        ok: true, 
-        authorized: true,
-        team: settings.slackTokens?.team
-      };
-    } catch {
-      return { ok: true, authorized: false };
-    }
+    return await SlackOAuthService.checkAuth(currentUser?.username, getSlackAccessToken, getSettingsPath);
   });
 
   ipcMain.handle("integrations:disconnectSlack", async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch {
-        // No settings
-      }
-      delete settings.slackTokens;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await SlackOAuthService.disconnect(currentUser?.username);
   });
 
   // Update the test handler
   ipcMain.handle("integrations:testSlack", async () => {
-    const accessToken = await getSlackAccessToken(currentUser?.username);
-    if (!accessToken) {
-      return { ok: false, error: "Slack not connected" };
-    }
-
-    try {
-      const response = await fetch("https://slack.com/api/auth.test", {
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      const data = await response.json();
-      
-      if (data.ok) {
-        return { ok: true, message: `Connected to ${data.team} as ${data.user} (messages will be sent as you)` };
-      }
-      return { ok: false, error: data.error || "Connection test failed" };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await IntegrationsService.testSlack(getSlackAccessToken, currentUser?.username);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -4113,65 +3112,19 @@ Generate ONLY the welcome message, nothing else.`;
   // ─────────────────────────────────────────────────────────────────────────────
 
   ipcMain.handle("telegram:setToken", async (_event, { token }) => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch { /* No existing settings */ }
-      
-      settings.telegramBotToken = token;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      
-      // Verify the token works
-      const response = await fetch(`https://api.telegram.org/bot${token}/getMe`);
-      const data = await response.json();
-      
-      if (data.ok) {
-        return { ok: true, bot: { username: data.result.username, name: data.result.first_name } };
-      }
-      return { ok: false, error: "Invalid bot token" };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await TelegramService.setToken(currentUser?.username, token);
   });
 
   ipcMain.handle("telegram:checkAuth", async () => {
-    const token = await getTelegramToken();
-    return { authorized: !!token };
+    return await TelegramService.checkAuth(currentUser?.username);
   });
 
   ipcMain.handle("telegram:disconnect", async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch { /* No settings */ }
-      
-      delete settings.telegramBotToken;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await TelegramService.disconnect(currentUser?.username);
   });
 
   ipcMain.handle("telegram:test", async () => {
-    const token = await getTelegramToken();
-    if (!token) {
-      return { ok: false, error: "Telegram not connected" };
-    }
-    try {
-      const response = await fetch(`https://api.telegram.org/bot${token}/getMe`);
-      const data = await response.json();
-      if (data.ok) {
-        return { ok: true, message: `Connected as @${data.result.username}` };
-      }
-      return { ok: false, error: "Token verification failed" };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await TelegramService.test(currentUser?.username);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -4179,128 +3132,24 @@ Generate ONLY the welcome message, nothing else.`;
   // ─────────────────────────────────────────────────────────────────────────────
 
   ipcMain.handle("discord:startOAuth", async (_event, { clientId, clientSecret }) => {
-    return new Promise((resolve) => {
-      const redirectUri = "http://localhost:18923/oauth/callback";
-      const scopes = "identify guilds guilds.members.read messages.read bot";
-      
-      const authUrl = `https://discord.com/api/oauth2/authorize?` +
-        `client_id=${encodeURIComponent(clientId)}` +
-        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-        `&response_type=code` +
-        `&scope=${encodeURIComponent(scopes)}`;
-
-      const server = http.createServer(async (req, res) => {
-        const url = new URL(req.url, `http://localhost:18923`);
-        
-        if (url.pathname === "/oauth/callback") {
-          const code = url.searchParams.get("code");
-          const error = url.searchParams.get("error");
-
-          if (error) {
-            res.writeHead(200, { "Content-Type": "text/html" });
-            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
-            server.close();
-            resolve({ ok: false, error });
-            return;
-          }
-
-          if (code) {
-            try {
-              const tokenResponse = await fetch("https://discord.com/api/oauth2/token", {
-                method: "POST",
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body: new URLSearchParams({
-                  code,
-                  client_id: clientId,
-                  client_secret: clientSecret,
-                  redirect_uri: redirectUri,
-                  grant_type: "authorization_code"
-                })
-              });
-
-              const tokenData = await tokenResponse.json();
-
-              if (tokenData.access_token) {
-                const settingsPath = await getSettingsPath(currentUser?.username);
-                let settings = {};
-                try {
-                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-                } catch { /* No existing settings */ }
-
-                settings.discordTokens = {
-                  access_token: tokenData.access_token,
-                  refresh_token: tokenData.refresh_token,
-                  expires_at: Date.now() + (tokenData.expires_in * 1000),
-                  client_id: clientId,
-                  client_secret: clientSecret
-                };
-
-                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
-                server.close();
-                resolve({ ok: true });
-              } else {
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
-                server.close();
-                resolve({ ok: false, error: tokenData.error_description || "Token exchange failed" });
-              }
-            } catch (err) {
-              res.writeHead(200, { "Content-Type": "text/html" });
-              res.end("<h1>Error</h1><p>" + err.message + "</p>");
-              server.close();
-              resolve({ ok: false, error: err.message });
-            }
-          }
-        }
-      });
-
-      server.listen(18923, () => {
-        require("electron").shell.openExternal(authUrl);
-      });
-    });
+    return await DiscordService.startOAuth(
+      currentUser?.username,
+      clientId,
+      clientSecret,
+      require("electron").shell
+    );
   });
 
   ipcMain.handle("discord:checkAuth", async () => {
-    const token = await getDiscordAccessToken();
-    return { authorized: !!token };
+    return await DiscordService.checkAuth(currentUser?.username, getDiscordAccessToken);
   });
 
   ipcMain.handle("discord:disconnect", async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch { /* No settings */ }
-      
-      delete settings.discordTokens;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await DiscordService.disconnect(currentUser?.username);
   });
 
   ipcMain.handle("discord:test", async () => {
-    const token = await getDiscordAccessToken();
-    if (!token) {
-      return { ok: false, error: "Discord not connected" };
-    }
-    try {
-      const response = await fetch("https://discord.com/api/v10/users/@me", {
-        headers: { "Authorization": `Bearer ${token}` }
-      });
-      const data = await response.json();
-      if (data.username) {
-        return { ok: true, message: `Connected as ${data.username}` };
-      }
-      return { ok: false, error: "Connection test failed" };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await DiscordService.test(currentUser?.username, getDiscordAccessToken);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -4308,135 +3157,19 @@ Generate ONLY the welcome message, nothing else.`;
   // ─────────────────────────────────────────────────────────────────────────────
 
   ipcMain.handle("x:startOAuth", async (_event, { clientId, clientSecret }) => {
-    return new Promise((resolve) => {
-      const redirectUri = "http://localhost:18923/oauth/callback";
-      const scopes = "tweet.read tweet.write users.read dm.read dm.write offline.access";
-      const codeVerifier = require("crypto").randomBytes(32).toString("base64url");
-      const codeChallenge = require("crypto").createHash("sha256").update(codeVerifier).digest("base64url");
-      
-      const authUrl = `https://twitter.com/i/oauth2/authorize?` +
-        `response_type=code` +
-        `&client_id=${encodeURIComponent(clientId)}` +
-        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-        `&scope=${encodeURIComponent(scopes)}` +
-        `&state=state` +
-        `&code_challenge=${codeChallenge}` +
-        `&code_challenge_method=S256`;
-
-      const server = http.createServer(async (req, res) => {
-        const url = new URL(req.url, `http://localhost:18923`);
-        
-        if (url.pathname === "/oauth/callback") {
-          const code = url.searchParams.get("code");
-          const error = url.searchParams.get("error");
-
-          if (error) {
-            res.writeHead(200, { "Content-Type": "text/html" });
-            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
-            server.close();
-            resolve({ ok: false, error });
-            return;
-          }
-
-          if (code) {
-            try {
-              const tokenResponse = await fetch("https://api.twitter.com/2/oauth2/token", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/x-www-form-urlencoded",
-                  "Authorization": `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`
-                },
-                body: new URLSearchParams({
-                  code,
-                  grant_type: "authorization_code",
-                  redirect_uri: redirectUri,
-                  code_verifier: codeVerifier
-                })
-              });
-
-              const tokenData = await tokenResponse.json();
-
-              if (tokenData.access_token) {
-                const settingsPath = await getSettingsPath(currentUser?.username);
-                let settings = {};
-                try {
-                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-                } catch { /* No existing settings */ }
-
-                settings.xTokens = {
-                  access_token: tokenData.access_token,
-                  refresh_token: tokenData.refresh_token,
-                  expires_at: Date.now() + (tokenData.expires_in * 1000),
-                  client_id: clientId,
-                  client_secret: clientSecret
-                };
-
-                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
-                server.close();
-                resolve({ ok: true });
-              } else {
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Token Exchange Failed</h1><p>" + (tokenData.error_description || "Unknown error") + "</p>");
-                server.close();
-                resolve({ ok: false, error: tokenData.error_description || "Token exchange failed" });
-              }
-            } catch (err) {
-              res.writeHead(200, { "Content-Type": "text/html" });
-              res.end("<h1>Error</h1><p>" + err.message + "</p>");
-              server.close();
-              resolve({ ok: false, error: err.message });
-            }
-          }
-        }
-      });
-
-      server.listen(18923, () => {
-        require("electron").shell.openExternal(authUrl);
-      });
-    });
+    return await XService.startOAuth(currentUser?.username, clientId, clientSecret, require("electron").shell);
   });
 
   ipcMain.handle("x:checkAuth", async () => {
-    const token = await getXAccessToken();
-    return { authorized: !!token };
+    return await XService.checkAuth(currentUser?.username, getXAccessToken);
   });
 
   ipcMain.handle("x:disconnect", async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch { /* No settings */ }
-      
-      delete settings.xTokens;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await XService.disconnect(currentUser?.username);
   });
 
   ipcMain.handle("x:test", async () => {
-    const token = await getXAccessToken();
-    if (!token) {
-      return { ok: false, error: "X not connected" };
-    }
-    try {
-      const response = await fetch("https://api.twitter.com/2/users/me", {
-        headers: { "Authorization": `Bearer ${token}` }
-      });
-      const data = await response.json();
-      if (data.data?.username) {
-        return { ok: true, message: `Connected as @${data.data.username}` };
-      }
-      return { ok: false, error: "Connection test failed" };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await XService.test(currentUser?.username, getXAccessToken);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -4444,652 +3177,103 @@ Generate ONLY the welcome message, nothing else.`;
   // ─────────────────────────────────────────────────────────────────────────────
 
   ipcMain.handle("notion:startOAuth", async (_event, { clientId, clientSecret }) => {
-    return new Promise((resolve) => {
-      const redirectUri = "http://localhost:18923/oauth/callback";
-      
-      const authUrl = `https://api.notion.com/v1/oauth/authorize?` +
-        `client_id=${encodeURIComponent(clientId)}` +
-        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-        `&response_type=code` +
-        `&owner=user`;
-
-      const server = http.createServer(async (req, res) => {
-        const url = new URL(req.url, `http://localhost:18923`);
-        
-        if (url.pathname === "/oauth/callback") {
-          const code = url.searchParams.get("code");
-          const error = url.searchParams.get("error");
-
-          if (error) {
-            res.writeHead(200, { "Content-Type": "text/html" });
-            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
-            server.close();
-            resolve({ ok: false, error });
-            return;
-          }
-
-          if (code) {
-            try {
-              const tokenResponse = await fetch("https://api.notion.com/v1/oauth/token", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  "Authorization": `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`
-                },
-                body: JSON.stringify({
-                  grant_type: "authorization_code",
-                  code,
-                  redirect_uri: redirectUri
-                })
-              });
-
-              const tokenData = await tokenResponse.json();
-
-              if (tokenData.access_token) {
-                const settingsPath = await getSettingsPath(currentUser?.username);
-                let settings = {};
-                try {
-                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-                } catch { /* No existing settings */ }
-
-                settings.notionTokens = {
-                  access_token: tokenData.access_token,
-                  workspace_name: tokenData.workspace_name,
-                  workspace_id: tokenData.workspace_id
-                };
-
-                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
-                server.close();
-                resolve({ ok: true, workspace: tokenData.workspace_name });
-              } else {
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
-                server.close();
-                resolve({ ok: false, error: tokenData.error || "Token exchange failed" });
-              }
-            } catch (err) {
-              res.writeHead(200, { "Content-Type": "text/html" });
-              res.end("<h1>Error</h1><p>" + err.message + "</p>");
-              server.close();
-              resolve({ ok: false, error: err.message });
-            }
-          }
-        }
-      });
-
-      server.listen(18923, () => {
-        require("electron").shell.openExternal(authUrl);
-      });
-    });
+    return await NotionService.startOAuth(currentUser?.username, clientId, clientSecret, require("electron").shell);
   });
 
   ipcMain.handle("notion:checkAuth", async () => {
-    const token = await getNotionAccessToken();
-    return { authorized: !!token };
+    return await NotionService.checkAuth(currentUser?.username, getNotionAccessToken);
   });
 
   ipcMain.handle("notion:disconnect", async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch { /* No settings */ }
-      
-      delete settings.notionTokens;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await NotionService.disconnect(currentUser?.username);
   });
 
   ipcMain.handle("notion:test", async () => {
-    const token = await getNotionAccessToken();
-    if (!token) {
-      return { ok: false, error: "Notion not connected" };
-    }
-    try {
-      const response = await fetch("https://api.notion.com/v1/users/me", {
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "Notion-Version": "2022-06-28"
-        }
-      });
-      const data = await response.json();
-      if (data.name) {
-        return { ok: true, message: `Connected as ${data.name}` };
-      }
-      return { ok: false, error: "Connection test failed" };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await NotionService.test(currentUser?.username, getNotionAccessToken);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
   // GitHub IPC Handlers
   // ─────────────────────────────────────────────────────────────────────────────
 
+  // GitHub
   ipcMain.handle("github:startOAuth", async (_event, { clientId, clientSecret }) => {
-    return new Promise((resolve) => {
-      const redirectUri = "http://localhost:18923/oauth/callback";
-      const scopes = "repo read:user notifications";
-      
-      const authUrl = `https://github.com/login/oauth/authorize?` +
-        `client_id=${encodeURIComponent(clientId)}` +
-        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-        `&scope=${encodeURIComponent(scopes)}`;
-
-      const server = http.createServer(async (req, res) => {
-        const url = new URL(req.url, `http://localhost:18923`);
-        
-        if (url.pathname === "/oauth/callback") {
-          const code = url.searchParams.get("code");
-          const error = url.searchParams.get("error");
-
-          if (error) {
-            res.writeHead(200, { "Content-Type": "text/html" });
-            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
-            server.close();
-            resolve({ ok: false, error });
-            return;
-          }
-
-          if (code) {
-            try {
-              const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  "Accept": "application/json"
-                },
-                body: JSON.stringify({
-                  client_id: clientId,
-                  client_secret: clientSecret,
-                  code
-                })
-              });
-
-              const tokenData = await tokenResponse.json();
-
-              if (tokenData.access_token) {
-                const settingsPath = await getSettingsPath(currentUser?.username);
-                let settings = {};
-                try {
-                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-                } catch { /* No existing settings */ }
-
-                settings.githubTokens = {
-                  access_token: tokenData.access_token,
-                  token_type: tokenData.token_type,
-                  scope: tokenData.scope
-                };
-
-                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
-                server.close();
-                resolve({ ok: true });
-              } else {
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
-                server.close();
-                resolve({ ok: false, error: tokenData.error_description || "Token exchange failed" });
-              }
-            } catch (err) {
-              res.writeHead(200, { "Content-Type": "text/html" });
-              res.end("<h1>Error</h1><p>" + err.message + "</p>");
-              server.close();
-              resolve({ ok: false, error: err.message });
-            }
-          }
-        }
-      });
-
-      server.listen(18923, () => {
-        require("electron").shell.openExternal(authUrl);
-      });
-    });
+    return await GitHubService.startOAuth(currentUser?.username, clientId, clientSecret, electron.shell);
   });
 
   ipcMain.handle("github:checkAuth", async () => {
-    const token = await getGitHubAccessToken();
-    return { authorized: !!token };
+    return await GitHubService.checkAuth(currentUser?.username, getGitHubAccessToken);
   });
 
   ipcMain.handle("github:disconnect", async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch { /* No settings */ }
-      
-      delete settings.githubTokens;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await GitHubService.disconnect(currentUser?.username);
   });
 
   ipcMain.handle("github:test", async () => {
-    const token = await getGitHubAccessToken();
-    if (!token) {
-      return { ok: false, error: "GitHub not connected" };
-    }
-    try {
-      const response = await fetch("https://api.github.com/user", {
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "Accept": "application/vnd.github+json"
-        }
-      });
-      const data = await response.json();
-      if (data.login) {
-        return { ok: true, message: `Connected as @${data.login}` };
-      }
-      return { ok: false, error: "Connection test failed" };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await GitHubService.test(currentUser?.username, getGitHubAccessToken);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Asana IPC Handlers
   // ─────────────────────────────────────────────────────────────────────────────
 
+  // Asana
   ipcMain.handle("asana:startOAuth", async (_event, { clientId, clientSecret }) => {
-    return new Promise((resolve) => {
-      const redirectUri = "http://localhost:18923/oauth/callback";
-      
-      const authUrl = `https://app.asana.com/-/oauth_authorize?` +
-        `client_id=${encodeURIComponent(clientId)}` +
-        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-        `&response_type=code`;
-
-      const server = http.createServer(async (req, res) => {
-        const url = new URL(req.url, `http://localhost:18923`);
-        
-        if (url.pathname === "/oauth/callback") {
-          const code = url.searchParams.get("code");
-          const error = url.searchParams.get("error");
-
-          if (error) {
-            res.writeHead(200, { "Content-Type": "text/html" });
-            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
-            server.close();
-            resolve({ ok: false, error });
-            return;
-          }
-
-          if (code) {
-            try {
-              const tokenResponse = await fetch("https://app.asana.com/-/oauth_token", {
-                method: "POST",
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body: new URLSearchParams({
-                  grant_type: "authorization_code",
-                  client_id: clientId,
-                  client_secret: clientSecret,
-                  redirect_uri: redirectUri,
-                  code
-                })
-              });
-
-              const tokenData = await tokenResponse.json();
-
-              if (tokenData.access_token) {
-                const settingsPath = await getSettingsPath(currentUser?.username);
-                let settings = {};
-                try {
-                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-                } catch { /* No existing settings */ }
-
-                settings.asanaTokens = {
-                  access_token: tokenData.access_token,
-                  refresh_token: tokenData.refresh_token,
-                  expires_at: Date.now() + (tokenData.expires_in * 1000),
-                  client_id: clientId,
-                  client_secret: clientSecret
-                };
-
-                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
-                server.close();
-                resolve({ ok: true });
-              } else {
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
-                server.close();
-                resolve({ ok: false, error: tokenData.error || "Token exchange failed" });
-              }
-            } catch (err) {
-              res.writeHead(200, { "Content-Type": "text/html" });
-              res.end("<h1>Error</h1><p>" + err.message + "</p>");
-              server.close();
-              resolve({ ok: false, error: err.message });
-            }
-          }
-        }
-      });
-
-      server.listen(18923, () => {
-        require("electron").shell.openExternal(authUrl);
-      });
-    });
+    return await AsanaService.startOAuth(currentUser?.username, clientId, clientSecret, electron.shell);
   });
 
   ipcMain.handle("asana:checkAuth", async () => {
-    const token = await getAsanaAccessToken();
-    return { authorized: !!token };
+    return await AsanaService.checkAuth(currentUser?.username, getAsanaAccessToken);
   });
 
   ipcMain.handle("asana:disconnect", async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch { /* No settings */ }
-      
-      delete settings.asanaTokens;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await AsanaService.disconnect(currentUser?.username);
   });
 
   ipcMain.handle("asana:test", async () => {
-    const token = await getAsanaAccessToken();
-    if (!token) {
-      return { ok: false, error: "Asana not connected" };
-    }
-    try {
-      const response = await fetch("https://app.asana.com/api/1.0/users/me", {
-        headers: { "Authorization": `Bearer ${token}` }
-      });
-      const data = await response.json();
-      if (data.data?.name) {
-        return { ok: true, message: `Connected as ${data.data.name}` };
-      }
-      return { ok: false, error: "Connection test failed" };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await AsanaService.test(currentUser?.username, getAsanaAccessToken);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Reddit IPC Handlers
   // ─────────────────────────────────────────────────────────────────────────────
 
+  // Reddit
   ipcMain.handle("reddit:startOAuth", async (_event, { clientId, clientSecret }) => {
-    return new Promise((resolve) => {
-      const redirectUri = "http://localhost:18923/oauth/callback";
-      const scopes = "identity read submit privatemessages history";
-      const state = require("crypto").randomBytes(16).toString("hex");
-      
-      const authUrl = `https://www.reddit.com/api/v1/authorize?` +
-        `client_id=${encodeURIComponent(clientId)}` +
-        `&response_type=code` +
-        `&state=${state}` +
-        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-        `&duration=permanent` +
-        `&scope=${encodeURIComponent(scopes)}`;
-
-      const server = http.createServer(async (req, res) => {
-        const url = new URL(req.url, `http://localhost:18923`);
-        
-        if (url.pathname === "/oauth/callback") {
-          const code = url.searchParams.get("code");
-          const error = url.searchParams.get("error");
-
-          if (error) {
-            res.writeHead(200, { "Content-Type": "text/html" });
-            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
-            server.close();
-            resolve({ ok: false, error });
-            return;
-          }
-
-          if (code) {
-            try {
-              const tokenResponse = await fetch("https://www.reddit.com/api/v1/access_token", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/x-www-form-urlencoded",
-                  "Authorization": `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`
-                },
-                body: new URLSearchParams({
-                  grant_type: "authorization_code",
-                  code,
-                  redirect_uri: redirectUri
-                })
-              });
-
-              const tokenData = await tokenResponse.json();
-
-              if (tokenData.access_token) {
-                const settingsPath = await getSettingsPath(currentUser?.username);
-                let settings = {};
-                try {
-                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-                } catch { /* No existing settings */ }
-
-                settings.redditTokens = {
-                  access_token: tokenData.access_token,
-                  refresh_token: tokenData.refresh_token,
-                  expires_at: Date.now() + (tokenData.expires_in * 1000),
-                  client_id: clientId,
-                  client_secret: clientSecret
-                };
-
-                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
-                server.close();
-                resolve({ ok: true });
-              } else {
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
-                server.close();
-                resolve({ ok: false, error: tokenData.error || "Token exchange failed" });
-              }
-            } catch (err) {
-              res.writeHead(200, { "Content-Type": "text/html" });
-              res.end("<h1>Error</h1><p>" + err.message + "</p>");
-              server.close();
-              resolve({ ok: false, error: err.message });
-            }
-          }
-        }
-      });
-
-      server.listen(18923, () => {
-        require("electron").shell.openExternal(authUrl);
-      });
-    });
+    return await RedditService.startOAuth(currentUser?.username, clientId, clientSecret, electron.shell);
   });
 
   ipcMain.handle("reddit:checkAuth", async () => {
-    const token = await getRedditAccessToken();
-    return { authorized: !!token };
+    return await RedditService.checkAuth(currentUser?.username, getRedditAccessToken);
   });
 
   ipcMain.handle("reddit:disconnect", async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch { /* No settings */ }
-      
-      delete settings.redditTokens;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await RedditService.disconnect(currentUser?.username);
   });
 
   ipcMain.handle("reddit:test", async () => {
-    const token = await getRedditAccessToken();
-    if (!token) {
-      return { ok: false, error: "Reddit not connected" };
-    }
-    try {
-      const response = await fetch("https://oauth.reddit.com/api/v1/me", {
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "User-Agent": "Wovly/1.0"
-        }
-      });
-      const data = await response.json();
-      if (data.name) {
-        return { ok: true, message: `Connected as u/${data.name}` };
-      }
-      return { ok: false, error: "Connection test failed" };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await RedditService.test(currentUser?.username, getRedditAccessToken);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Spotify IPC Handlers
   // ─────────────────────────────────────────────────────────────────────────────
 
+  // Spotify
   ipcMain.handle("spotify:startOAuth", async (_event, { clientId, clientSecret }) => {
-    return new Promise((resolve) => {
-      const redirectUri = "http://localhost:18923/oauth/callback";
-      const scopes = "user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private playlist-read-collaborative";
-      
-      const authUrl = `https://accounts.spotify.com/authorize?` +
-        `client_id=${encodeURIComponent(clientId)}` +
-        `&response_type=code` +
-        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-        `&scope=${encodeURIComponent(scopes)}`;
-
-      const server = http.createServer(async (req, res) => {
-        const url = new URL(req.url, `http://localhost:18923`);
-        
-        if (url.pathname === "/oauth/callback") {
-          const code = url.searchParams.get("code");
-          const error = url.searchParams.get("error");
-
-          if (error) {
-            res.writeHead(200, { "Content-Type": "text/html" });
-            res.end("<h1>Authorization Failed</h1><p>You can close this window.</p>");
-            server.close();
-            resolve({ ok: false, error });
-            return;
-          }
-
-          if (code) {
-            try {
-              const tokenResponse = await fetch("https://accounts.spotify.com/api/token", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/x-www-form-urlencoded",
-                  "Authorization": `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`
-                },
-                body: new URLSearchParams({
-                  grant_type: "authorization_code",
-                  code,
-                  redirect_uri: redirectUri
-                })
-              });
-
-              const tokenData = await tokenResponse.json();
-
-              if (tokenData.access_token) {
-                const settingsPath = await getSettingsPath(currentUser?.username);
-                let settings = {};
-                try {
-                  settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-                } catch { /* No existing settings */ }
-
-                settings.spotifyTokens = {
-                  access_token: tokenData.access_token,
-                  refresh_token: tokenData.refresh_token,
-                  expires_at: Date.now() + (tokenData.expires_in * 1000),
-                  client_id: clientId,
-                  client_secret: clientSecret
-                };
-
-                await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Authorization Successful!</h1><p>You can close this window and return to Wovly.</p>");
-                server.close();
-                resolve({ ok: true });
-              } else {
-                res.writeHead(200, { "Content-Type": "text/html" });
-                res.end("<h1>Token Exchange Failed</h1><p>You can close this window.</p>");
-                server.close();
-                resolve({ ok: false, error: tokenData.error || "Token exchange failed" });
-              }
-            } catch (err) {
-              res.writeHead(200, { "Content-Type": "text/html" });
-              res.end("<h1>Error</h1><p>" + err.message + "</p>");
-              server.close();
-              resolve({ ok: false, error: err.message });
-            }
-          }
-        }
-      });
-
-      server.listen(18923, () => {
-        require("electron").shell.openExternal(authUrl);
-      });
-    });
+    return await SpotifyService.startOAuth(currentUser?.username, clientId, clientSecret, electron.shell);
   });
 
   ipcMain.handle("spotify:checkAuth", async () => {
-    const token = await getSpotifyAccessToken();
-    return { authorized: !!token };
+    return await SpotifyService.checkAuth(currentUser?.username, getSpotifyAccessToken);
   });
 
   ipcMain.handle("spotify:disconnect", async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch { /* No settings */ }
-      
-      delete settings.spotifyTokens;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await SpotifyService.disconnect(currentUser?.username);
   });
 
   ipcMain.handle("spotify:test", async () => {
-    const token = await getSpotifyAccessToken();
-    if (!token) {
-      return { ok: false, error: "Spotify not connected" };
-    }
-    try {
-      const response = await fetch("https://api.spotify.com/v1/me", {
-        headers: { "Authorization": `Bearer ${token}` }
-      });
-      const data = await response.json();
-      if (data.display_name) {
-        return { ok: true, message: `Connected as ${data.display_name}` };
-      }
-      return { ok: false, error: "Connection test failed" };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await SpotifyService.test(currentUser?.username, getSpotifyAccessToken);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -5150,114 +3334,35 @@ Generate ONLY the welcome message, nothing else.`;
   });
 
   ipcMain.handle("tasks:list", async () => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: true, tasks: [] };
-      }
-      const tasks = await listTasks(currentUser.username);
-      return { ok: true, tasks };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await TasksService.listTasks(currentUser?.username);
   });
 
   ipcMain.handle("tasks:get", async (_event, taskId) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const task = await getTask(taskId, currentUser.username);
-      if (!task) {
-        return { ok: false, error: "Task not found" };
-      }
-      return { ok: true, task };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await TasksService.getTask(taskId, currentUser?.username);
   });
 
   ipcMain.handle("tasks:update", async (_event, { taskId, updates }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const task = await updateTask(taskId, updates, currentUser.username);
-      if (task.error) {
-        return { ok: false, error: task.error };
-      }
-      return { ok: true, task };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await TasksService.updateTask(taskId, updates, currentUser?.username);
   });
 
   ipcMain.handle("tasks:cancel", async (_event, taskId) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const result = await cancelTask(taskId, currentUser.username);
-      if (result.error) {
-        return { ok: false, error: result.error };
-      }
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await TasksService.cancelTask(taskId, currentUser?.username);
   });
 
   ipcMain.handle("tasks:hide", async (_event, taskId) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const result = await hideTask(taskId, currentUser.username);
-      if (result.error) {
-        return { ok: false, error: result.error };
-      }
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await TasksService.hideTask(taskId, currentUser?.username);
   });
 
   ipcMain.handle("tasks:getUpdates", async () => {
-    try {
-      const updates = getTaskUpdates();
-      return { ok: true, updates };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return TasksService.getUpdates();
   });
 
   ipcMain.handle("tasks:getRawMarkdown", async (_event, taskId) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const markdown = await getTaskRawMarkdown(taskId, currentUser.username);
-      if (markdown.error) {
-        return { ok: false, error: markdown.error };
-      }
-      return { ok: true, markdown };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await TasksService.getRawMarkdown(taskId, currentUser?.username);
   });
 
   ipcMain.handle("tasks:saveRawMarkdown", async (_event, { taskId, markdown }) => {
-    try {
-      if (!currentUser?.username) {
-        return { ok: false, error: "Not logged in" };
-      }
-      const result = await saveTaskRawMarkdown(taskId, markdown, currentUser.username);
-      if (result.error) {
-        return { ok: false, error: result.error };
-      }
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await TasksService.saveRawMarkdown(taskId, markdown, currentUser?.username);
   });
 
   ipcMain.handle("tasks:execute", async (_event, taskId) => {
@@ -5272,6 +3377,392 @@ Generate ONLY the welcome message, nothing else.`;
       return { ok: true, result };
     } catch (err) {
       return { ok: false, error: err.message };
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Web Scraper IPC Handlers
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("webscraper:analyzeUrl", async (_event, { url, siteType }) => {
+    try {
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+
+      const { VisualSelectorTool, ai } = require("./dist/webscraper/index");
+      const { getBrowserController } = require("./dist/browser");
+
+      // Create a temporary page to analyze
+      const browserController = await getBrowserController(currentUser.username);
+      const visualTool = new VisualSelectorTool(browserController, currentUser.username);
+      const sessionId = `analyze-${Date.now()}`;
+      const page = await browserController.getPage(sessionId);
+
+      // Navigate with more lenient options
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      } catch (err) {
+        // If navigation fails, try with load event only
+        if (err.message.includes('timeout')) {
+          console.log('[WebScraper] Navigation timeout, trying with load event...');
+          await page.goto(url, { waitUntil: 'load', timeout: 10000 }).catch(() => {
+            // If still fails, we'll work with whatever loaded
+            console.log('[WebScraper] Using partially loaded page');
+          });
+        } else {
+          throw err;
+        }
+      }
+
+      // Show banner to user
+      await visualTool.injectStatusBanner(page, '🔍 Analyzing page... Please wait, do not touch anything.');
+
+      // Wait a bit for any dynamic content
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // Check if we're already on a login page (has password field)
+      const hasPasswordField = await page.evaluate(() => {
+        return !!document.querySelector('input[type="password"]');
+      });
+
+      // If not on login page, try to find and click a login button/link
+      if (!hasPasswordField) {
+        console.log('[WebScraper] Not on login page, looking for login button...');
+
+        const loginClicked = await page.evaluate(() => {
+          // Look for login/sign in buttons or links
+          const patterns = [
+            /log\s*in/i,
+            /sign\s*in/i,
+            /login/i,
+            /signin/i,
+            /log-in/i,
+            /sign-in/i,
+            /member\s*login/i,
+            /account\s*login/i
+          ];
+
+          // Check buttons
+          const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+          for (const btn of buttons) {
+            const text = btn.textContent?.trim() || '';
+            const ariaLabel = btn.getAttribute('aria-label') || '';
+            const href = btn.getAttribute('href') || '';
+
+            const combined = `${text} ${ariaLabel} ${href}`.toLowerCase();
+
+            for (const pattern of patterns) {
+              if (pattern.test(combined)) {
+                console.log('Found login button:', text || href);
+                btn.click();
+                return true;
+              }
+            }
+          }
+          return false;
+        });
+
+        if (loginClicked) {
+          console.log('[WebScraper] Clicked login button, waiting for login page...');
+
+          // Wait for navigation or new content
+          await Promise.race([
+            page.waitForNavigation({ timeout: 5000 }).catch(() => {}),
+            new Promise(resolve => setTimeout(resolve, 3000))
+          ]);
+
+          // Wait for password field to appear
+          await page.waitForSelector('input[type="password"]', { timeout: 5000 }).catch(() => {
+            console.log('[WebScraper] Password field not found after clicking login button');
+          });
+        } else {
+          console.log('[WebScraper] No login button found on page');
+        }
+      }
+
+      // Use AI to generate selectors (with fallback if it fails)
+      let selectors = null;
+      let confidence = 'low';
+
+      try {
+        const settingsPath = await getSettingsPath(currentUser.username);
+        const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+        const apiKeys = settings.apiKeys || {};
+
+        selectors = await ai.generateSelectorsWithAI(page, siteType, apiKeys);
+        confidence = selectors.confidence;
+        console.log(`[WebScraper] AI analysis complete with ${confidence} confidence`);
+      } catch (aiError) {
+        console.log('[WebScraper] AI analysis failed, falling back to manual setup');
+        console.log('[WebScraper] Error:', aiError.message);
+
+        // Provide empty selectors for manual setup
+        selectors = {
+          login: {
+            usernameField: '',
+            passwordField: '',
+            submitButton: '',
+            successIndicator: ''
+          },
+          navigation: [],
+          messages: {
+            container: '',
+            messageItem: '',
+            sender: '',
+            content: '',
+            timestamp: ''
+          },
+          confidence: 'low'
+        };
+      }
+
+      // Get the final URL after any navigation (this is the actual login page URL)
+      const finalUrl = page.url();
+      console.log(`[WebScraper] Analysis complete. Final URL: ${finalUrl}`);
+
+      // Close the page
+      await page.close();
+
+      return {
+        ok: true,
+        success: true,
+        selectors: selectors,
+        confidence: confidence,
+        loginPageUrl: finalUrl, // The actual URL where the login form is
+        originalUrl: url // The URL the user entered
+      };
+    } catch (err) {
+      console.error("[WebScraper] Error analyzing URL:", err);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("webscraper:launchVisualSelector", async (_event, { url, options }) => {
+    try {
+      if (!currentUser?.username) {
+        return { ok: false, error: "Not logged in" };
+      }
+
+      const { VisualSelectorTool } = require("./dist/webscraper/index");
+      const { getBrowserController } = require("./dist/browser");
+
+      const browserController = await getBrowserController(currentUser.username);
+      const visualTool = new VisualSelectorTool(browserController, currentUser.username);
+
+      // Get Google access token for 2FA email checking
+      const googleAccessToken = await getGoogleAccessToken(currentUser.username);
+      visualTool.setGoogleAccessToken(googleAccessToken);
+
+      if (options.mode === 'navigation') {
+        // Record navigation sequence (with auto-login if credentials provided)
+        const steps = await visualTool.recordNavigationSequence(
+          url,
+          options.credentials || null,
+          options.loginSelectors || null
+        );
+        return { ok: true, steps };
+      } else if (options.mode === 'combined') {
+        // Combined navigation + message selection flow
+        const result = await visualTool.recordNavigationAndSelectMessages(
+          url,
+          options.credentials || null,
+          options.loginSelectors || null
+        );
+        return { ok: true, ...result };
+      } else {
+        // Select a single element (with optional auto-login and navigation)
+        const selector = await visualTool.selectElement(
+          url,
+          options.purpose,
+          options.suggested,
+          options.credentials || null,
+          options.loginSelectors || null,
+          options.navigationSteps || null
+        );
+        return { ok: true, selector };
+      }
+    } catch (err) {
+      console.error("[WebScraper] Visual selector error:", err);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("webscraper:saveConfiguration", async (_event, { config }) => {
+    try {
+      if (!currentUser?.username) {
+        return { success: false, error: "Not logged in" };
+      }
+
+      const { config: configManager } = require("./dist/webscraper/index");
+
+      const savedConfig = await configManager.createIntegration(currentUser.username, config);
+
+      return { success: true, config: savedConfig };
+    } catch (err) {
+      console.error("[WebScraper] Error saving configuration:", err);
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("webscraper:listIntegrations", async () => {
+    try {
+      if (!currentUser?.username) {
+        return { success: true, integrations: [] };
+      }
+
+      const { config: configManager } = require("./dist/webscraper/index");
+
+      const integrations = await configManager.listIntegrations(currentUser.username);
+
+      return { success: true, integrations };
+    } catch (err) {
+      console.error("[WebScraper] Error listing integrations:", err);
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("webscraper:updateIntegration", async (_event, { id, updates }) => {
+    try {
+      if (!currentUser?.username) {
+        return { success: false, error: "Not logged in" };
+      }
+
+      const { config: configManager } = require("./dist/webscraper/index");
+
+      const updated = await configManager.updateIntegration(currentUser.username, id, updates);
+
+      return { success: true, config: updated };
+    } catch (err) {
+      console.error("[WebScraper] Error updating integration:", err);
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("webscraper:deleteIntegration", async (_event, { id }) => {
+    try {
+      if (!currentUser?.username) {
+        return { success: false, error: "Not logged in" };
+      }
+
+      const { config: configManager } = require("./dist/webscraper/index");
+
+      await configManager.deleteIntegration(currentUser.username, id);
+
+      return { success: true };
+    } catch (err) {
+      console.error("[WebScraper] Error deleting integration:", err);
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("webscraper:testIntegration", async (_event, { siteId }) => {
+    try {
+      if (!currentUser?.username) {
+        return { success: false, error: "Not logged in" };
+      }
+
+      const { config: configManager, WebScraper } = require("./dist/webscraper/index");
+      const { getBrowserController } = require("./dist/browser");
+
+      // Load the integration config
+      const siteConfig = await configManager.getIntegration(currentUser.username, siteId);
+      if (!siteConfig) {
+        return { success: false, error: "Integration not found" };
+      }
+
+      // Run the scraper
+      const browserController = await getBrowserController(currentUser.username);
+      const scraper = new WebScraper(browserController, currentUser.username);
+
+      const result = await scraper.scrapeMessages(siteConfig);
+
+      if (result.success) {
+        return {
+          success: true,
+          messageCount: result.messages.length,
+          sampleMessage: result.messages[0] || null
+        };
+      } else {
+        return {
+          success: false,
+          error: result.error
+        };
+      }
+    } catch (err) {
+      console.error("[WebScraper] Error testing integration:", err);
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("webscraper:launchOAuthLogin", async (_event, { url, siteName, oauth, siteId }) => {
+    try {
+      if (!currentUser?.username) {
+        return { success: false, error: "Not logged in" };
+      }
+
+      const { OAuthLoginHandler } = require("./dist/webscraper/oauth-login");
+      const { getBrowserController } = require("./dist/browser");
+
+      const browserController = await getBrowserController(currentUser.username);
+
+      // Create temporary or use existing site config for OAuth login
+      const tempConfig = {
+        id: siteId || `temp-${Date.now()}`,
+        name: siteName,
+        url,
+        authMethod: 'oauth',
+        oauth: {
+          oauthProvider: oauth?.oauthProvider || 'generic',
+          loginDetectionSelector: oauth?.loginDetectionSelector,
+          successDetectionSelector: oauth?.successDetectionSelector,
+          requiresManualLogin: true
+        }
+      };
+
+      const oauthHandler = new OAuthLoginHandler(browserController, currentUser.username);
+      const result = await oauthHandler.launchManualLogin(tempConfig, { timeout: 300000 });
+
+      return result;
+
+    } catch (error) {
+      console.error("[IPC] OAuth login error:", error);
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  });
+
+  ipcMain.handle("webscraper:testConfiguration", async (_event, { config }) => {
+    try {
+      if (!currentUser?.username) {
+        return { success: false, error: "Not logged in" };
+      }
+
+      const { WebScraper } = require("./dist/webscraper/index");
+      const { getBrowserController } = require("./dist/browser");
+
+      const browserController = await getBrowserController(currentUser.username);
+      const scraper = new WebScraper(browserController, currentUser.username);
+
+      const result = await scraper.scrapeMessages(config);
+
+      if (result.success) {
+        return {
+          success: true,
+          messageCount: result.messages.length,
+          sampleMessage: result.messages[0] || null
+        };
+      } else {
+        return {
+          success: false,
+          error: result.error
+        };
+      }
+    } catch (err) {
+      console.error("[WebScraper] Test error:", err);
+      return { success: false, error: err.message };
     }
   });
 
@@ -5702,121 +4193,36 @@ Generate ONLY the welcome message, nothing else.`;
 
   // Set auto-send preference for a task
   ipcMain.handle("tasks:setAutoSend", async (_event, { taskId, autoSend }) => {
-    try {
-      const task = await getTask(taskId, currentUser?.username);
-      if (!task) {
-        return { ok: false, error: "Task not found" };
-      }
-
-      task.autoSend = autoSend;
-      task.lastUpdated = new Date().toISOString();
-      task.executionLog.push({
-        timestamp: new Date().toISOString(),
-        message: `Auto-send ${autoSend ? 'enabled' : 'disabled'}`
-      });
-
-      // Save task
-      const tasksDir = await getTasksDir(currentUser?.username);
-      const taskPath = path.join(tasksDir, `${taskId}.md`);
-      await fs.writeFile(taskPath, serializeTask(task), "utf8");
-
-      // Notify UI
+    const result = await TasksService.setAutoSend(taskId, autoSend, currentUser?.username);
+    if (result.ok) {
       addTaskUpdate(taskId, `Auto-send ${autoSend ? 'enabled' : 'disabled'}`);
-
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
     }
+    return result;
   });
 
   // Set notifications disabled preference for a task
   ipcMain.handle("tasks:setNotificationsDisabled", async (_event, { taskId, disabled }) => {
-    try {
-      const task = await getTask(taskId, currentUser?.username);
-      if (!task) {
-        return { ok: false, error: "Task not found" };
-      }
-
-      task.notificationsDisabled = disabled;
-      task.lastUpdated = new Date().toISOString();
-      task.executionLog.push({
-        timestamp: new Date().toISOString(),
-        message: `Notifications ${disabled ? 'disabled' : 'enabled'}`
-      });
-
-      // Save task
-      const tasksDir = await getTasksDir(currentUser?.username);
-      const taskPath = path.join(tasksDir, `${taskId}.md`);
-      await fs.writeFile(taskPath, serializeTask(task), "utf8");
-
-      // Only notify if notifications are being enabled
-      if (!disabled) {
-        addTaskUpdate(taskId, `Notifications enabled`);
-      }
-
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
+    const result = await TasksService.setNotificationsDisabled(taskId, disabled, currentUser?.username);
+    // Only notify if notifications are being enabled
+    if (result.ok && !disabled) {
+      addTaskUpdate(taskId, `Notifications enabled`);
     }
+    return result;
   });
 
   // Set poll frequency for a task
   ipcMain.handle("tasks:setPollFrequency", async (_event, { taskId, pollFrequency }) => {
-    try {
-      const task = await getTask(taskId, currentUser?.username);
-      if (!task) {
-        return { ok: false, error: "Task not found" };
-      }
-
-      // Parse poll frequency - can be a preset key or full object
-      let newPollFrequency;
-      if (typeof pollFrequency === 'string') {
-        if (POLL_FREQUENCY_PRESETS[pollFrequency]) {
-          newPollFrequency = { ...POLL_FREQUENCY_PRESETS[pollFrequency] };
-        } else {
-          return { ok: false, error: "Invalid poll frequency preset" };
-        }
-      } else if (typeof pollFrequency === 'object' && pollFrequency.type && pollFrequency.value) {
-        newPollFrequency = pollFrequency;
-      } else {
-        return { ok: false, error: "Invalid poll frequency format" };
-      }
-
-      task.pollFrequency = newPollFrequency;
-      task.lastUpdated = new Date().toISOString();
-      task.executionLog.push({
-        timestamp: new Date().toISOString(),
-        message: `Poll frequency changed to: ${newPollFrequency.label}`
-      });
-
-      // Update nextCheck based on the new poll frequency
-      if (newPollFrequency.type === "event") {
-        // For event-based tasks, clear nextCheck since they don't poll on interval
-        task.nextCheck = null;
-      } else {
-        // Always recalculate nextCheck when user explicitly changes frequency
-        // Schedule next check from NOW based on new interval
-        task.nextCheck = Date.now() + newPollFrequency.value;
-        console.log(`[Tasks] Poll frequency updated for ${taskId}: next check in ${newPollFrequency.value}ms (${newPollFrequency.label})`);
-      }
-
-      // Save task
-      const tasksDir = await getTasksDir(currentUser?.username);
-      const taskPath = path.join(tasksDir, `${taskId}.md`);
-      await fs.writeFile(taskPath, serializeTask(task), "utf8");
-
-      // Notify UI
-      addTaskUpdate(taskId, `Poll frequency changed to: ${newPollFrequency.label}`);
-
-      return { ok: true, pollFrequency: newPollFrequency };
-    } catch (err) {
-      return { ok: false, error: err.message };
+    const result = await TasksService.setPollFrequency(taskId, pollFrequency, currentUser?.username);
+    if (result.ok && result.pollFrequency) {
+      console.log(`[Tasks] Poll frequency updated for ${taskId}: next check in ${result.pollFrequency.value}ms (${result.pollFrequency.label})`);
+      addTaskUpdate(taskId, `Poll frequency changed to: ${result.pollFrequency.label}`);
     }
+    return result;
   });
 
   // Get available poll frequency presets
   ipcMain.handle("tasks:getPollFrequencyPresets", async () => {
-    return { ok: true, presets: POLL_FREQUENCY_PRESETS };
+    return TasksService.getPollFrequencyPresets();
   });
 
   // Slack API helpers for tools
@@ -5866,92 +4272,31 @@ Generate ONLY the welcome message, nothing else.`;
   // ─────────────────────────────────────────────────────────────────────────────
 
   ipcMain.handle("whatsapp:connect", async () => {
-    try {
-      await connectWhatsApp();
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await WhatsAppService.connect(whatsappConnector);
   });
 
   ipcMain.handle("whatsapp:disconnect", async () => {
-    try {
-      await disconnectWhatsApp();
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await WhatsAppService.disconnect(whatsappConnector);
   });
 
   ipcMain.handle("whatsapp:getStatus", async () => {
-    return {
-      ok: true,
-      status: whatsappStatus,
-      qr: whatsappQR
-    };
+    return await WhatsAppService.getStatus(whatsappConnector);
   });
 
   ipcMain.handle("whatsapp:checkAuth", async () => {
-    // Check if we have auth state saved
-    try {
-      const authDir = await getWhatsAppAuthDir();
-      const files = await fs.readdir(authDir);
-      const hasAuth = files.some(f => f.includes("creds"));
-      return {
-        ok: true,
-        hasAuth,
-        connected: whatsappStatus === "connected"
-      };
-    } catch {
-      return { ok: true, hasAuth: false, connected: false };
-    }
+    return await WhatsAppService.checkAuth(whatsappConnector, fs);
   });
 
   ipcMain.handle("whatsapp:sendMessage", async (_event, { recipient, message }) => {
-    if (!whatsappSocket || whatsappStatus !== "connected") {
-      return { ok: false, error: "WhatsApp is not connected" };
-    }
-
-    try {
-      // Ensure recipient ends with @s.whatsapp.net for individual chats
-      let jid = recipient;
-      if (!jid.includes("@")) {
-        jid = jid.replace(/[^0-9]/g, "") + "@s.whatsapp.net";
-      }
-      
-      await whatsappSocket.sendMessage(jid, { text: message });
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await WhatsAppService.sendMessage(whatsappConnector, recipient, message);
   });
 
-  // Sync a message to WhatsApp self-chat (for chat window sync)
   ipcMain.handle("whatsapp:syncToSelfChat", async (_event, { message, isFromUser }) => {
-    if (!whatsappSocket || whatsappStatus !== "connected") {
-      return { ok: false, error: "WhatsApp is not connected" };
-    }
-
-    if (!whatsappSelfChatJid) {
-      return { ok: false, error: "Self-chat not initialized. Send a message from WhatsApp first." };
-    }
-
-    try {
-      // Prefix AI responses with [Wovly] to distinguish from user messages
-      const text = isFromUser ? message : `[Wovly] ${message}`;
-      await whatsappSocket.sendMessage(whatsappSelfChatJid, { text });
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await WhatsAppService.syncToSelfChat(whatsappConnector, message, isFromUser);
   });
 
-  // Check if WhatsApp sync is ready (connected and has self-chat JID)
   ipcMain.handle("whatsapp:isSyncReady", async () => {
-    return {
-      ok: true,
-      ready: whatsappStatus === "connected" && !!whatsappSelfChatJid
-    };
+    return await WhatsAppService.isSyncReady(whatsappConnector);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -5995,23 +4340,7 @@ Generate ONLY the welcome message, nothing else.`;
 
   // Clear Google authorization (to force re-auth with new scopes)
   ipcMain.handle("integrations:disconnectGoogle", async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      let settings = {};
-      try {
-        settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      } catch {
-        // No settings
-      }
-      
-      // Remove Google tokens
-      delete settings.googleTokens;
-      await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await GoogleOAuthService.disconnect(currentUser?.username);
   });
 
   // Google Workspace Tools
@@ -6170,7 +4499,7 @@ Generate ONLY the welcome message, nothing else.`;
     },
     {
       name: "update_user_profile",
-      description: "Update the user's profile with new information. Use this when the user shares ANY personal information - their job, family details, important dates (birthdays, anniversaries), preferences, or any facts they want you to remember. Always confirm with user before updating. Use 'addNote' for custom facts like family birthdays, anniversaries, preferences, etc.",
+      description: "Update the user's profile with new information. Use this when the user shares ANY personal information - their job, family details, important dates (birthdays, anniversaries), preferences, goals, or any facts they want you to remember. Always confirm with user before updating. Use 'addNote' for custom facts. Use 'addGoal' when the user mentions a goal or priority (e.g., 'new goal: save more money', 'I want to learn Spanish', 'my goal is to buy a house').",
       input_schema: {
         type: "object",
         properties: {
@@ -6180,7 +4509,9 @@ Generate ONLY the welcome message, nothing else.`;
           dateOfBirth: { type: "string", description: "User's birthday in any format" },
           onboardingCompleted: { type: "boolean", description: "Set true when basic info is collected" },
           addNote: { type: "string", description: "Add a custom fact or note to remember. Use for ANY information the user wants saved: family birthdays, anniversaries, preferences, important dates, etc. Example: 'Wife\\'s birthday: November 29, 1985'" },
-          removeNote: { type: "string", description: "Remove a note that contains this text" }
+          removeNote: { type: "string", description: "Remove a note that contains this text" },
+          addGoal: { type: "string", description: "Add a new goal or priority. Use when user says things like 'new goal: ...', 'I want to...', 'my goal is...'. Example: 'Save more money', 'Learn Spanish', 'Buy a house by end of year'. Goals help prioritize insights from messages." },
+          removeGoal: { type: "string", description: "Remove a goal that contains this text" }
         },
         required: []
       }
@@ -7515,20 +5846,112 @@ Generate ONLY the welcome message, nothing else.`;
   };
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // Custom Web Integration (Brightwheel, etc.)
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Custom Web Tools
+  const customWebTools = [
+    {
+      name: "search_custom_web_messages",
+      description: "Search messages from custom web integrations like Brightwheel, tax sites, school portals. Use when user asks about messages from sites without native APIs.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Text to search for in message content"
+          },
+          site: {
+            type: "string",
+            description: "Filter by site ID (e.g., 'brightwheel', 'turbotax')"
+          },
+          from: {
+            type: "string",
+            description: "Filter by sender name"
+          },
+          days_back: {
+            type: "number",
+            description: "How many days to search back (default 30)"
+          },
+          limit: {
+            type: "number",
+            description: "Max results to return (default 20)"
+          }
+        },
+        required: ["query"]
+      }
+    },
+    {
+      name: "get_recent_custom_web_messages",
+      description: "Get recent messages from custom web integrations. Lists all messages from Brightwheel, tax sites, etc. in chronological order.",
+      input_schema: {
+        type: "object",
+        properties: {
+          site: {
+            type: "string",
+            description: "Filter by site ID (optional)"
+          },
+          hours: {
+            type: "number",
+            description: "Hours back to look (default 24)"
+          },
+          limit: {
+            type: "number",
+            description: "Max messages (default 50)"
+          }
+        },
+        required: []
+      }
+    },
+    {
+      name: "get_custom_web_messages_by_date",
+      description: "Get all messages from custom web integrations for a specific date or date range.",
+      input_schema: {
+        type: "object",
+        properties: {
+          date: {
+            type: "string",
+            description: "Date in YYYY-MM-DD format"
+          },
+          end_date: {
+            type: "string",
+            description: "Optional end date for range (YYYY-MM-DD)"
+          },
+          site: {
+            type: "string",
+            description: "Filter by site ID (optional)"
+          }
+        },
+        required: ["date"]
+      }
+    },
+    {
+      name: "list_custom_web_sites",
+      description: "List all configured custom web integrations with their status. Shows which sites are enabled, paused, or having issues.",
+      input_schema: {
+        type: "object",
+        properties: {},
+        required: []
+      }
+    }
+  ];
+
+  // Execute Custom Web tool
+  const executeCustomWebTool = async (toolName, toolInput) => {
+    try {
+      const { executeCustomWebTool: execute } = require('./dist/tools/customweb');
+      return await execute(toolName, toolInput, currentUser?.username);
+    } catch (err) {
+      console.error(`[CustomWeb] Error executing ${toolName}:`, err);
+      return { error: err.message };
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // Telegram Integration
   // ─────────────────────────────────────────────────────────────────────────────
 
   // Get Telegram bot token from settings
-  const getTelegramToken = async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      return settings.telegramBotToken || null;
-    } catch {
-      return null;
-    }
-  };
-
   // Telegram tools
   const telegramTools = [
     {
@@ -9846,13 +8269,16 @@ Generate ONLY the welcome message, nothing else.`;
       }
 
       if (toolName === "update_user_profile") {
+        // Track if goals were changed
+        let goalsChanged = false;
+
         // Handle addNote
         if (toolInput.addNote) {
           if (!profile.notes) {
             profile.notes = [];
           }
           // Check if similar note already exists
-          const existingIndex = profile.notes.findIndex(n => 
+          const existingIndex = profile.notes.findIndex(n =>
             n.toLowerCase().includes(toolInput.addNote.toLowerCase().split(':')[0])
           );
           if (existingIndex >= 0) {
@@ -9868,15 +8294,44 @@ Generate ONLY the welcome message, nothing else.`;
         // Handle removeNote
         if (toolInput.removeNote) {
           if (profile.notes) {
-            profile.notes = profile.notes.filter(n => 
+            profile.notes = profile.notes.filter(n =>
               !n.toLowerCase().includes(toolInput.removeNote.toLowerCase())
             );
           }
           delete toolInput.removeNote;
         }
 
+        // Handle addGoal
+        if (toolInput.addGoal) {
+          goalsChanged = true;
+          if (!profile.goals) {
+            profile.goals = [];
+          }
+          // Check if similar goal already exists
+          const goalLower = toolInput.addGoal.toLowerCase();
+          const existingGoal = profile.goals.find(g =>
+            g.toLowerCase().includes(goalLower) || goalLower.includes(g.toLowerCase())
+          );
+          if (!existingGoal) {
+            // Add new goal
+            profile.goals.push(toolInput.addGoal);
+          }
+          delete toolInput.addGoal;
+        }
+
+        // Handle removeGoal
+        if (toolInput.removeGoal) {
+          goalsChanged = true;
+          if (profile.goals) {
+            profile.goals = profile.goals.filter(g =>
+              !g.toLowerCase().includes(toolInput.removeGoal.toLowerCase())
+            );
+          }
+          delete toolInput.removeGoal;
+        }
+
         // Update other fields
-        const { addNote, removeNote, ...otherFields } = toolInput;
+        const { addNote, removeNote, addGoal, removeGoal, ...otherFields } = toolInput;
         Object.assign(profile, otherFields);
         
         // Check if we should advance onboarding from profile stage to task_demo
@@ -9890,6 +8345,28 @@ Generate ONLY the welcome message, nothing else.`;
         
         const newMarkdown = serializeUserProfile(profile);
         await fs.writeFile(profilePath, newMarkdown, "utf8");
+
+        // If goals were added or removed, trigger insights refresh
+        // This will re-analyze recent messages with the new goal priorities
+        if (goalsChanged) {
+          console.log("[Profile] Goals changed, triggering insights refresh");
+          // Run insights check in background
+          setTimeout(async () => {
+            let limit = 5;
+            try {
+              const settingsPath = await getSettingsPath(currentUser.username);
+              const settingsData = await fs.readFile(settingsPath, "utf8");
+              const settings = JSON.parse(settingsData);
+              limit = settings.insightsLimit || 5;
+            } catch (err) {
+              // Use default if settings not found
+            }
+            runInsightsCheck(limit).catch(err =>
+              console.error("[Profile] Error refreshing insights after goal change:", err)
+            );
+          }, 1000);
+        }
+
         return { success: true, profile, message: "Profile updated successfully" };
       }
 
@@ -13039,6 +11516,7 @@ ${formatDecomposedSteps(steps)}
       asanaAccessToken = null,
       redditAccessToken = null,
       spotifyAccessToken = null,
+      customWebEnabled = false, // Custom web integrations
       apiKeys = null, // Add apiKeys for LLM-based tools
       includeProfileTools = true,
       includeTaskTools = true,
@@ -13075,13 +11553,19 @@ ${formatDecomposedSteps(steps)}
     if (asanaAccessToken) tools.push(...asanaTools);
     if (redditAccessToken) tools.push(...redditTools);
     if (spotifyAccessToken) tools.push(...spotifyTools);
-    
+
+    // Custom Web Integration tools
+    if (customWebEnabled) {
+      tools.push(...customWebTools);
+      console.log("[Tools] Custom web integration tools enabled");
+    }
+
     // Browser tools (CDP-based direct control)
     if (browserEnabled) {
       tools.push(...cdpBrowserTools);
       console.log("[Tools] Browser tools enabled");
     }
-    
+
     if (additionalTools.length > 0) tools.push(...additionalTools);
 
     // Tool execution router
@@ -13217,12 +11701,17 @@ ${formatDecomposedSteps(steps)}
       if (spotifyAccessToken && spotifyTools.find(t => t.name === toolName)) {
         return await executeSpotifyTool(toolName, toolInput, spotifyAccessToken);
       }
-      
+
+      // Custom Web Integration tools
+      if (customWebEnabled && customWebTools.find(t => t.name === toolName)) {
+        return await executeCustomWebTool(toolName, toolInput);
+      }
+
       // Browser tools (CDP-based)
       if (browserEnabled && cdpBrowserTools.find(t => t.name === toolName)) {
         return await executeCdpBrowserTool(toolName, toolInput);
       }
-      
+
       return { error: `Tool ${toolName} not available` };
     };
 
@@ -13324,6 +11813,20 @@ ${formatDecomposedSteps(steps)}
       spotifyAccessToken = await getSpotifyAccessToken();
     } catch { /* No Spotify */ }
 
+    // Check Custom Web Integrations
+    let customWebEnabled = false;
+    try {
+      const { config: configManager } = require('./dist/webscraper/index');
+      const sites = await configManager.listIntegrations(currentUser?.username);
+      customWebEnabled = sites.length > 0;
+      if (customWebEnabled) {
+        console.log(`[Integrations] Custom web integrations enabled (${sites.length} site${sites.length > 1 ? 's' : ''})`);
+      }
+    } catch (err) {
+      // No web integrations configured or error loading
+      console.log('[Integrations] No custom web integrations configured');
+    }
+
     const { tools, executeTool } = buildToolsAndExecutor({
       googleAccessToken,
       slackAccessToken,
@@ -13338,6 +11841,7 @@ ${formatDecomposedSteps(steps)}
       asanaAccessToken,
       redditAccessToken,
       spotifyAccessToken,
+      customWebEnabled,
       ...options
     });
 
@@ -13356,7 +11860,8 @@ ${formatDecomposedSteps(steps)}
       githubAccessToken,
       asanaAccessToken,
       redditAccessToken,
-      spotifyAccessToken
+      spotifyAccessToken,
+      customWebEnabled
     };
   };
 
@@ -13625,7 +12130,7 @@ ${formatDecomposedSteps(steps)}
     
     // Check if there's a task waiting for user input
     // If so, route the user's message to that task
-    const userMessage = messages[messages.length - 1]?.content || "";
+    let userMessage = messages[messages.length - 1]?.content || ""; // Use let since it may be reassigned during clarification
     const waitingTasks = await getTasksWaitingForInput(currentUser.username);
     if (waitingTasks.length > 0 && userMessage.trim()) {
       const task = waitingTasks[0]; // Handle most recent task waiting for input
@@ -13770,58 +12275,115 @@ ${formatDecomposedSteps(steps)}
 
     // ─────────────────────────────────────────────────────────────────────────
     // Pre-load Context (needed for Query Understanding and Chat)
+    // OPTIMIZATION: Load all context in parallel for faster response
     // ─────────────────────────────────────────────────────────────────────────
-    
-    // Get user profile for context
-    let profile = null;
-    try {
-      const profilePath = await getUserProfilePath(currentUser?.username);
-      const markdown = await fs.readFile(profilePath, "utf8");
-      profile = parseUserProfile(markdown);
-    } catch {
-      // No profile
+
+    const perf = new PerformanceTracker('Query Processing');
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Multi-Turn Clarification Detection
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const clarificationContext = detectClarificationResponse(messages);
+    if (clarificationContext && clarificationContext.isClarificationResponse) {
+      console.log("[Clarification] Detected clarification response, enriching query");
+      console.log(`[Clarification] Original query: "${clarificationContext.originalQuery}"`);
+      console.log(`[Clarification] Clarification: "${userMessage}"`);
+
+      // Build enriched query from original + clarification
+      const enrichedFromClarification = buildEnrichedQueryFromClarification(
+        clarificationContext.originalQuery,
+        userMessage,
+        clarificationContext.clarificationQuestion
+      );
+
+      // Replace user message with enriched version for processing
+      userMessage = enrichedFromClarification;
+      console.log(`[Clarification] Enriched query: "${userMessage.substring(0, 200)}..."`);
     }
 
-    // Load conversation context (historical memory)
-    let conversationContext = { todayMessages: "", yesterdayMessages: "", recentSummaries: "" };
-    try {
-      if (currentUser?.username) {
-        conversationContext = await loadConversationContext(currentUser.username);
-        if (!conversationContext.todayMessages && !conversationContext.yesterdayMessages && !conversationContext.recentSummaries) {
-          console.log("[Memory] No conversation history found (new user or first conversation)");
+    perf.start('context_loading');
+
+    // Load profile, memory, and calendar in parallel
+    const [profile, conversationContext, todayCalendarEvents] = await Promise.all([
+      // Get user profile for context
+      (async () => {
+        try {
+          const profilePath = await getUserProfilePath(currentUser?.username);
+          const markdown = await fs.readFile(profilePath, "utf8");
+          return parseUserProfile(markdown);
+        } catch {
+          return null; // No profile
         }
-      }
-    } catch (err) {
-      console.error("[Memory] Error loading conversation context:", err.message);
-      // Continue with empty context rather than failing the chat
-      conversationContext = { todayMessages: "", yesterdayMessages: "", recentSummaries: "" };
-    }
+      })(),
 
-    // Get calendar events for today (if Google is connected) - helps with time references
-    let todayCalendarEvents = [];
-    try {
-      const accessToken = await getGoogleAccessToken(currentUser?.username);
-      if (accessToken) {
-        const today = new Date();
-        const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0, 0);
-        const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999);
-        todayCalendarEvents = await fetchCalendarEvents(accessToken, startOfDay, endOfDay);
+      // Load conversation context (historical memory)
+      (async () => {
+        try {
+          if (currentUser?.username) {
+            const context = await loadConversationContext(currentUser.username);
+            if (!context.todayMessages && !context.yesterdayMessages && !context.recentSummaries) {
+              console.log("[Memory] No conversation history found (new user or first conversation)");
+            }
+            return context;
+          }
+          return { todayMessages: "", yesterdayMessages: "", recentSummaries: "" };
+        } catch (err) {
+          console.error("[Memory] Error loading conversation context:", err.message);
+          // Continue with empty context rather than failing the chat
+          return { todayMessages: "", yesterdayMessages: "", recentSummaries: "" };
+        }
+      })(),
+
+      // Get calendar events for today (if Google is connected) - helps with time references
+      (async () => {
+        try {
+          const accessToken = await getGoogleAccessToken(currentUser?.username);
+          if (accessToken) {
+            const today = new Date();
+            const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0, 0);
+            const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999);
+            return await fetchCalendarEvents(accessToken, startOfDay, endOfDay);
+          }
+          return [];
+        } catch (err) {
+          console.log("[Calendar] Unable to fetch calendar for context:", err.message);
+          return [];
+        }
+      })()
+    ]);
+
+    perf.end('context_loading');
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Response Cache Check - Return cached response for repeated queries
+    // ─────────────────────────────────────────────────────────────────────────
+
+    if (!skipDecomposition && !stepContext && !workflowContext) {
+      const cachedResponse = responseCache.getCachedResponse(userMessage, currentUser?.username);
+      if (cachedResponse) {
+        perf.report();
+        return {
+          ok: true,
+          response: cachedResponse.response,
+          fromCache: true
+        };
       }
-    } catch (err) {
-      console.log("[Calendar] Unable to fetch calendar for context:", err.message);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Input Type Detection - Check if this is an informational statement
     // ─────────────────────────────────────────────────────────────────────────
-    
+
     // Track facts detected during workflow for deferred prompting
     let detectedFactsDuringWorkflow = [];
-    
+
     if (!skipDecomposition && userMessage.length > 10) {
       try {
+        perf.start('input_type_detection');
         console.log("[InputType] Detecting input type...");
         const inputType = await detectInputType(userMessage, apiKeys, activeProvider);
+        perf.end('input_type_detection');
         
         if (inputType.type === "information" && inputType.confidence > 0.7) {
           console.log("[InputType] Detected informational statement, extracting facts...");
@@ -13889,12 +12451,13 @@ ${formatDecomposedSteps(steps)}
     // ─────────────────────────────────────────────────────────────────────────
     // Query Understanding - Extract entities, resolve ambiguities, enrich query
     // ─────────────────────────────────────────────────────────────────────────
-    
+
     let queryUnderstanding = null;
     let enrichedQuery = userMessage; // Default to original if understanding fails/skipped
-    
+
     if (!skipDecomposition && userMessage.length > 20) {
       try {
+        perf.start('query_understanding');
         console.log("[QueryUnderstanding] Analyzing query...");
         queryUnderstanding = await understandQuery(userMessage, {
           profile,
@@ -13903,6 +12466,7 @@ ${formatDecomposedSteps(steps)}
           currentDate: new Date(),
           sessionMessages: messages // Pass current session messages for immediate context
         }, apiKeys, activeProvider);
+        perf.end('query_understanding');
         
         // Check if clarification is needed
         if (queryUnderstanding.clarification_needed && queryUnderstanding.clarification_questions?.length > 0) {
@@ -13919,21 +12483,15 @@ ${formatDecomposedSteps(steps)}
             /\bcredential/i
           ];
           
-          const safeQuestions = queryUnderstanding.clarification_questions.filter(q => {
-            const questionText = (q.question || q).toLowerCase();
-            const isCredentialQuestion = credentialPatterns.some(pattern => pattern.test(questionText));
-            if (isCredentialQuestion) {
-              console.warn("[QueryUnderstanding] BLOCKED credential question:", q.question || q);
-            }
-            return !isCredentialQuestion;
-          });
+          const safeQuestions = filterSensitiveQuestions(queryUnderstanding.clarification_questions);
           
           // Only return clarification if there are still valid questions after filtering
           if (safeQuestions.length > 0) {
             console.log("[QueryUnderstanding] Clarification needed, returning to user");
+            const clarificationMessage = formatClarificationQuestions(safeQuestions);
             return {
               ok: true,
-              response: `Before I proceed, I need to clarify a few things:\n\n${safeQuestions.map((q, i) => `${i + 1}. ${q.question || q}`).join('\n')}\n\nPlease provide these details so I can help you better.`,
+              response: clarificationMessage,
               clarification_needed: true,
               clarification_questions: safeQuestions,
               original_query: userMessage
@@ -14076,11 +12634,36 @@ ${formatDecomposedSteps(steps)}
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Query Decomposition - All queries go through Architect-Builder
+    // Query Complexity Check - Bypass decomposition for simple queries
     // ─────────────────────────────────────────────────────────────────────────
-    
+
+    let shouldDecompose = !skipDecomposition;
+
     if (!skipDecomposition) {
       try {
+        perf.start('complexity_classification');
+        const complexity = await classifyQueryComplexity(enrichedQuery, apiKeys, activeProvider);
+        perf.end('complexity_classification');
+
+        // Bypass decomposition if query is simple and confidence is high
+        if (!complexity.needs_decomposition && complexity.confidence > 0.7) {
+          console.log("[QueryComplexity] Simple query detected, bypassing decomposition");
+          console.log(`[QueryComplexity] Confidence: ${complexity.confidence}, Reasoning: ${complexity.reasoning}`);
+          shouldDecompose = false;
+        }
+      } catch (err) {
+        console.error("[QueryComplexity] Error classifying complexity:", err.message);
+        // Continue with decomposition on error (safe default)
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Query Decomposition - Complex queries go through Architect-Builder
+    // ─────────────────────────────────────────────────────────────────────────
+
+    if (shouldDecompose) {
+      try {
+        perf.start('decomposition');
         console.log("[QueryDecomposition] Processing query through Architect-Builder...");
         
         // Build tools list for decomposition
@@ -14220,6 +12803,8 @@ ${formatDecomposedSteps(steps)}
       } catch (err) {
         console.error("[QueryDecomposition] Error in decomposition flow:", err.message);
         // Fall through to normal chat flow on error
+      } finally {
+        perf.end('decomposition');
       }
     }
 
@@ -14401,6 +12986,22 @@ Use this as advisory guidance. When the user asks about this topic, explain the 
       }
       integrationsInfo += `\n- Tools: list_slack_channels, get_slack_messages, send_slack_message, search_slack_users`;
       integrationsInfo += `\n- Note: Always confirm before sending messages\n`;
+    }
+
+    // Check for Custom Web Integrations
+    let customWebSites = [];
+    try {
+      const { config: configManager } = require('./dist/webscraper/index');
+      customWebSites = await configManager.listIntegrations(currentUser?.username);
+    } catch { /* No custom web integrations */ }
+
+    if (customWebSites.length > 0) {
+      hasAnyIntegration = true;
+      const siteNames = customWebSites.map(s => s.name).join(', ');
+      integrationsInfo += `\n**Custom Websites** (Messages from sites without APIs)`;
+      integrationsInfo += `\n- Configured sites: ${siteNames}`;
+      integrationsInfo += `\n- Tools: search_custom_web_messages, get_recent_custom_web_messages, get_custom_web_messages_by_date, list_custom_web_sites`;
+      integrationsInfo += `\n- Note: These are scraped from daycare portals, tax sites, school systems, etc.\n`;
     }
 
     if (hasAnyIntegration) {
@@ -15059,10 +13660,18 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             let responseText = textBlock?.text || "";
             // Save conversation to memory
             await saveConversationToMemory(userMessage, responseText);
-            
+
             // Check for skill demo completion (Marco -> Polo test)
             await checkSkillDemoCompletion(userMessage, responseText);
-            
+
+            // Cache the response for future queries
+            if (!stepContext && !workflowContext) {
+              responseCache.cacheResponse(userMessage, currentUser?.username, responseText);
+            }
+
+            // Log performance metrics
+            perf.report();
+
             return { ok: true, response: responseText };
           }
 
@@ -15171,10 +13780,18 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             let responseText = choice.message.content || "";
             // Save conversation to memory
             await saveConversationToMemory(userMessage, responseText);
-            
+
             // Check for skill demo completion (Marco -> Polo test)
             await checkSkillDemoCompletion(userMessage, responseText);
-            
+
+            // Cache the response for future queries
+            if (!stepContext && !workflowContext) {
+              responseCache.cacheResponse(userMessage, currentUser?.username, responseText);
+            }
+
+            // Log performance metrics
+            perf.report();
+
             return { ok: true, response: responseText };
           }
 
@@ -15264,16 +13881,427 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
         // Save conversation to memory
         await saveConversationToMemory(userMessage, text);
-        
+
         // Check for skill demo completion (Marco -> Polo test)
         await checkSkillDemoCompletion(userMessage, text);
-        
+
+        // Cache the response for future queries
+        if (!stepContext && !workflowContext) {
+          responseCache.cacheResponse(userMessage, currentUser?.username, text);
+        }
+
+        // Log performance metrics
+        perf.report();
+
         return { ok: true, response: text };
       }
 
       return { ok: false, error: "No API key available for selected provider" };
     } catch (err) {
       console.error("Chat error:", err);
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Streaming Chat Handler - Real-time response streaming
+  // ───────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("chat:sendStream", async (_event, { messages, skipDecomposition = false, stepContext = null, workflowContext = null }) => {
+    try {
+      console.log("[StreamingChat] Starting streaming response...");
+
+      if (!currentUser?.username) {
+        return { ok: false, error: "Please log in to use chat" };
+      }
+
+      // Extract user message for memory saving later
+      const userMessage = messages[messages.length - 1]?.content || "";
+
+      // Use the shared processing function to get context, tools, and system prompt
+      // Skip decomposition in streaming mode to keep responses fast and simple
+      const processResult = await processChatQuery(messages, {
+        skipDecomposition: true,  // Always skip decomposition in streaming mode
+        stepContext,
+        workflowContext
+      });
+
+      // If processChatQuery returned a result that doesn't need full flow, return it directly
+      // (e.g., tutorial response, routed to task, etc.)
+      if (!processResult.continueWithFullFlow) {
+        return processResult;
+      }
+
+      // Extract prepared context from processChatQuery
+      const { apiKeys, models, activeProvider, systemPrompt: baseSystemPrompt } = processResult;
+      const { accessToken, hasGoogleTools, hasIMessageTools } = processResult;
+
+      // Build on the system prompt from processChatQuery
+      let systemPrompt = baseSystemPrompt;
+      const settingsPath = await getSettingsPath(currentUser?.username);
+
+      // Weather system prompt
+      systemPrompt += `\n\nYou have access to weather tools. You can look up weather forecasts, current conditions, and find location coordinates. Use these when the user asks about weather.`;
+
+      // Check if weather is enabled
+      let weatherEnabled = true;
+      try {
+        const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+        weatherEnabled = settings.weatherEnabled !== false;
+      } catch {
+        // Use default
+      }
+
+      // Check if Slack is connected
+      let slackAccessToken = null;
+      let hasSlackTools = false;
+      try {
+        slackAccessToken = await getSlackAccessToken(currentUser?.username);
+        hasSlackTools = !!slackAccessToken;
+      } catch {
+        // No Slack
+      }
+
+      // Add Slack system prompt if connected
+      if (hasSlackTools) {
+        systemPrompt += `\n\nYou have access to Slack. You can list channels, read messages, send messages, and search for users. Always confirm before sending messages.`;
+      }
+
+      // Check if browser automation is enabled
+      let hasBrowserTools = false;
+      try {
+        const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+        hasBrowserTools = settings.browserEnabled === true;
+      } catch {
+        // Default disabled
+      }
+
+      // Get available credentials for browser login
+      const availableCredentials = await getAvailableCredentialDomains();
+
+      // Add browser automation system prompt (simplified version for streaming)
+      if (hasBrowserTools) {
+        let browserPrompt = `\n\nYou have FULL browser automation capability. Use browser_navigate, browser_click, browser_type, browser_press, browser_snapshot, and browser_scroll to research online. DO NOT SAY "I cannot access" websites - JUST USE THE BROWSER TOOLS.`;
+
+        if (availableCredentials.length > 0) {
+          browserPrompt += `\n\nSaved credentials available for: ${availableCredentials.join(', ')}. Use browser_fill_credential to log in automatically.`;
+        }
+
+        systemPrompt += browserPrompt;
+      }
+
+      // Add task system prompt (simplified for streaming)
+      systemPrompt += `\n\nYou can create autonomous background TASKS for scheduling, follow-ups, or multi-step coordination. Offer to create a task when requests involve waiting for responses or scheduling negotiations.`;
+
+      // Combine tools
+      const allTools = [...profileTools, ...taskTools, ...memoryTools, ...timeTools];
+      if (hasGoogleTools) allTools.push(...googleWorkspaceTools);
+      if (hasIMessageTools) allTools.push(...iMessageTools);
+      if (weatherEnabled) allTools.push(...weatherTools);
+      if (hasSlackTools) allTools.push(...slackTools);
+      if (hasBrowserTools) allTools.push(...cdpBrowserTools);
+
+      console.log(`[StreamingChat] Tools available: ${allTools.length}`, allTools.map(t => t.name));
+
+      // Convert messages to API format
+      const conversationMessages = messages.filter(m => m.role !== 'system');
+
+      if (activeProvider === 'anthropic' && apiKeys.anthropic) {
+        const model = models.anthropic || 'claude-sonnet-4-20250514';
+
+        // Tool execution loop - continue streaming until no more tool uses
+        let currentMessages = [...conversationMessages];
+        const maxIterations = 10;
+
+        for (let iteration = 0; iteration < maxIterations; iteration++) {
+          console.log(`[StreamingChat] Iteration ${iteration + 1}/${maxIterations}`);
+
+          const toolUseQueue = [];
+          let streamResult = null;
+
+          await streamAnthropicResponse(
+            {
+              apiKey: apiKeys.anthropic,
+              model,
+              maxTokens: 4096,
+              system: systemPrompt,
+              messages: currentMessages,
+              tools: allTools
+            },
+            // onDelta - send each text chunk to UI
+            (delta, fullText) => {
+              if (win && !win.isDestroyed()) {
+                win.webContents.send('chat:stream:delta', { delta, fullText });
+              }
+            },
+            // onToolUse - queue tool for execution after stream completes
+            (toolUse) => {
+              console.log('[StreamingChat] Tool use detected:', toolUse.name);
+              toolUseQueue.push(toolUse);
+            },
+            // onComplete - save result
+            (result) => {
+              streamResult = result;
+            }
+          );
+
+          // If no tool uses, we're done - save to memory and complete
+          if (toolUseQueue.length === 0) {
+            console.log('[StreamingChat] No more tool uses, completing');
+
+            // Save to memory
+            try {
+              if (currentUser?.username && userMessage && streamResult?.text) {
+                await saveToDaily(currentUser.username, userMessage, streamResult.text);
+              }
+            } catch (err) {
+              console.error("[Memory] Failed to save:", err.message);
+            }
+
+            if (win && !win.isDestroyed()) {
+              win.webContents.send('chat:stream:complete', {
+                result: {
+                  text: streamResult?.text || '',
+                  stop_reason: streamResult?.stop_reason || 'end_turn'
+                }
+              });
+            }
+
+            return { ok: true, streaming: true };
+          }
+
+          // Execute all tools
+          console.log(`[StreamingChat] Executing ${toolUseQueue.length} tools`);
+          const toolResults = [];
+
+          // Build tool executor
+          const chatToolExecutor = buildToolsAndExecutor({
+            googleAccessToken: accessToken,
+            slackAccessToken,
+            weatherEnabled,
+            iMessageEnabled: hasIMessageTools,
+            browserEnabled: hasBrowserTools,
+            apiKeys
+          });
+
+          for (const toolUse of toolUseQueue) {
+            try {
+              // Parse tool input if it's a string
+              const toolInput = typeof toolUse.input === 'string'
+                ? JSON.parse(toolUse.input)
+                : toolUse.input;
+
+              // Execute the tool
+              const result = await chatToolExecutor.executeTool(toolUse.name, toolInput);
+              console.log('[StreamingChat] Tool result:', result);
+
+              // Send tool execution to UI for display
+              if (win && !win.isDestroyed()) {
+                win.webContents.send('chat:stream:tool', {
+                  toolUse,
+                  result,
+                  screenshotDataUrl: result.screenshotDataUrl
+                });
+              }
+
+              // Handle browser screenshots
+              if (result.screenshotDataUrl && win && !win.isDestroyed()) {
+                win.webContents.send("chat:screenshot", { dataUrl: result.screenshotDataUrl });
+              }
+
+              // Prepare tool result for LLM (remove screenshot data URL)
+              const { screenshotDataUrl, ...resultForLLM } = result;
+
+              if (screenshotDataUrl && screenshotDataUrl.startsWith('data:image/')) {
+                // Include image in tool result for vision-enabled models
+                const base64Match = screenshotDataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
+                if (base64Match) {
+                  const mediaType = `image/${base64Match[1]}`;
+                  const base64Data = base64Match[2];
+
+                  toolResults.push({
+                    type: "tool_result",
+                    tool_use_id: toolUse.id,
+                    content: [
+                      { type: "text", text: JSON.stringify(resultForLLM) },
+                      { type: "image", source: { type: "base64", media_type: mediaType, data: base64Data } }
+                    ]
+                  });
+                } else {
+                  toolResults.push({
+                    type: "tool_result",
+                    tool_use_id: toolUse.id,
+                    content: JSON.stringify(resultForLLM)
+                  });
+                }
+              } else {
+                toolResults.push({
+                  type: "tool_result",
+                  tool_use_id: toolUse.id,
+                  content: JSON.stringify(resultForLLM)
+                });
+              }
+            } catch (err) {
+              console.error('[StreamingChat] Tool execution error:', err);
+              toolResults.push({
+                type: "tool_result",
+                tool_use_id: toolUse.id,
+                content: JSON.stringify({ error: err.message }),
+                is_error: true
+              });
+            }
+          }
+
+          // Add assistant message with tool uses and user message with tool results
+          // streamResult.contentBlocks contains the full ordered array of text + tool_use blocks
+          // Ensure all tool_use blocks have object inputs (not strings)
+          const assistantContent = (streamResult.contentBlocks || []).map(block => {
+            if (block.type === 'tool_use') {
+              // Ensure input is an object
+              if (typeof block.input === 'string') {
+                console.warn('[StreamingChat] Tool input is still a string, parsing:', block.name);
+                try {
+                  return { ...block, input: JSON.parse(block.input) };
+                } catch (e) {
+                  console.error('[StreamingChat] Failed to parse tool input:', e.message);
+                  return { ...block, input: {} };
+                }
+              }
+              // Ensure input exists
+              if (!block.input) {
+                console.warn('[StreamingChat] Tool input is missing, using empty object:', block.name);
+                return { ...block, input: {} };
+              }
+            }
+            return block;
+          });
+
+          console.log('[StreamingChat] Assistant content blocks:', JSON.stringify(assistantContent, null, 2));
+
+          currentMessages.push({
+            role: "assistant",
+            content: assistantContent
+          });
+          currentMessages.push({
+            role: "user",
+            content: toolResults
+          });
+
+          // Continue to next iteration to get LLM's response to tool results
+        }
+
+        // Max iterations reached
+        console.error('[StreamingChat] Max iterations reached without completion');
+        if (win && !win.isDestroyed()) {
+          win.webContents.send('chat:stream:error', {
+            error: 'Max iterations reached'
+          });
+        }
+
+        return { ok: false, error: 'Max iterations reached' };
+
+      } else if (activeProvider === 'openai' && apiKeys.openai) {
+        const model = models.openai || 'gpt-4o';
+
+        // Convert to OpenAI format
+        const openaiMessages = [
+          { role: 'system', content: systemPrompt },
+          ...conversationMessages
+        ];
+
+        await streamOpenAIResponse(
+          {
+            apiKey: apiKeys.openai,
+            model,
+            maxTokens: 4096,
+            messages: openaiMessages,
+            tools: allTools // Pass all available tools for streaming
+          },
+          // onDelta
+          (delta, fullText) => {
+            if (win && !win.isDestroyed()) {
+              win.webContents.send('chat:stream:delta', { delta, fullText });
+            }
+          },
+          // onToolCall
+          async (toolCall) => {
+            console.log('[StreamingChat] Tool call:', toolCall.function.name, toolCall.function.arguments);
+
+            // Build tool executor with current context
+            const chatToolExecutor = buildToolsAndExecutor({
+              googleAccessToken: accessToken,
+              slackAccessToken,
+              weatherEnabled,
+              iMessageEnabled: hasIMessageTools,
+              browserEnabled: hasBrowserTools,
+              apiKeys
+            });
+
+            try {
+              // Parse arguments
+              const toolInput = JSON.parse(toolCall.function.arguments);
+
+              // Execute the tool
+              const result = await chatToolExecutor.executeTool(toolCall.function.name, toolInput);
+              console.log('[StreamingChat] Tool result:', result);
+
+              // Send tool execution result to UI
+              if (win && !win.isDestroyed()) {
+                win.webContents.send('chat:stream:tool', {
+                  toolCall,
+                  result,
+                  screenshotDataUrl: result.screenshotDataUrl
+                });
+              }
+
+              // Handle CDP browser tool screenshots - send to UI for display
+              if (result.screenshotDataUrl && win && !win.isDestroyed()) {
+                win.webContents.send("chat:screenshot", { dataUrl: result.screenshotDataUrl });
+              }
+
+              return result;
+            } catch (err) {
+              console.error('[StreamingChat] Tool execution error:', err);
+              return { error: err.message };
+            }
+          },
+          // onComplete
+          async (result) => {
+            console.log('[StreamingChat] Stream complete');
+
+            // Save to memory
+            try {
+              if (currentUser?.username && userMessage && result.text) {
+                await saveToDaily(currentUser.username, userMessage, result.text);
+              }
+            } catch (err) {
+              console.error("[Memory] Failed to save:", err.message);
+            }
+
+            if (win && !win.isDestroyed()) {
+              win.webContents.send('chat:stream:complete', {
+                result: {
+                  text: result.text,
+                  finish_reason: result.finish_reason
+                }
+              });
+            }
+          }
+        );
+
+        return { ok: true, streaming: true };
+      }
+
+      return { ok: false, error: "No API key configured for streaming" };
+
+    } catch (err) {
+      console.error("[StreamingChat] Error:", err);
+
+      // Send error to UI
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('chat:stream:error', { error: err.message });
+      }
+
       return { ok: false, error: err.message };
     }
   });
@@ -16126,6 +15154,7 @@ app.on("window-all-closed", async () => {
   // Clean up schedulers
   stopTaskScheduler();
   stopMemoryScheduler();
+  stopInsightsScheduler();
 
   // Clean up browser controller before quitting
   if (browserController) {

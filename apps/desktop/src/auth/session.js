@@ -4,7 +4,7 @@
 
 const path = require("path");
 const fs = require("fs/promises");
-const { getWovlyDir } = require("../utils/helpers");
+const { getWovlyDir } = require("../../dist/utils/helpers");
 
 const getSessionPath = async () => {
   const dir = await getWovlyDir();

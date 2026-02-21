@@ -12,9 +12,11 @@
     "build:win": "npm run -w apps/ui build && npm run -w apps/desktop build:win",
     "build:linux": "npm run -w apps/ui build && npm run -w apps/desktop build:linux",
     "dist": "npm run -w apps/ui build && npm run -w apps/desktop dist",
-    "lint": "npm run -w apps/ui lint && npm run -w apps/desktop lint"
+    "lint": "npm run -w apps/ui lint && npm run -w apps/desktop lint",
+    "prepare": "husky"
   },
   "devDependencies": {
-    "concurrently": "^9.0.0"
+    "concurrently": "^9.0.0",
+    "puppeteer-core": "^24.37.3"
   }
 }

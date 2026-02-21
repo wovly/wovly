@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld("wovly", {
   },
   chat: {
     send: (messages, workflowContext = null) => ipcRenderer.invoke("chat:send", { messages, workflowContext }),
+    sendStream: (messages, workflowContext = null) => ipcRenderer.invoke("chat:sendStream", { messages, workflowContext }),
     executeInline: (decomposition, originalMessage) => ipcRenderer.invoke("chat:executeInline", { decomposition, originalMessage }),
     // Subscribe to new messages (from WhatsApp sync)
     onNewMessage: (callback) => {
@@ -19,6 +20,27 @@ contextBridge.exposeInMainWorld("wovly", {
       const handler = (_event, data) => callback(data);
       ipcRenderer.on("chat:screenshot", handler);
       return () => ipcRenderer.removeListener("chat:screenshot", handler);
+    },
+    // Streaming events
+    onStreamDelta: (callback) => {
+      const handler = (_event, data) => callback(data);
+      ipcRenderer.on("chat:stream:delta", handler);
+      return () => ipcRenderer.removeListener("chat:stream:delta", handler);
+    },
+    onStreamTool: (callback) => {
+      const handler = (_event, data) => callback(data);
+      ipcRenderer.on("chat:stream:tool", handler);
+      return () => ipcRenderer.removeListener("chat:stream:tool", handler);
+    },
+    onStreamComplete: (callback) => {
+      const handler = (_event, data) => callback(data);
+      ipcRenderer.on("chat:stream:complete", handler);
+      return () => ipcRenderer.removeListener("chat:stream:complete", handler);
+    },
+    onStreamError: (callback) => {
+      const handler = (_event, data) => callback(data);
+      ipcRenderer.on("chat:stream:error", handler);
+      return () => ipcRenderer.removeListener("chat:stream:error", handler);
     }
   },
   // Message Confirmation - requires user approval before sending any message
@@ -34,6 +56,16 @@ contextBridge.exposeInMainWorld("wovly", {
   },
   calendar: {
     getEvents: (date) => ipcRenderer.invoke("calendar:getEvents", { date })
+  },
+  insights: {
+    setLimit: (limit = 5) => ipcRenderer.invoke("insights:setLimit", { limit }),
+    getToday: (limit = 5) => ipcRenderer.invoke("insights:getToday", { limit }),
+    refresh: (limit = 5) => ipcRenderer.invoke("insights:refresh", { limit }),
+    onUpdated: (callback) => {
+      const handler = (_event, data) => callback(data);
+      ipcRenderer.on("insights:updated", handler);
+      return () => ipcRenderer.removeListener("insights:updated", handler);
+    }
   },
   integrations: {
     testGoogle: () => ipcRenderer.invoke("integrations:testGoogle"),
@@ -214,6 +246,23 @@ contextBridge.exposeInMainWorld("wovly", {
     get: (domain, includePassword = false) => ipcRenderer.invoke("credentials:get", { domain, includePassword }),
     save: (credential) => ipcRenderer.invoke("credentials:save", credential),
     delete: (domain) => ipcRenderer.invoke("credentials:delete", { domain })
+  },
+  // Web Scraper - custom website integrations
+  webscraper: {
+    analyzeUrl: (url, siteType) => ipcRenderer.invoke("webscraper:analyzeUrl", { url, siteType }),
+    launchVisualSelector: (url, options) => ipcRenderer.invoke("webscraper:launchVisualSelector", { url, options }),
+    saveConfiguration: (config) => ipcRenderer.invoke("webscraper:saveConfiguration", { config }),
+    listIntegrations: () => ipcRenderer.invoke("webscraper:listIntegrations"),
+    updateIntegration: (id, updates) => ipcRenderer.invoke("webscraper:updateIntegration", { id, updates }),
+    deleteIntegration: (id) => ipcRenderer.invoke("webscraper:deleteIntegration", { id }),
+    testConfiguration: (config) => ipcRenderer.invoke("webscraper:testConfiguration", { config }),
+    testIntegration: (siteId) => ipcRenderer.invoke("webscraper:testIntegration", { siteId }),
+    launchOAuthLogin: (config) => ipcRenderer.invoke("webscraper:launchOAuthLogin", config),
+    onOAuthExpired: (callback) => {
+      const handler = (_event, data) => callback(data);
+      ipcRenderer.on("webscraper:oauthExpired", handler);
+      return () => ipcRenderer.removeListener("webscraper:oauthExpired", handler);
+    }
   },
   // Shell utilities
   shell: {

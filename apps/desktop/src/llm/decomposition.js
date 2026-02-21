@@ -565,6 +565,127 @@ ${stepsText}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Query Complexity Classifier - Bypass decomposition for simple queries
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Classify whether a query needs multi-step decomposition
+ * @param {string} query - User query
+ * @param {Object} apiKeys - API keys
+ * @param {string} activeProvider - Active LLM provider
+ * @returns {Promise<{needs_decomposition: boolean, confidence: number, reasoning: string}>}
+ */
+async function classifyQueryComplexity(query, apiKeys, activeProvider) {
+  const prompt = `Classify if this query needs multi-step planning and decomposition:
+
+Query: "${query}"
+
+A query NEEDS decomposition if it:
+- Requires multiple sequential operations with dependencies
+- Involves waiting for external responses (emails, messages)
+- Needs conditional logic or loops
+- Creates recurring/scheduled tasks
+- Monitors or tracks things over time
+- Has multiple recipients or targets
+
+A query DOES NOT need decomposition if it:
+- Is a simple lookup or search (calendar, emails, messages)
+- Is a single action with no dependencies
+- Is a one-time send operation
+- Is asking for information or status
+- Can be completed with a single tool call or short chain
+
+Examples NEEDING decomposition:
+- "Create a task to monitor my email and notify me when John replies"
+- "Schedule a meeting with the team and send them the agenda"
+- "Every day at 9am, send me a summary of my calendar"
+- "Monitor the weather and alert me if it will rain"
+
+Examples NOT needing decomposition:
+- "What's my schedule today?" (single calendar lookup)
+- "Send an email to John about the project" (single email)
+- "Search for messages from Sarah about the budget" (single search)
+- "What did we discuss yesterday?" (memory lookup)
+- "Show me my tasks" (single task list)
+- "Get the latest from the sales channel" (single Slack query)
+
+Respond with ONLY JSON (no markdown):
+{
+  "needs_decomposition": boolean,
+  "confidence": 0.0-1.0,
+  "reasoning": "brief explanation"
+}`;
+
+  try {
+    // Use Haiku for fast classification
+    if (apiKeys.anthropic) {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKeys.anthropic,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 128,
+          messages: [{ role: "user", content: prompt }]
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const text = data.content?.[0]?.text || "{}";
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const result = JSON.parse(jsonMatch[0]);
+          console.log(`[ComplexityClassifier] Query ${result.needs_decomposition ? "NEEDS" : "DOES NOT NEED"} decomposition (confidence: ${result.confidence})`);
+          console.log(`[ComplexityClassifier] Reasoning: ${result.reasoning}`);
+          return result;
+        }
+      }
+    }
+
+    if (apiKeys.openai) {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKeys.openai}`
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          max_tokens: 128,
+          messages: [
+            { role: "system", content: "You classify query complexity. Respond with only JSON." },
+            { role: "user", content: prompt }
+          ]
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const text = data.choices?.[0]?.message?.content || "{}";
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const result = JSON.parse(jsonMatch[0]);
+          console.log(`[ComplexityClassifier] Query ${result.needs_decomposition ? "NEEDS" : "DOES NOT NEED"} decomposition (confidence: ${result.confidence})`);
+          console.log(`[ComplexityClassifier] Reasoning: ${result.reasoning}`);
+          return result;
+        }
+      }
+    }
+
+    // Default: assume needs decomposition to be safe
+    return { needs_decomposition: true, confidence: 0.5, reasoning: "Classification failed, defaulting to decomposition" };
+  } catch (err) {
+    console.error("[ComplexityClassifier] Error:", err.message);
+    // Default to decomposition on error
+    return { needs_decomposition: true, confidence: 0.5, reasoning: "Error during classification" };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main Entry Point: decomposeQuery (Orchestrates Architect -> Builder -> Validator)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -733,6 +854,7 @@ function formatBuilderPlan(builderResult) {
 
 module.exports = {
   CLASSIFIER_MODELS,
+  classifyQueryComplexity,
   decomposeQuery,
   validateDecomposition,
   architectDecompose,

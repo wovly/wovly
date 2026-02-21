@@ -1,5 +1,7 @@
 import React, { useEffect, useState, useRef, Fragment } from "react";
 import { WovlyIcon, GoogleIcon, IMessageIcon, WeatherIcon, SlackIcon, WhatsAppIcon, TelegramIcon, DiscordIcon, ClaudeIcon, OpenAIIcon, GeminiIcon, PlaywrightIcon, NotionIcon, GitHubIcon, AsanaIcon, RedditIcon, SpotifyIcon, DocsIcon, LogoutIcon, ChatIcon, TasksIcon, SkillsIcon, AboutMeIcon, InterfacesIcon, IntegrationsIcon, SettingsIcon, CredentialsIcon } from "./icons";
+import AddWebIntegrationModal from "./components/webscraper/AddWebIntegrationModal";
+import ManageWebIntegrationsModal from "./components/webscraper/ManageWebIntegrationsModal";
 
 type NavItem = "chat" | "tasks" | "skills" | "about-me" | "interfaces" | "integrations" | "credentials" | "settings";
 
@@ -17,6 +19,23 @@ type CalendarEvent = {
   start: string;
   end: string;
   location?: string;
+};
+
+type Insight = {
+  id: string;
+  type: 'conflict' | 'follow_up' | 'miscommunication' | 'fact_conflict' | 'action_needed';
+  title: string;
+  description: string;
+  priority: number;
+  timestamp: string;
+  relatedMessages?: {
+    platform: string;
+    from: string;
+    snippet: string;
+    timestamp: string;
+  }[];
+  suggestedAction?: string;
+  relatedGoal?: string;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -192,17 +211,307 @@ function calculateEventColumns(events: CalendarEvent[]): Map<string, { column: n
   return result;
 }
 
-function AgendaPanel() {
+// ─────────────────────────────────────────────────────────────────────────────
+// Insight Components
+// ─────────────────────────────────────────────────────────────────────────────
+
+function InsightCard({
+  insight,
+  expanded,
+  onToggle
+}: {
+  insight: Insight;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const getInsightIcon = (type: Insight['type']) => {
+    const iconProps = {
+      width: 20,
+      height: 20,
+      viewBox: "0 0 24 24",
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: 2,
+      strokeLinecap: "round" as const,
+      strokeLinejoin: "round" as const,
+    };
+
+    switch (type) {
+      case 'conflict':
+        return (
+          <svg {...iconProps}>
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+            <line x1="12" y1="9" x2="12" y2="13" />
+            <line x1="12" y1="17" x2="12.01" y2="17" />
+          </svg>
+        );
+      case 'follow_up':
+        return (
+          <svg {...iconProps}>
+            <circle cx="12" cy="12" r="10" />
+            <polyline points="12 6 12 12 16 14" />
+          </svg>
+        );
+      case 'miscommunication':
+        return (
+          <svg {...iconProps}>
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            <line x1="9" y1="10" x2="15" y2="10" />
+            <line x1="12" y1="14" x2="12" y2="14" />
+          </svg>
+        );
+      case 'fact_conflict':
+        return (
+          <svg {...iconProps}>
+            <polyline points="23 4 23 10 17 10" />
+            <polyline points="1 20 1 14 7 14" />
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+          </svg>
+        );
+      case 'action_needed':
+        return (
+          <svg {...iconProps}>
+            <polyline points="20 6 9 17 4 12" />
+          </svg>
+        );
+      default:
+        return (
+          <svg {...iconProps}>
+            <circle cx="12" cy="12" r="10" />
+            <line x1="12" y1="16" x2="12" y2="12" />
+            <line x1="12" y1="8" x2="12.01" y2="8" />
+          </svg>
+        );
+    }
+  };
+
+  const getInsightTypeLabel = (type: Insight['type']) => {
+    switch (type) {
+      case 'conflict': return 'Conflict';
+      case 'follow_up': return 'Follow-up';
+      case 'miscommunication': return 'Miscommunication';
+      case 'fact_conflict': return 'Conflicting Info';
+      case 'action_needed': return 'Action Needed';
+      default: return 'Insight';
+    }
+  };
+
+  // Get unique sources (platforms and people)
+  const getMessageSources = () => {
+    if (!insight.relatedMessages || insight.relatedMessages.length === 0) {
+      return null;
+    }
+
+    const platforms = new Set(insight.relatedMessages.map(m => m.platform));
+    const people = new Set(insight.relatedMessages.map(m => m.from));
+
+    return {
+      platforms: Array.from(platforms),
+      people: Array.from(people)
+    };
+  };
+
+  // Get primary platform (the one with most messages)
+  const getPrimaryPlatform = () => {
+    if (!insight.relatedMessages || insight.relatedMessages.length === 0) {
+      return null;
+    }
+
+    const platformCounts: Record<string, number> = {};
+    insight.relatedMessages.forEach(msg => {
+      platformCounts[msg.platform] = (platformCounts[msg.platform] || 0) + 1;
+    });
+
+    const primaryPlatform = Object.entries(platformCounts).sort((a, b) => b[1] - a[1])[0][0];
+    return primaryPlatform;
+  };
+
+  // Get platform icon component
+  const getPlatformIcon = (platform: string) => {
+    const iconSize = 16;
+    switch (platform?.toLowerCase()) {
+      case 'gmail':
+      case 'email':
+        return <GoogleIcon size={iconSize} />;
+      case 'imessage':
+        return <IMessageIcon size={iconSize} />;
+      case 'slack':
+        return <SlackIcon size={iconSize} />;
+      case 'whatsapp':
+        return <WhatsAppIcon size={iconSize} />;
+      case 'telegram':
+        return <TelegramIcon size={iconSize} />;
+      case 'discord':
+        return <DiscordIcon size={iconSize} />;
+      case 'notion':
+        return <NotionIcon size={iconSize} />;
+      case 'github':
+        return <GitHubIcon size={iconSize} />;
+      case 'asana':
+        return <AsanaIcon size={iconSize} />;
+      case 'reddit':
+        return <RedditIcon size={iconSize} />;
+      case 'spotify':
+        return <SpotifyIcon size={iconSize} />;
+      default:
+        return null;
+    }
+  };
+
+  const sources = getMessageSources();
+  const primaryPlatform = getPrimaryPlatform();
+  const platformIcon = primaryPlatform ? getPlatformIcon(primaryPlatform) : null;
+
+  return (
+    <div className={`insight-card insight-${insight.type}`}>
+      <div className="insight-header" onClick={onToggle}>
+        <div className="insight-header-left">
+          <span className="insight-icon">{getInsightIcon(insight.type)}</span>
+          <div className="insight-title-section">
+            <h4 className="insight-title">{insight.title}</h4>
+            <span className="insight-type-label">{getInsightTypeLabel(insight.type)}</span>
+          </div>
+        </div>
+        <div className="insight-header-right">
+          {platformIcon && (
+            <span className="insight-platform-icon" title={`Primary source: ${primaryPlatform}`}>
+              {platformIcon}
+            </span>
+          )}
+          <span className="insight-priority">Priority: {insight.priority}</span>
+          <button className="insight-expand-btn" aria-label={expanded ? "Collapse" : "Expand"}>
+            {expanded ? '▼' : '▶'}
+          </button>
+        </div>
+      </div>
+
+      {expanded && (
+        <div className="insight-details">
+          {sources && (
+            <div className="insight-sources">
+              <strong>Sources:</strong> {sources.platforms.join(', ')} • {sources.people.join(', ')}
+            </div>
+          )}
+
+          <p className="insight-description">{insight.description}</p>
+
+          {insight.relatedGoal && (
+            <div className="insight-goal">
+              <strong>Related Goal:</strong> {insight.relatedGoal}
+            </div>
+          )}
+
+          {insight.suggestedAction && (
+            <div className="insight-action">
+              <strong>Suggested Action:</strong> {insight.suggestedAction}
+            </div>
+          )}
+
+          {insight.relatedMessages && insight.relatedMessages.length > 0 && (
+            <div className="insight-messages">
+              <strong>Related Messages:</strong>
+              {insight.relatedMessages.map((msg, index) => (
+                <div key={index} className="insight-message">
+                  <div className="message-header">
+                    <span className="message-platform">{msg.platform}</span>
+                    <span className="message-from">From: {msg.from}</span>
+                    <span className="message-time">
+                      {new Date(msg.timestamp).toLocaleDateString()}
+                    </span>
+                  </div>
+                  <p className="message-snippet">{msg.snippet}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function InsightsTabContent({ insights, loading, error, onNavigate }: {
+  insights: Insight[];
+  loading: boolean;
+  error: string | null;
+  onNavigate?: (nav: NavItem) => void;
+}) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+
+  if (loading) {
+    return (
+      <div className="insights-empty-state">
+        <div className="loading-spinner"></div>
+        <p>Loading insights...</p>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="insights-empty-state">
+        <div className="empty-state-icon">⚠️</div>
+        <h4>Error Loading Insights</h4>
+        <p>{error}</p>
+      </div>
+    );
+  }
+
+  if (insights.length === 0) {
+    return (
+      <div className="insights-empty-state">
+        <div className="empty-state-icon">✨</div>
+        <h4>No Insights Yet</h4>
+        <p>We'll analyze your messages hourly and surface important issues here.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="insights-list">
+      {insights.map((insight) => (
+        <InsightCard
+          key={insight.id}
+          insight={insight}
+          expanded={expandedId === insight.id}
+          onToggle={() => setExpandedId(expandedId === insight.id ? null : insight.id)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function AgendaPanel({ onNavigate }: { onNavigate?: (nav: NavItem) => void }) {
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [currentDate, setCurrentDate] = useState(new Date());
   const [loading, setLoading] = useState(true);
   const [googleConnected, setGoogleConnected] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Insights state
+  const [activeTab, setActiveTab] = useState<"insights" | "agenda">("insights");
+  const [insights, setInsights] = useState<Insight[]>([]);
+  const [insightsLoading, setInsightsLoading] = useState(false);
+  const [insightsError, setInsightsError] = useState<string | null>(null);
+  const [lastInsightsUpdate, setLastInsightsUpdate] = useState<Date | null>(null);
+  const [isRefreshingInsights, setIsRefreshingInsights] = useState(false);
+  const [insightsLimit, setInsightsLimit] = useState<number>(() => {
+    // Load from localStorage or default to 5
+    const saved = localStorage.getItem('wovly-insights-limit');
+    return saved ? parseInt(saved, 10) : 5;
+  });
 
   useEffect(() => {
     const checkGoogle = async () => {
       if (!window.wovly) return;
-      const result = await window.wovly.integrations.checkGoogleAuth();
-      setGoogleConnected(result.authorized);
+      try {
+        const result = await window.wovly.integrations.checkGoogleAuth();
+        console.log('[AgendaPanel] Google auth check:', result);
+        setGoogleConnected(result.authorized);
+      } catch (err) {
+        console.error('[AgendaPanel] Error checking Google auth:', err);
+        setError('Failed to check Google Calendar connection');
+      }
     };
     checkGoogle();
   }, []);
@@ -213,23 +522,122 @@ function AgendaPanel() {
         setLoading(false);
         return;
       }
-      
+
       setLoading(true);
-      // Use local date format (YYYY-MM-DD) instead of toISOString() which converts to UTC
-      // toISOString() can shift the date by a day depending on timezone
-      const year = currentDate.getFullYear();
-      const month = String(currentDate.getMonth() + 1).padStart(2, '0');
-      const day = String(currentDate.getDate()).padStart(2, '0');
-      const dateStr = `${year}-${month}-${day}`;
-      const result = await window.wovly.calendar.getEvents(dateStr);
-      
-      if (result.ok && result.events) {
-        setEvents(result.events);
+      setError(null);
+
+      try {
+        // Use local date format (YYYY-MM-DD) instead of toISOString() which converts to UTC
+        // toISOString() can shift the date by a day depending on timezone
+        const year = currentDate.getFullYear();
+        const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+        const day = String(currentDate.getDate()).padStart(2, '0');
+        const dateStr = `${year}-${month}-${day}`;
+
+        console.log('[AgendaPanel] Fetching events for date:', dateStr);
+        const result = await window.wovly.calendar.getEvents(dateStr);
+        console.log('[AgendaPanel] Calendar API result:', result);
+
+        if (result.ok && result.events) {
+          setEvents(result.events);
+          console.log('[AgendaPanel] Loaded events:', result.events.length);
+        } else {
+          console.warn('[AgendaPanel] No events or API error:', result);
+          setError(result.error || 'Failed to load calendar events');
+          setEvents([]);
+        }
+      } catch (err) {
+        console.error('[AgendaPanel] Error fetching events:', err);
+        setError(err instanceof Error ? err.message : 'Failed to fetch calendar events');
+        setEvents([]);
+      } finally {
+        setLoading(false);
       }
-      setLoading(false);
     };
     fetchEvents();
   }, [currentDate, googleConnected]);
+
+  // Fetch insights
+  useEffect(() => {
+    const fetchInsights = async () => {
+      if (!window.wovly) return;
+      setInsightsLoading(true);
+      setInsightsError(null);
+      try {
+        const result = await window.wovly.insights.getToday(insightsLimit);
+        if (result.ok) {
+          setInsights(result.insights || []);
+          setLastInsightsUpdate(new Date());
+        } else {
+          setInsightsError(result.error || 'Failed to load insights');
+        }
+      } catch (err) {
+        console.error('[AgendaPanel] Error fetching insights:', err);
+        setInsightsError(err instanceof Error ? err.message : 'Failed to fetch insights');
+      } finally {
+        setInsightsLoading(false);
+      }
+    };
+
+    fetchInsights();
+
+    // Refresh every 5 minutes
+    const interval = setInterval(fetchInsights, 5 * 60 * 1000);
+
+    // Subscribe to insights updates
+    const unsubscribe = window.wovly?.insights.onUpdated((data: { insights: Insight[] }) => {
+      setInsights(data.insights || []);
+      setLastInsightsUpdate(new Date());
+    });
+
+    return () => {
+      clearInterval(interval);
+      if (unsubscribe) unsubscribe();
+    };
+  }, [insightsLimit]);
+
+  // Save insights limit to localStorage and backend settings when it changes
+  const isInitialMount = useRef(true);
+  useEffect(() => {
+    localStorage.setItem('wovly-insights-limit', insightsLimit.toString());
+
+    // Save to backend settings immediately (so scheduled checks use the new limit)
+    if (window.wovly?.insights?.setLimit) {
+      window.wovly.insights.setLimit(insightsLimit).catch(err => {
+        console.error('[AgendaPanel] Error saving limit preference:', err);
+      });
+    }
+
+    // Trigger refresh when limit changes (but not on initial mount)
+    if (!isInitialMount.current) {
+      console.log('[AgendaPanel] Insights limit changed, triggering refresh');
+      handleRefreshInsights();
+    } else {
+      isInitialMount.current = false;
+    }
+  }, [insightsLimit]);
+
+  // Manual refresh handler for insights
+  const handleRefreshInsights = async () => {
+    if (!window.wovly || isRefreshingInsights) return;
+
+    setIsRefreshingInsights(true);
+    setInsightsError(null);
+    try {
+      const result = await window.wovly.insights.refresh(insightsLimit);
+      if (result.ok) {
+        setInsights(result.insights || []);
+        setLastInsightsUpdate(new Date());
+      } else {
+        setInsightsError(result.error || 'Failed to refresh insights');
+      }
+    } catch (err) {
+      console.error('[AgendaPanel] Error refreshing insights:', err);
+      setInsightsError(err instanceof Error ? err.message : 'Failed to refresh insights');
+    } finally {
+      setIsRefreshingInsights(false);
+    }
+  };
 
   const goToPreviousDay = () => {
     setCurrentDate(prev => {
@@ -282,25 +690,129 @@ function AgendaPanel() {
   const timedEvents = events.filter(e => e.start.includes("T"));
   const eventColumns = calculateEventColumns(timedEvents);
 
+  console.log('[AgendaPanel] Timed events for rendering:', timedEvents.length);
+  console.log('[AgendaPanel] Event columns:', eventColumns);
+
+  // Calculate current time indicator position
+  const isToday = currentDate.toDateString() === new Date().toDateString();
+  const getCurrentTimePosition = () => {
+    if (!isToday) return null;
+    const now = new Date();
+    const currentHour = now.getHours() + now.getMinutes() / 60;
+    if (currentHour < START_HOUR || currentHour > END_HOUR) return null;
+    return ((currentHour - START_HOUR) / TOTAL_HOURS) * 100;
+  };
+  const currentTimePosition = getCurrentTimePosition();
+
   return (
-    <div className="panel agenda-panel">
-      <div className="panel-header">
-        <button className="icon-btn" onClick={goToPreviousDay}>←</button>
-        <div className="agenda-header-text">
-          <h2>{formatDate(currentDate)}</h2>
-          <span className="agenda-date-subtitle">{formatFullDate(currentDate)}</span>
-        </div>
-        <button className="icon-btn" onClick={goToNextDay}>→</button>
+    <div className="agenda-panel">
+      <div className="agenda-header">
+        {activeTab === "agenda" ? (
+          <div className="agenda-date-nav">
+            <button className="btn-ghost agenda-nav-btn" onClick={goToPreviousDay}>
+              ←
+            </button>
+            <div className="agenda-date-display">
+              <h3 className="agenda-date-title">{formatDate(currentDate)}</h3>
+              <p className="agenda-date-subtitle">{formatFullDate(currentDate)}</p>
+            </div>
+            <button className="btn-ghost agenda-nav-btn" onClick={goToNextDay}>
+              →
+            </button>
+          </div>
+        ) : (
+          <div className="agenda-title-section">
+            <button
+              className="btn-ghost insights-refresh-btn-corner"
+              onClick={handleRefreshInsights}
+              disabled={isRefreshingInsights}
+              title="Refresh insights"
+            >
+              {isRefreshingInsights ? '⟳' : '↻'}
+            </button>
+            <h3 className="agenda-title">Insights</h3>
+            <p className="agenda-subtitle">
+              Important issues discovered from your messages based on your{' '}
+              <button
+                className="insights-goals-link-inline"
+                onClick={() => onNavigate?.("about-me")}
+              >
+                goals
+              </button>
+            </p>
+            <div className="insights-controls">
+              <label className="insights-limit-label">
+                Show:
+                <select
+                  className="insights-limit-select"
+                  value={insightsLimit}
+                  onChange={(e) => setInsightsLimit(Number(e.target.value))}
+                >
+                  <option value={5}>5 insights</option>
+                  <option value={10}>10 insights</option>
+                  <option value={20}>20 insights</option>
+                </select>
+              </label>
+            </div>
+            {lastInsightsUpdate && (
+              <p className="insights-last-update">
+                Last update: {lastInsightsUpdate.toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit'
+                })}
+              </p>
+            )}
+          </div>
+        )}
       </div>
-      <div className="panel-body">
-        {!googleConnected ? (
-          <div className="empty-state">
-            <p>Connect Google Calendar in Integrations to see your agenda.</p>
+
+      <div className="task-tabs">
+        <button
+          className={`task-tab ${activeTab === "insights" ? "active" : ""}`}
+          onClick={() => setActiveTab("insights")}
+        >
+          Insights
+        </button>
+        <button
+          className={`task-tab ${activeTab === "agenda" ? "active" : ""}`}
+          onClick={() => setActiveTab("agenda")}
+        >
+          Today's Agenda
+        </button>
+      </div>
+
+      <div className="agenda-content">
+        {activeTab === "insights" ? (
+          <InsightsTabContent
+            insights={insights}
+            loading={insightsLoading}
+            error={insightsError}
+            onNavigate={onNavigate}
+          />
+        ) : !googleConnected ? (
+          <div className="agenda-empty-state">
+            <div className="empty-state-icon">📅</div>
+            <h4>Connect Google Calendar</h4>
+            <p>View your schedule by connecting your Google Calendar in Integrations.</p>
+          </div>
+        ) : error ? (
+          <div className="agenda-empty-state">
+            <div className="empty-state-icon">⚠️</div>
+            <h4>Error Loading Calendar</h4>
+            <p>{error}</p>
+            <p className="error-hint">Check the browser console (F12) for more details.</p>
           </div>
         ) : loading ? (
-          <div className="empty-state"><p>Loading...</p></div>
+          <div className="agenda-empty-state">
+            <div className="loading-spinner"></div>
+            <p>Loading events...</p>
+          </div>
         ) : events.length === 0 ? (
-          <div className="empty-state"><p>No events scheduled for this day.</p></div>
+          <div className="agenda-empty-state">
+            <div className="empty-state-icon">✨</div>
+            <h4>No events today</h4>
+            <p>You have a free day ahead.</p>
+          </div>
         ) : (
           <div className="agenda-timeline-container">
             <div className="agenda-timeline">
@@ -309,33 +821,48 @@ function AgendaPanel() {
                   const hour = START_HOUR + i;
                   const topPercent = (i / TOTAL_HOURS) * 100;
                   return (
-                    <div key={hour} className="timeline-hour" style={{ top: `${topPercent}%` }}>
-                      <span className="timeline-hour-label">{formatHourLabel(hour)}</span>
-                      <div className="timeline-hour-line" />
+                    <div key={hour} className="timeline-row" style={{ top: `${topPercent}%` }}>
+                      <span className="timeline-time-label">{formatHourLabel(hour)}</span>
+                      <div className="timeline-divider" />
                     </div>
                   );
                 })}
               </div>
+              {currentTimePosition !== null && (
+                <div className="timeline-now-indicator" style={{ top: `${currentTimePosition}%` }}>
+                  <div className="now-indicator-dot"></div>
+                  <div className="now-indicator-line"></div>
+                </div>
+              )}
               <div className="timeline-events">
                 {timedEvents.map(event => {
                   const pos = getEventPosition(event);
-                  if (!pos) return null;
-                  
+                  if (!pos) {
+                    console.log('[AgendaPanel] Event filtered out (position null):', event.title);
+                    return null;
+                  }
+                  console.log('[AgendaPanel] Rendering event:', event.title, 'at position:', pos);
+
                   const colInfo = eventColumns.get(event.id);
                   const column = colInfo?.column ?? 0;
                   const totalColumns = colInfo?.totalColumns ?? 1;
                   const width = 100 / totalColumns;
                   const left = column * width;
-                  
+
                   const startTime = new Date(event.start).toLocaleTimeString("en-US", {
                     hour: "numeric",
                     minute: "2-digit"
                   });
-                  
+
+                  const endTime = new Date(event.end).toLocaleTimeString("en-US", {
+                    hour: "numeric",
+                    minute: "2-digit"
+                  });
+
                   return (
                     <div
                       key={event.id}
-                      className="timeline-event"
+                      className="event-card"
                       style={{
                         top: `${pos.top}%`,
                         height: `${pos.height}%`,
@@ -343,8 +870,13 @@ function AgendaPanel() {
                         width: `${width}%`
                       }}
                     >
-                      <div className="timeline-event-title">{event.title}</div>
-                      <div className="timeline-event-time">{startTime}</div>
+                      <div className="event-card-content">
+                        <div className="event-title">{event.title}</div>
+                        <div className="event-time">{startTime} - {endTime}</div>
+                        {event.location && (
+                          <div className="event-location">📍 {event.location}</div>
+                        )}
+                      </div>
                     </div>
                   );
                 })}
@@ -450,6 +982,8 @@ function ChatPanel({
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [whatsappSyncReady, setWhatsappSyncReady] = useState(false);
+  // Always use streaming mode
+  const [isStreaming, setIsStreaming] = useState(false);
   const chatBodyRef = useRef<HTMLDivElement>(null);
   
   // Query decomposition state
@@ -542,6 +1076,84 @@ function ChatPanel({
     };
   }, [setMessages]);
 
+  // Streaming event listeners
+  useEffect(() => {
+    if (!window.wovly?.chat) return;
+
+    // Listen for streaming text deltas
+    const unsubscribeDelta = window.wovly.chat.onStreamDelta?.((data: { delta: string; fullText: string }) => {
+      setMessages(prev => {
+        const last = prev[prev.length - 1];
+        if (last && last.role === 'assistant' && last.streaming) {
+          // Update the last streaming message
+          return [
+            ...prev.slice(0, -1),
+            { ...last, content: data.fullText }
+          ];
+        } else {
+          // Create new streaming message
+          return [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              role: 'assistant',
+              content: data.fullText,
+              source: 'app',
+              streaming: true
+            }
+          ];
+        }
+      });
+    });
+
+    // Listen for tool calls during streaming
+    const unsubscribeTool = window.wovly.chat.onStreamTool?.((data: { toolUse: any }) => {
+      console.log('[UI] Tool being executed:', data.toolUse.name);
+      // You could show a tool execution indicator here
+    });
+
+    // Listen for stream completion
+    const unsubscribeComplete = window.wovly.chat.onStreamComplete?.((data: { result: any }) => {
+      console.log('[UI] Stream complete');
+      setIsStreaming(false);
+      setIsLoading(false);
+      setMessages(prev => {
+        const last = prev[prev.length - 1];
+        if (last && last.streaming) {
+          // Mark as complete (remove streaming flag)
+          const { streaming, ...rest } = last;
+
+          // Sync assistant response to WhatsApp if connected
+          window.wovly.whatsapp?.isSyncReady().then(ready => {
+            if (ready && rest.content) {
+              window.wovly.whatsapp.syncToSelfChat(rest.content, false).catch(() => {
+                // Silently ignore sync errors
+              });
+            }
+          }).catch(() => {});
+
+          return [...prev.slice(0, -1), rest];
+        }
+        return prev;
+      });
+    });
+
+    // Listen for streaming errors
+    const unsubscribeError = window.wovly.chat.onStreamError?.((data: { error: string }) => {
+      console.error('[UI] Streaming error:', data.error);
+      setError(`Streaming error: ${data.error}`);
+      setIsStreaming(false);
+      setIsLoading(false);
+    });
+
+    return () => {
+      unsubscribeDelta?.();
+      unsubscribeTool?.();
+      unsubscribeComplete?.();
+      unsubscribeError?.();
+    };
+  }, []);
+
   // Note: Task updates are now sent via chat:newMessage for richer formatting
   // The tasks.onUpdate is still used by TasksPage to refresh the task list
 
@@ -615,6 +1227,24 @@ function ChatPanel({
         type: activeWorkflow.type,
         original_query: activeWorkflow.context?.original_query
       } : null;
+
+      // Always use streaming mode
+      console.log('[UI] Using streaming mode');
+      setIsStreaming(true);
+
+      try {
+        await window.wovly.chat.sendStream(chatHistory, workflowContext);
+        // Streaming handlers will update messages automatically
+        // onStreamDelta adds content progressively
+        // onStreamComplete marks streaming as finished
+      } catch (streamError) {
+        console.error('[UI] Streaming failed:', streamError);
+        setError('Streaming failed. Please try again.');
+        setIsStreaming(false);
+        setIsLoading(false);
+      }
+
+      return; // Exit early - streaming handlers take over
 
       const result = await window.wovly.chat.send(chatHistory, workflowContext) as {
         ok: boolean;
@@ -972,47 +1602,76 @@ function ChatPanel({
   };
 
   return (
-    <div className="panel chat-panel">
-      <div className="panel-header">
-        <h2>Chat</h2>
-        {whatsappSyncReady && (
-          <span className="sync-indicator whatsapp" title="Synced with WhatsApp">
-            💬 Synced
-          </span>
-        )}
+    <div className="chat-container">
+      <div className="chat-header">
+        <div className="chat-header-info">
+          <h3>Chat with Wovly</h3>
+          {whatsappSyncReady && (
+            <div className="chat-status">
+              <div className="status-indicator"></div>
+              Synced with WhatsApp
+            </div>
+          )}
+        </div>
       </div>
-      <div className="chat-body" ref={chatBodyRef}>
+      <div className="chat-messages" ref={chatBodyRef}>
         {messages.map(msg => (
-          <div key={msg.id} className={`chat-bubble ${msg.role} ${msg.source === "whatsapp" ? "from-whatsapp" : ""} ${msg.source === "task" ? "from-task" : ""} ${msg.source === "clarification" ? "clarification" : ""}`}>
-            {msg.source === "whatsapp" && <span className="source-badge">📱</span>}
-            {msg.source === "task" && <span className="source-badge">📋</span>}
-            {msg.source === "clarification" && <span className="source-badge">❓</span>}
-            {msg.role === "assistant" ? renderMarkdown(msg.content) : msg.content}
-            {msg.images && msg.images.length > 0 && (
-              <div className="chat-images">
-                {msg.images.map((imgSrc, idx) => (
-                  <img 
-                    key={idx} 
-                    src={imgSrc} 
-                    alt="Browser screenshot" 
-                    className="chat-screenshot"
-                    onClick={() => window.open(imgSrc, '_blank')}
-                  />
-                ))}
+          <div key={msg.id} className={`message ${msg.role}`}>
+            <div className="message-avatar">
+              {msg.role === 'assistant' ? 'W' : (msg.content.charAt(0).toUpperCase() || 'U')}
+            </div>
+            <div className="message-content">
+              <div className="message-bubble">
+                {msg.role === "assistant" ? renderMarkdown(msg.content) : msg.content}
+                {msg.images && msg.images.length > 0 && (
+                  <div className="message-screenshots">
+                    {msg.images.map((imgSrc, idx) => (
+                      <img
+                        key={idx}
+                        src={imgSrc}
+                        alt="Browser screenshot"
+                        className="screenshot-thumb"
+                        onClick={() => window.open(imgSrc, '_blank')}
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
-            )}
+              {(msg.source || msg.streaming) && (
+                <div className="message-meta">
+                  {msg.source === "whatsapp" && <span className="message-source">📱 WhatsApp</span>}
+                  {msg.source === "task" && <span className="message-source">📋 Task</span>}
+                  {msg.source === "clarification" && <span className="message-source">❓ Clarification</span>}
+                  {msg.streaming && <span className="message-streaming">Typing</span>}
+                </div>
+              )}
+            </div>
           </div>
         ))}
         {isLoading && (
-          <div className="chat-bubble assistant">
-            <div className="typing-dots">
-              <span className="typing-dot"></span>
-              <span className="typing-dot"></span>
-              <span className="typing-dot"></span>
+          <div className="message assistant">
+            <div className="message-avatar">W</div>
+            <div className="message-content">
+              <div className="message-bubble">
+                <div className="typing-dots">
+                  <span className="typing-dot"></span>
+                  <span className="typing-dot"></span>
+                  <span className="typing-dot"></span>
+                </div>
+              </div>
             </div>
           </div>
         )}
-        {error && <div className="chat-error">{error}</div>}
+        {error && (
+          <div className="message assistant">
+            <div className="message-avatar">⚠️</div>
+            <div className="message-content">
+              <div className="message-bubble" style={{ background: 'var(--error-bg)', color: 'var(--error)' }}>
+                {error}
+              </div>
+            </div>
+          </div>
+        )}
         
         {/* Onboarding: Go to Settings when API keys needed */}
         {needsApiSetup && (
@@ -1090,14 +1749,14 @@ function ChatPanel({
               </select>
             </div>
             <button 
-              className="primary" 
+              className="btn btn-primary" 
               onClick={handleCreateTaskFromDecomposition}
               disabled={isCreatingTask}
             >
               {isCreatingTask ? "Creating Task..." : "Yes, Create Task"}
             </button>
             <button 
-              className="secondary" 
+              className="btn btn-secondary" 
               onClick={handleDismissTaskSuggestion}
               disabled={isCreatingTask}
             >
@@ -1175,14 +1834,14 @@ function ChatPanel({
             {/* Action Buttons */}
             <div className="fact-confirmation-actions">
               <button 
-                className="primary" 
+                className="btn btn-primary" 
                 onClick={handleSaveFacts}
                 disabled={isSavingFacts}
               >
                 {isSavingFacts ? "Saving..." : "Save to Profile"}
               </button>
               <button 
-                className="secondary" 
+                className="btn btn-secondary" 
                 onClick={handleSkipFacts}
                 disabled={isSavingFacts}
               >
@@ -1192,17 +1851,20 @@ function ChatPanel({
           </div>
         )}
       </div>
-      <div className="chat-input-area">
-        <textarea
-          value={message}
-          onChange={e => setMessage(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Type a message..."
-          rows={1}
-        />
-        <button className="send-btn" onClick={handleSend} disabled={isLoading || !message.trim()}>
-          Send
-        </button>
+      <div className="chat-input-container">
+        <div className="chat-input-wrapper">
+          <textarea
+            className="chat-input"
+            value={message}
+            onChange={e => setMessage(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Type a message..."
+            rows={1}
+          />
+          <button className="send-button" onClick={handleSend} disabled={isLoading || !message.trim()}>
+            ↑
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1288,7 +1950,7 @@ function GoogleSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
                   </ul>
                 </li>
               </ol>
-              <button className="primary" onClick={() => setStep(2)}>Next</button>
+              <button className="btn btn-primary" onClick={() => setStep(2)}>Next</button>
             </>
           )}
 
@@ -1302,8 +1964,8 @@ function GoogleSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
                 <li>Add scopes for Calendar, Gmail, and Drive</li>
                 <li>Add your email as a test user</li>
               </ol>
-              <button className="secondary" onClick={() => setStep(1)}>Back</button>
-              <button className="primary" onClick={() => setStep(3)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(3)}>Next</button>
             </>
           )}
 
@@ -1319,8 +1981,8 @@ function GoogleSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
                 </li>
                 <li>Click "Create"</li>
               </ol>
-              <button className="secondary" onClick={() => setStep(2)}>Back</button>
-              <button className="primary" onClick={() => setStep(4)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(2)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(4)}>Next</button>
             </>
           )}
 
@@ -1354,8 +2016,8 @@ function GoogleSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
                 />
               </div>
 
-              <button className="secondary" onClick={() => setStep(3)}>Back</button>
-              <button className="primary" onClick={() => setStep(5)} disabled={!clientId || !clientSecret}>
+              <button className="btn btn-secondary" onClick={() => setStep(3)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(5)} disabled={!clientId || !clientSecret}>
                 Next
               </button>
             </>
@@ -1367,7 +2029,7 @@ function GoogleSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
               <p>Click below to authorize Wovly to access your Google account:</p>
               
               {authStatus === "idle" && (
-                <button className="primary" onClick={handleAuthorize}>
+                <button className="btn btn-primary" onClick={handleAuthorize}>
                   Authorize with Google
                 </button>
               )}
@@ -1383,11 +2045,11 @@ function GoogleSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
               {authStatus === "error" && (
                 <>
                   <p className="error-text">✗ {authError}</p>
-                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                  <button className="btn btn-primary" onClick={handleAuthorize}>Try Again</button>
                 </>
               )}
 
-              <button className="secondary" onClick={() => setStep(4)}>Back</button>
+              <button className="btn btn-secondary" onClick={() => setStep(4)}>Back</button>
             </>
           )}
         </div>
@@ -1490,7 +2152,7 @@ function SlackSetupModal({ onClose, onComplete }: { onClose: () => void; onCompl
                 <li>Select your workspace</li>
                 <li>Click <strong>"Create App"</strong></li>
               </ol>
-              <button className="primary" onClick={() => setStep(2)}>Next</button>
+              <button className="btn btn-primary" onClick={() => setStep(2)}>Next</button>
             </>
           )}
 
@@ -1522,8 +2184,8 @@ function SlackSetupModal({ onClose, onComplete }: { onClose: () => void; onCompl
               <div style={{ background: "#fff3cd", padding: "10px", borderRadius: "6px", marginTop: "12px", fontSize: "0.85rem" }}>
                 ⚠️ Make sure you add these to <strong>User Token Scopes</strong>, not Bot Token Scopes
               </div>
-              <button className="secondary" onClick={() => setStep(1)}>Back</button>
-              <button className="primary" onClick={() => setStep(3)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(3)}>Next</button>
             </>
           )}
 
@@ -1539,7 +2201,7 @@ function SlackSetupModal({ onClose, onComplete }: { onClose: () => void; onCompl
               </div>
 
               {tunnelStatus === "idle" && (
-                <button className="primary" onClick={handleStartTunnel}>
+                <button className="btn btn-primary" onClick={handleStartTunnel}>
                   🚀 Start Secure Tunnel
                 </button>
               )}
@@ -1583,14 +2245,14 @@ function SlackSetupModal({ onClose, onComplete }: { onClose: () => void; onCompl
               {tunnelStatus === "error" && (
                 <div className="auth-status error">
                   <p>❌ {tunnelError}</p>
-                  <button className="primary" onClick={handleStartTunnel}>Try Again</button>
+                  <button className="btn btn-primary" onClick={handleStartTunnel}>Try Again</button>
                 </div>
               )}
 
               <div style={{ marginTop: "16px" }}>
-                <button className="secondary" onClick={() => setStep(2)}>Back</button>
+                <button className="btn btn-secondary" onClick={() => setStep(2)}>Back</button>
                 <button 
-                  className="primary" 
+                  className="btn btn-primary" 
                   onClick={() => setStep(4)} 
                   disabled={tunnelStatus !== "ready"}
                 >
@@ -1623,8 +2285,8 @@ function SlackSetupModal({ onClose, onComplete }: { onClose: () => void; onCompl
                 </li>
                 <li>Click <strong>"Add"</strong> then <strong>"Save URLs"</strong></li>
               </ol>
-              <button className="secondary" onClick={() => setStep(3)}>Back</button>
-              <button className="primary" onClick={() => setStep(5)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(3)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(5)}>Next</button>
             </>
           )}
 
@@ -1657,8 +2319,8 @@ function SlackSetupModal({ onClose, onComplete }: { onClose: () => void; onCompl
                 />
               </div>
 
-              <button className="secondary" onClick={() => setStep(4)}>Back</button>
-              <button className="primary" onClick={() => setStep(6)} disabled={!clientId || !clientSecret}>
+              <button className="btn btn-secondary" onClick={() => setStep(4)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(6)} disabled={!clientId || !clientSecret}>
                 Next
               </button>
             </>
@@ -1695,11 +2357,11 @@ function SlackSetupModal({ onClose, onComplete }: { onClose: () => void; onCompl
               {authStatus === "error" && (
                 <div className="auth-status error">
                   <p>❌ {authError}</p>
-                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                  <button className="btn btn-primary" onClick={handleAuthorize}>Try Again</button>
                 </div>
               )}
 
-              <button className="secondary" onClick={() => setStep(5)}>Back</button>
+              <button className="btn btn-secondary" onClick={() => setStep(5)}>Back</button>
             </>
           )}
         </div>
@@ -1750,7 +2412,7 @@ function IMessageSetupModal({ onClose }: { onClose: () => void }) {
             <li>Restart the app</li>
           </ol>
           
-          <button className="primary" onClick={handleTest} disabled={testStatus === "testing"}>
+          <button className="btn btn-primary" onClick={handleTest} disabled={testStatus === "testing"}>
             {testStatus === "testing" ? "Testing..." : "Test iMessage Access"}
           </button>
           
@@ -1894,7 +2556,7 @@ function WhatsAppSetupModal({
               </div>
 
               {status !== "connected" && (
-                <button className="secondary" onClick={() => setStep(1)}>Back</button>
+                <button className="btn btn-secondary" onClick={() => setStep(1)}>Back</button>
               )}
             </>
           )}
@@ -1952,7 +2614,7 @@ function TelegramSetupModal({ onClose, onComplete }: { onClose: () => void; onCo
                 <li>Follow the prompts to name your bot</li>
                 <li>Copy the bot token provided by BotFather</li>
               </ol>
-              <button className="primary" onClick={() => setStep(2)}>Next</button>
+              <button className="btn btn-primary" onClick={() => setStep(2)}>Next</button>
             </>
           )}
 
@@ -1972,7 +2634,7 @@ function TelegramSetupModal({ onClose, onComplete }: { onClose: () => void; onCo
               </div>
 
               {authStatus === "idle" && (
-                <button className="primary" onClick={handleConnect} disabled={!token}>
+                <button className="btn btn-primary" onClick={handleConnect} disabled={!token}>
                   Connect
                 </button>
               )}
@@ -1988,11 +2650,11 @@ function TelegramSetupModal({ onClose, onComplete }: { onClose: () => void; onCo
               {authStatus === "error" && (
                 <>
                   <p className="error-text">✗ {authError}</p>
-                  <button className="primary" onClick={handleConnect}>Try Again</button>
+                  <button className="btn btn-primary" onClick={handleConnect}>Try Again</button>
                 </>
               )}
 
-              <button className="secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="btn btn-secondary" onClick={() => setStep(1)}>Back</button>
             </>
           )}
         </div>
@@ -2049,7 +2711,7 @@ function DiscordSetupModal({ onClose, onComplete }: { onClose: () => void; onCom
                 <li>Click "New Application"</li>
                 <li>Name your application</li>
               </ol>
-              <button className="primary" onClick={() => setStep(2)}>Next</button>
+              <button className="btn btn-primary" onClick={() => setStep(2)}>Next</button>
             </>
           )}
 
@@ -2061,8 +2723,8 @@ function DiscordSetupModal({ onClose, onComplete }: { onClose: () => void; onCom
                 <li>Click "Add Bot"</li>
                 <li>Enable "Message Content Intent" under Privileged Gateway Intents</li>
               </ol>
-              <button className="secondary" onClick={() => setStep(1)}>Back</button>
-              <button className="primary" onClick={() => setStep(3)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(3)}>Next</button>
             </>
           )}
 
@@ -2076,8 +2738,8 @@ function DiscordSetupModal({ onClose, onComplete }: { onClose: () => void; onCom
                 </li>
                 <li>Copy the Client ID and Client Secret</li>
               </ol>
-              <button className="secondary" onClick={() => setStep(2)}>Back</button>
-              <button className="primary" onClick={() => setStep(4)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(2)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(4)}>Next</button>
             </>
           )}
 
@@ -2106,7 +2768,7 @@ function DiscordSetupModal({ onClose, onComplete }: { onClose: () => void; onCom
               </div>
 
               {authStatus === "idle" && (
-                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                <button className="btn btn-primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
                   Authorize with Discord
                 </button>
               )}
@@ -2122,11 +2784,11 @@ function DiscordSetupModal({ onClose, onComplete }: { onClose: () => void; onCom
               {authStatus === "error" && (
                 <>
                   <p className="error-text">✗ {authError}</p>
-                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                  <button className="btn btn-primary" onClick={handleAuthorize}>Try Again</button>
                 </>
               )}
 
-              <button className="secondary" onClick={() => setStep(3)}>Back</button>
+              <button className="btn btn-secondary" onClick={() => setStep(3)}>Back</button>
             </>
           )}
         </div>
@@ -2183,7 +2845,7 @@ function XSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete:
                 <li>Sign up for a developer account</li>
                 <li>Create a new Project and App</li>
               </ol>
-              <button className="primary" onClick={() => setStep(2)}>Next</button>
+              <button className="btn btn-primary" onClick={() => setStep(2)}>Next</button>
             </>
           )}
 
@@ -2198,8 +2860,8 @@ function XSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete:
                   <div className="code-block">http://localhost:18923/oauth/callback</div>
                 </li>
               </ol>
-              <button className="secondary" onClick={() => setStep(1)}>Back</button>
-              <button className="primary" onClick={() => setStep(3)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(3)}>Next</button>
             </>
           )}
 
@@ -2211,8 +2873,8 @@ function XSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete:
                 <li>Copy Client ID (OAuth 2.0)</li>
                 <li>Generate and copy Client Secret</li>
               </ol>
-              <button className="secondary" onClick={() => setStep(2)}>Back</button>
-              <button className="primary" onClick={() => setStep(4)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(2)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(4)}>Next</button>
             </>
           )}
 
@@ -2242,7 +2904,7 @@ function XSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete:
               </div>
 
               {authStatus === "idle" && (
-                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                <button className="btn btn-primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
                   Authorize with X
                 </button>
               )}
@@ -2258,11 +2920,11 @@ function XSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete:
               {authStatus === "error" && (
                 <>
                   <p className="error-text">✗ {authError}</p>
-                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                  <button className="btn btn-primary" onClick={handleAuthorize}>Try Again</button>
                 </>
               )}
 
-              <button className="secondary" onClick={() => setStep(3)}>Back</button>
+              <button className="btn btn-secondary" onClick={() => setStep(3)}>Back</button>
             </>
           )}
         </div>
@@ -2320,7 +2982,7 @@ function NotionSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
                 <li>Name it and select your workspace</li>
                 <li>Set capabilities (Read/Update/Insert content)</li>
               </ol>
-              <button className="primary" onClick={() => setStep(2)}>Next</button>
+              <button className="btn btn-primary" onClick={() => setStep(2)}>Next</button>
             </>
           )}
 
@@ -2335,8 +2997,8 @@ function NotionSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
                 </li>
                 <li>Copy OAuth client ID and secret</li>
               </ol>
-              <button className="secondary" onClick={() => setStep(1)}>Back</button>
-              <button className="primary" onClick={() => setStep(3)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(3)}>Next</button>
             </>
           )}
 
@@ -2366,7 +3028,7 @@ function NotionSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
               </div>
 
               {authStatus === "idle" && (
-                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                <button className="btn btn-primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
                   Authorize with Notion
                 </button>
               )}
@@ -2382,11 +3044,11 @@ function NotionSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
               {authStatus === "error" && (
                 <>
                   <p className="error-text">✗ {authError}</p>
-                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                  <button className="btn btn-primary" onClick={handleAuthorize}>Try Again</button>
                 </>
               )}
 
-              <button className="secondary" onClick={() => setStep(2)}>Back</button>
+              <button className="btn btn-secondary" onClick={() => setStep(2)}>Back</button>
             </>
           )}
         </div>
@@ -2443,7 +3105,7 @@ function GitHubSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
                 <li>Click "New OAuth App"</li>
                 <li>Fill in application name and homepage URL</li>
               </ol>
-              <button className="primary" onClick={() => setStep(2)}>Next</button>
+              <button className="btn btn-primary" onClick={() => setStep(2)}>Next</button>
             </>
           )}
 
@@ -2458,8 +3120,8 @@ function GitHubSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
                 <li>Copy Client ID</li>
                 <li>Generate and copy Client Secret</li>
               </ol>
-              <button className="secondary" onClick={() => setStep(1)}>Back</button>
-              <button className="primary" onClick={() => setStep(3)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(3)}>Next</button>
             </>
           )}
 
@@ -2488,7 +3150,7 @@ function GitHubSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
               </div>
 
               {authStatus === "idle" && (
-                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                <button className="btn btn-primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
                   Authorize with GitHub
                 </button>
               )}
@@ -2504,11 +3166,11 @@ function GitHubSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
               {authStatus === "error" && (
                 <>
                   <p className="error-text">✗ {authError}</p>
-                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                  <button className="btn btn-primary" onClick={handleAuthorize}>Try Again</button>
                 </>
               )}
 
-              <button className="secondary" onClick={() => setStep(2)}>Back</button>
+              <button className="btn btn-secondary" onClick={() => setStep(2)}>Back</button>
             </>
           )}
         </div>
@@ -2565,7 +3227,7 @@ function AsanaSetupModal({ onClose, onComplete }: { onClose: () => void; onCompl
                 <li>Click "Create New App"</li>
                 <li>Name your application</li>
               </ol>
-              <button className="primary" onClick={() => setStep(2)}>Next</button>
+              <button className="btn btn-primary" onClick={() => setStep(2)}>Next</button>
             </>
           )}
 
@@ -2579,8 +3241,8 @@ function AsanaSetupModal({ onClose, onComplete }: { onClose: () => void; onCompl
                 </li>
                 <li>Copy Client ID and Client Secret</li>
               </ol>
-              <button className="secondary" onClick={() => setStep(1)}>Back</button>
-              <button className="primary" onClick={() => setStep(3)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(3)}>Next</button>
             </>
           )}
 
@@ -2609,7 +3271,7 @@ function AsanaSetupModal({ onClose, onComplete }: { onClose: () => void; onCompl
               </div>
 
               {authStatus === "idle" && (
-                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                <button className="btn btn-primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
                   Authorize with Asana
                 </button>
               )}
@@ -2625,11 +3287,11 @@ function AsanaSetupModal({ onClose, onComplete }: { onClose: () => void; onCompl
               {authStatus === "error" && (
                 <>
                   <p className="error-text">✗ {authError}</p>
-                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                  <button className="btn btn-primary" onClick={handleAuthorize}>Try Again</button>
                 </>
               )}
 
-              <button className="secondary" onClick={() => setStep(2)}>Back</button>
+              <button className="btn btn-secondary" onClick={() => setStep(2)}>Back</button>
             </>
           )}
         </div>
@@ -2689,7 +3351,7 @@ function RedditSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
                   <div className="code-block">http://localhost:18923/oauth/callback</div>
                 </li>
               </ol>
-              <button className="primary" onClick={() => setStep(2)}>Next</button>
+              <button className="btn btn-primary" onClick={() => setStep(2)}>Next</button>
             </>
           )}
 
@@ -2700,8 +3362,8 @@ function RedditSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
                 <li>Copy the Client ID (shown under the app name)</li>
                 <li>Copy the Client Secret</li>
               </ol>
-              <button className="secondary" onClick={() => setStep(1)}>Back</button>
-              <button className="primary" onClick={() => setStep(3)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(3)}>Next</button>
             </>
           )}
 
@@ -2730,7 +3392,7 @@ function RedditSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
               </div>
 
               {authStatus === "idle" && (
-                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                <button className="btn btn-primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
                   Authorize with Reddit
                 </button>
               )}
@@ -2746,11 +3408,11 @@ function RedditSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
               {authStatus === "error" && (
                 <>
                   <p className="error-text">✗ {authError}</p>
-                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                  <button className="btn btn-primary" onClick={handleAuthorize}>Try Again</button>
                 </>
               )}
 
-              <button className="secondary" onClick={() => setStep(2)}>Back</button>
+              <button className="btn btn-secondary" onClick={() => setStep(2)}>Back</button>
             </>
           )}
         </div>
@@ -2807,7 +3469,7 @@ function SpotifySetupModal({ onClose, onComplete }: { onClose: () => void; onCom
                 <li>Click "Create app"</li>
                 <li>Name your app and add a description</li>
               </ol>
-              <button className="primary" onClick={() => setStep(2)}>Next</button>
+              <button className="btn btn-primary" onClick={() => setStep(2)}>Next</button>
             </>
           )}
 
@@ -2821,8 +3483,8 @@ function SpotifySetupModal({ onClose, onComplete }: { onClose: () => void; onCom
                 </li>
                 <li>Copy Client ID and Client Secret</li>
               </ol>
-              <button className="secondary" onClick={() => setStep(1)}>Back</button>
-              <button className="primary" onClick={() => setStep(3)}>Next</button>
+              <button className="btn btn-secondary" onClick={() => setStep(1)}>Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(3)}>Next</button>
             </>
           )}
 
@@ -2852,7 +3514,7 @@ function SpotifySetupModal({ onClose, onComplete }: { onClose: () => void; onCom
               </div>
 
               {authStatus === "idle" && (
-                <button className="primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
+                <button className="btn btn-primary" onClick={handleAuthorize} disabled={!clientId || !clientSecret}>
                   Authorize with Spotify
                 </button>
               )}
@@ -2868,11 +3530,11 @@ function SpotifySetupModal({ onClose, onComplete }: { onClose: () => void; onCom
               {authStatus === "error" && (
                 <>
                   <p className="error-text">✗ {authError}</p>
-                  <button className="primary" onClick={handleAuthorize}>Try Again</button>
+                  <button className="btn btn-primary" onClick={handleAuthorize}>Try Again</button>
                 </>
               )}
 
-              <button className="secondary" onClick={() => setStep(2)}>Back</button>
+              <button className="btn btn-secondary" onClick={() => setStep(2)}>Back</button>
             </>
           )}
         </div>
@@ -2991,8 +3653,8 @@ function TaskEditModal({ taskId, onClose }: { taskId: string; onClose: () => voi
           {error && <div className="error-message">{error}</div>}
           
           <div className="modal-actions">
-            <button className="secondary" onClick={onClose}>Cancel</button>
-            <button className="primary" onClick={handleSave} disabled={saving || loading}>
+            <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+            <button className="btn btn-primary" onClick={handleSave} disabled={saving || loading}>
               {saving ? "Saving..." : "Save Changes"}
             </button>
           </div>
@@ -3238,26 +3900,33 @@ function TasksPage() {
   };
 
   return (
-    <div className="tasks-page">
-      <h1>Tasks</h1>
-      <p className="page-description">
-        Autonomous background tasks that run on your behalf. Tasks can monitor for events, 
-        send follow-up messages, and more.
-      </p>
-
-      {loading ? (
-        <div className="loading-state">Loading tasks...</div>
-      ) : tasks.length === 0 ? (
-        <div className="empty-state">
-          <div className="empty-icon">📋</div>
-          <h3>No tasks yet</h3>
-          <p>
-            Create tasks by asking in the chat! For example:
-            <br />
-            <em>"Email Jeff to schedule lunch and follow up until confirmed"</em>
+    <div className="main-content">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">Tasks</h1>
+          <p className="page-subtitle">
+            Autonomous background tasks that run on your behalf
           </p>
         </div>
-      ) : (
+      </div>
+
+      <div className="page-content">
+        {loading ? (
+          <div className="empty-state">
+            <div className="loading-spinner"></div>
+            <p>Loading tasks...</p>
+          </div>
+        ) : tasks.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-state-icon">📋</div>
+            <h4>No tasks yet</h4>
+            <p>
+              Create tasks by asking in the chat! For example:
+              <br />
+              <em>"Email Jeff to schedule lunch and follow up until confirmed"</em>
+            </p>
+          </div>
+        ) : (
         <div className="tasks-list">
           {tasks.map(task => (
             <div key={task.id} className={`task-card ${expandedTask === task.id ? "expanded" : ""} ${(task.pendingMessages?.length || 0) > 0 ? "has-pending" : ""}`}>
@@ -3335,11 +4004,11 @@ function TasksPage() {
                             <div className="pending-message-actions">
                               {editingMessage?.messageId === msg.id ? (
                                 <>
-                                  <button className="secondary small" onClick={() => setEditingMessage(null)}>
+                                  <button className="btn btn-secondary" onClick={() => setEditingMessage(null)}>
                                     Cancel Edit
                                   </button>
                                   <button
-                                    className="primary small"
+                                    className="btn btn-primary"
                                     onClick={() => handleApproveMessage(task.id, msg.id)}
                                     disabled={sendingMessage === msg.id}
                                   >
@@ -3349,16 +4018,16 @@ function TasksPage() {
                               ) : (
                                 <>
                                   <button
-                                    className="secondary small"
+                                    className="btn btn-secondary"
                                     onClick={() => setEditingMessage({ taskId: task.id, messageId: msg.id, content: msg.message })}
                                   >
                                     Edit
                                   </button>
-                                  <button className="danger small" onClick={() => handleRejectMessage(task.id, msg.id)}>
+                                  <button className="btn btn-danger" onClick={() => handleRejectMessage(task.id, msg.id)}>
                                     Discard
                                   </button>
                                   <button
-                                    className="primary small"
+                                    className="btn btn-primary"
                                     onClick={() => handleApproveMessage(task.id, msg.id)}
                                     disabled={sendingMessage === msg.id}
                                   >
@@ -3526,15 +4195,15 @@ function TasksPage() {
 
                         {/* Action Buttons */}
                         <div className="settings-actions">
-                          <button className="secondary small" onClick={() => setEditingTask(task.id)}>
+                          <button className="btn btn-secondary" onClick={() => setEditingTask(task.id)}>
                             Edit Task File
                           </button>
                           {(task.status === "pending" || task.status === "active" || task.status === "waiting") && (
-                            <button className="danger small" onClick={() => handleCancel(task.id)}>
+                            <button className="btn btn-danger" onClick={() => handleCancel(task.id)}>
                               Cancel Task
                             </button>
                           )}
-                          <button className="secondary small" onClick={() => handleHide(task.id)}>
+                          <button className="btn btn-secondary" onClick={() => handleHide(task.id)}>
                             Remove
                           </button>
                         </div>
@@ -3548,15 +4217,16 @@ function TasksPage() {
         </div>
       )}
 
-      {editingTask && (
-        <TaskEditModal
-          taskId={editingTask}
-          onClose={() => {
-            setEditingTask(null);
-            loadTasks();
-          }}
-        />
-      )}
+        {editingTask && (
+          <TaskEditModal
+            taskId={editingTask}
+            onClose={() => {
+              setEditingTask(null);
+              loadTasks();
+            }}
+          />
+        )}
+      </div>
     </div>
   );
 }
@@ -3669,40 +4339,58 @@ function SkillsPage() {
   // Editing/Creating modal
   if (editingSkill || isCreating) {
     return (
-      <div className="skills-page">
-        <div className="skills-editor">
-          <div className="editor-header">
-            <h2>{isCreating ? "Create New Skill" : `Edit: ${editingSkill}`}</h2>
-            <div className="editor-actions">
-              <button className="btn-secondary" onClick={handleCancel}>Cancel</button>
-              <button className="btn-primary" onClick={isCreating ? handleCreateSave : handleSave}>Save</button>
-            </div>
+      <div className="main-content">
+        <div className="page-header">
+          <div>
+            <h1 className="page-title">{isCreating ? "Create New Skill" : "Edit Skill"}</h1>
+            <p className="page-subtitle">
+              {isCreating ? "Define a new skill for the AI to use" : `Editing: ${editingSkill}`}
+            </p>
           </div>
-          
+          <div className="page-actions">
+            <button className="btn btn-secondary" onClick={handleCancel}>Cancel</button>
+            <button className="btn btn-primary" onClick={isCreating ? handleCreateSave : handleSave}>
+              {isCreating ? "Create Skill" : "Save Changes"}
+            </button>
+          </div>
+        </div>
+
+        <div className="page-content">
           {isCreating && (
-            <div className="skill-id-input">
-              <label>Skill ID (filename):</label>
+            <div className="skill-id-input-container">
+              <label className="input-label">Skill ID (filename)</label>
               <input
                 type="text"
+                className="input-field"
                 value={newSkillId}
                 onChange={(e) => setNewSkillId(e.target.value)}
                 placeholder="e.g., scheduling, email-drafting, research"
+                autoFocus
               />
+              <p className="input-hint">Use lowercase letters, numbers, and hyphens only</p>
             </div>
           )}
-          
-          <div className="editor-main">
-            <textarea
-              className="skill-editor-textarea"
-              value={editContent}
-              onChange={(e) => setEditContent(e.target.value)}
-              placeholder="Enter skill markdown..."
-            />
-            
-            <div className="editor-sidebar">
-              <div className="editor-help">
-                <h4>Skill Format:</h4>
-                <pre>{`# Skill Name
+
+          <div className="skill-editor-layout">
+            <div className="skill-editor-main">
+              <div className="editor-label-row">
+                <label className="input-label">Skill Content (Markdown)</label>
+                <span className="editor-hint">{editContent.length} characters</span>
+              </div>
+              <textarea
+                className="skill-editor-textarea"
+                value={editContent}
+                onChange={(e) => setEditContent(e.target.value)}
+                placeholder="Enter skill markdown..."
+                spellCheck={false}
+              />
+            </div>
+
+            <div className="skill-editor-sidebar">
+              <div className="editor-help-card">
+                <h3 className="help-card-title">Skill Format</h3>
+                <div className="help-card-content">
+                  <pre className="help-code">{`# Skill Name
 
 ## Description
 What this skill does.
@@ -3716,11 +4404,12 @@ keyword1, keyword2
 
 ## Constraints
 - Important rule`}</pre>
+                </div>
               </div>
-              
-              <div className="editor-info">
-                <p><strong>How Skills Work:</strong></p>
-                <ul>
+
+              <div className="editor-info-card">
+                <h3 className="info-card-title">How Skills Work</h3>
+                <ul className="info-list">
                   <li>Skills provide domain expertise to the Architect</li>
                   <li>Constraints are enforced by the Builder</li>
                   <li>Tools are auto-selected - no need to specify</li>
@@ -3734,76 +4423,82 @@ keyword1, keyword2
   }
 
   return (
-    <div className="skills-page">
-      <div className="skills-header">
+    <div className="main-content">
+      <div className="page-header">
         <div>
-          <h1>Skills Library</h1>
-          <p className="page-description">
-            Skills provide domain knowledge and constraints. The Architect uses procedures as guidance, 
-            while the Builder enforces constraints during tool selection.
+          <h1 className="page-title">Skills Library</h1>
+          <p className="page-subtitle">
+            Domain knowledge and procedures for the AI
           </p>
         </div>
-        <button className="btn-primary" onClick={handleCreate}>+ New Skill</button>
+        <div className="page-actions">
+          <button className="btn btn-primary" onClick={handleCreate}>+ New Skill</button>
+        </div>
       </div>
 
-      {loading ? (
-        <div className="loading-state">Loading skills...</div>
-      ) : skills.length === 0 ? (
-        <div className="empty-state">
-          <div className="empty-icon">📚</div>
-          <h3>No skills yet</h3>
-          <p>
-            Create skills to teach the AI specific procedures. Skills are markdown files that define
-            step-by-step processes for tasks like scheduling, email drafting, research, and more.
-          </p>
-          <button className="btn-primary" onClick={handleCreate}>Create Your First Skill</button>
-        </div>
-      ) : (
-        <div className="skills-list">
-          {skills.map(skill => (
-            <div key={skill.id} className="skill-card">
-              <div className="skill-card-header">
-                <h3>{skill.name}</h3>
-                <div className="skill-actions">
-                  <button className="btn-secondary btn-small" onClick={() => handleEdit(skill.id)}>Edit</button>
-                  <button className="btn-danger btn-small" onClick={() => handleDelete(skill.id)}>Delete</button>
+      <div className="page-content">
+        {loading ? (
+          <div className="empty-state">
+            <div className="loading-spinner"></div>
+            <p>Loading skills...</p>
+          </div>
+        ) : skills.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-state-icon">📚</div>
+            <h4>No skills yet</h4>
+            <p>
+              Create skills to teach the AI specific procedures. Skills are markdown files that define
+              step-by-step processes for tasks like scheduling, email drafting, research, and more.
+            </p>
+            <button className="btn btn-primary" onClick={handleCreate}>Create Your First Skill</button>
+          </div>
+        ) : (
+          <div className="skills-grid">
+            {skills.map(skill => (
+              <div key={skill.id} className="skill-card" onClick={() => handleEdit(skill.id)}>
+                <div className="skill-card-header">
+                  <div className="skill-card-title">
+                    <h3 className="skill-name">{skill.name}</h3>
+                    {skill.keywords.length > 0 && (
+                      <div className="skill-keywords-inline">
+                        {skill.keywords.slice(0, 2).map((kw, i) => (
+                          <span key={i} className="keyword-tag-small">{kw}</span>
+                        ))}
+                        {skill.keywords.length > 2 && (
+                          <span className="keyword-tag-small keyword-more">+{skill.keywords.length - 2}</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <div className="skill-actions" onClick={(e) => e.stopPropagation()}>
+                    <button className="btn-icon" onClick={() => handleEdit(skill.id)} title="Edit">
+                      ✎
+                    </button>
+                    <button className="btn-icon btn-danger" onClick={() => handleDelete(skill.id)} title="Delete">
+                      ×
+                    </button>
+                  </div>
+                </div>
+
+                <p className="skill-description">{skill.description}</p>
+
+                <div className="skill-meta">
+                  <div className="skill-meta-item">
+                    <span className="skill-meta-label">Steps:</span>
+                    <span className="skill-meta-value">{skill.procedure.length}</span>
+                  </div>
+                  {skill.constraints.length > 0 && (
+                    <div className="skill-meta-item">
+                      <span className="skill-meta-label">Constraints:</span>
+                      <span className="skill-meta-value">{skill.constraints.length}</span>
+                    </div>
+                  )}
                 </div>
               </div>
-              <p className="skill-description">{skill.description}</p>
-              
-              {skill.keywords.length > 0 && (
-                <div className="skill-keywords">
-                  {skill.keywords.map((kw, i) => (
-                    <span key={i} className="keyword-tag">{kw}</span>
-                  ))}
-                </div>
-              )}
-              
-              <div className="skill-procedure">
-                <h4>Procedure ({skill.procedure.length} steps)</h4>
-                <ol>
-                  {skill.procedure.slice(0, 3).map((step, i) => (
-                    <li key={i}>{step}</li>
-                  ))}
-                  {skill.procedure.length > 3 && <li className="more">...and {skill.procedure.length - 3} more steps</li>}
-                </ol>
-              </div>
-              
-              {skill.constraints.length > 0 && (
-                <div className="skill-constraints">
-                  <h4>Constraints</h4>
-                  <ul>
-                    {skill.constraints.slice(0, 2).map((c, i) => (
-                      <li key={i}>{c}</li>
-                    ))}
-                    {skill.constraints.length > 2 && <li className="more">...and {skill.constraints.length - 2} more</li>}
-                  </ul>
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
       )}
+      </div>
     </div>
   );
 }
@@ -3907,141 +4602,149 @@ function InterfacesPage() {
   };
 
   return (
-    <div className="interfaces-page">
-      <h1>Chat Interfaces</h1>
-      <p className="page-description">Connect messaging apps to chat with Wovly from your phone or other devices.</p>
-      
-      {/* WhatsApp */}
-      <div className="interface-row">
-        <div className="interface-icon whatsapp">
-          <WhatsAppIcon size={32} />
-        </div>
-        <div className="interface-info">
-          <h3>WhatsApp</h3>
-          <p>Chat with Wovly via WhatsApp on your phone</p>
-          {whatsappConnected && (
-            <span className="interface-detail">Messages will be answered by your configured AI</span>
-          )}
-        </div>
-        <div className="interface-status">
-          {whatsappConnected ? (
-            <>
-              <span className="status connected">Connected</span>
-              <button 
-                className="danger small" 
-                onClick={handleDisconnect}
-                disabled={disconnecting}
-              >
-                {disconnecting ? "..." : "Disconnect"}
-              </button>
-            </>
-          ) : whatsappStatus === "connecting" || whatsappStatus === "qr_ready" ? (
-            <>
-              <span className="status connecting">Connecting...</span>
-              <button className="secondary small" onClick={() => setShowWhatsAppSetup(true)}>
-                View QR
-              </button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Not connected</span>
-              <button className="primary small" onClick={() => setShowWhatsAppSetup(true)}>
-                Setup
-              </button>
-            </>
-          )}
+    <div className="main-content">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">Chat Interfaces</h1>
+          <p className="page-subtitle">Connect messaging apps to chat with Wovly</p>
         </div>
       </div>
 
-      {/* Telegram */}
-      <div className="interface-row">
-        <div className="interface-icon telegram">
-          <TelegramIcon size={32} />
-        </div>
-        <div className="interface-info">
-          <h3>Telegram</h3>
-          <p>Chat with Wovly via your Telegram bot</p>
-          {!telegramHasBot && (
-            <span className="interface-detail warning">Set up a Telegram bot in Integrations first</span>
-          )}
-          {telegramInterfaceConnected && (
-            <span className="interface-detail">Messages to your bot will be answered by Wovly</span>
-          )}
-          {telegramError && (
-            <span className="interface-detail error">{telegramError}</span>
-          )}
-        </div>
-        <div className="interface-status">
-          {telegramInterfaceConnected ? (
-            <>
-              <span className="status connected">Connected</span>
-              <button 
-                className="danger small" 
-                onClick={handleTelegramDisconnect}
-                disabled={telegramDisconnecting}
-              >
-                {telegramDisconnecting ? "..." : "Disconnect"}
-              </button>
-            </>
-          ) : telegramConnecting || telegramInterfaceStatus === "connecting" ? (
-            <>
-              <span className="status connecting">Connecting...</span>
-            </>
-          ) : telegramHasBot ? (
-            <>
-              <span className="status disconnected">Not listening</span>
-              <button className="primary small" onClick={handleTelegramConnect}>
-                Start Listening
-              </button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">No bot configured</span>
-              <button className="secondary small" disabled>
-                Setup bot first
-              </button>
-            </>
-          )}
-        </div>
-      </div>
+      <div className="page-content">
+        <div className="integrations-grid">
+          {/* WhatsApp */}
+          <div className={`integration-card ${whatsappConnected ? "connected" : ""}`}>
+            <div className="integration-header">
+              <WhatsAppIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">WhatsApp</h3>
+              <span className={`connection-status ${whatsappConnected ? "connected" : whatsappStatus === "connecting" || whatsappStatus === "qr_ready" ? "connecting" : "disconnected"}`}>
+                {whatsappConnected ? "Connected" : whatsappStatus === "connecting" || whatsappStatus === "qr_ready" ? "Connecting..." : "Not connected"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Chat with Wovly via WhatsApp on your phone
+              {whatsappConnected && (
+                <span style={{ display: 'block', fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-1)' }}>
+                  Messages will be answered by your configured AI
+                </span>
+              )}
+            </p>
+            <div className="integration-actions">
+              {whatsappConnected ? (
+                <button
+                  className="btn btn-danger"
+                  onClick={handleDisconnect}
+                  disabled={disconnecting}
+                >
+                  {disconnecting ? "Disconnecting..." : "Disconnect"}
+                </button>
+              ) : whatsappStatus === "connecting" || whatsappStatus === "qr_ready" ? (
+                <button className="btn btn-secondary" onClick={() => setShowWhatsAppSetup(true)}>
+                  View QR
+                </button>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setShowWhatsAppSetup(true)}>
+                  Setup
+                </button>
+              )}
+            </div>
+          </div>
 
-      {/* Discord - Coming Soon */}
-      <div className="interface-row disabled">
-        <div className="interface-icon discord">
-          <DiscordIcon size={32} />
-        </div>
-        <div className="interface-info">
-          <h3>Discord</h3>
-          <p>Chat with Wovly on Discord</p>
-        </div>
-        <div className="interface-status">
-          <span className="status coming-soon">Coming soon</span>
-        </div>
-      </div>
+          {/* Telegram */}
+          <div className={`integration-card ${telegramInterfaceConnected ? "connected" : ""}`}>
+            <div className="integration-header">
+              <TelegramIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Telegram</h3>
+              <span className={`connection-status ${telegramInterfaceConnected ? "connected" : telegramConnecting || telegramInterfaceStatus === "connecting" ? "connecting" : "disconnected"}`}>
+                {telegramInterfaceConnected ? "Connected" : telegramConnecting || telegramInterfaceStatus === "connecting" ? "Connecting..." : telegramHasBot ? "Not listening" : "No bot configured"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Chat with Wovly via your Telegram bot
+              {!telegramHasBot && (
+                <span style={{ display: 'block', fontSize: 'var(--text-xs)', color: 'var(--color-warning)', marginTop: 'var(--space-1)' }}>
+                  Set up a Telegram bot in Integrations first
+                </span>
+              )}
+              {telegramInterfaceConnected && (
+                <span style={{ display: 'block', fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-1)' }}>
+                  Messages to your bot will be answered by Wovly
+                </span>
+              )}
+            </p>
+            <div className="integration-actions">
+              {telegramInterfaceConnected ? (
+                <button
+                  className="btn btn-danger"
+                  onClick={handleTelegramDisconnect}
+                  disabled={telegramDisconnecting}
+                >
+                  {telegramDisconnecting ? "Disconnecting..." : "Disconnect"}
+                </button>
+              ) : telegramConnecting || telegramInterfaceStatus === "connecting" ? (
+                <button className="btn btn-secondary" disabled>Connecting...</button>
+              ) : telegramHasBot ? (
+                <button className="btn btn-primary" onClick={handleTelegramConnect}>
+                  Start Listening
+                </button>
+              ) : (
+                <button className="btn btn-secondary" disabled>
+                  Setup bot first
+                </button>
+              )}
+            </div>
+            {telegramError && (
+              <div className="badge badge-error" style={{ marginTop: 'var(--space-3)' }}>
+                {telegramError}
+              </div>
+            )}
+          </div>
 
-      {/* Slack - Coming Soon */}
-      <div className="interface-row disabled">
-        <div className="interface-icon slack">
-          <SlackIcon size={32} />
-        </div>
-        <div className="interface-info">
-          <h3>Slack</h3>
-          <p>Chat with Wovly in your Slack workspace</p>
-        </div>
-        <div className="interface-status">
-          <span className="status coming-soon">Coming soon</span>
-        </div>
-      </div>
+          {/* Discord - Coming Soon */}
+          <div className="integration-card" style={{ opacity: 0.6 }}>
+            <div className="integration-header">
+              <DiscordIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Discord</h3>
+              <span className="connection-status" style={{ color: 'var(--text-tertiary)' }}>
+                Coming soon
+              </span>
+            </div>
+            <p className="integration-description">
+              Chat with Wovly on Discord
+            </p>
+            <div className="integration-actions">
+              <button className="btn btn-secondary" disabled>Coming soon</button>
+            </div>
+          </div>
 
-      {showWhatsAppSetup && (
-        <WhatsAppSetupModal
-          onClose={() => setShowWhatsAppSetup(false)}
-          onConnect={() => {
-            setWhatsappConnected(true);
-            setShowWhatsAppSetup(false);
-          }}
-        />
-      )}
+          {/* Slack - Coming Soon */}
+          <div className="integration-card" style={{ opacity: 0.6 }}>
+            <div className="integration-header">
+              <SlackIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Slack</h3>
+              <span className="connection-status" style={{ color: 'var(--text-tertiary)' }}>
+                Coming soon
+              </span>
+            </div>
+            <p className="integration-description">
+              Chat with Wovly in your Slack workspace
+            </p>
+            <div className="integration-actions">
+              <button className="btn btn-secondary" disabled>Coming soon</button>
+            </div>
+          </div>
+        </div>
+
+        {showWhatsAppSetup && (
+          <WhatsAppSetupModal
+            onClose={() => setShowWhatsAppSetup(false)}
+            onConnect={() => {
+              setWhatsappConnected(true);
+              setShowWhatsAppSetup(false);
+            }}
+          />
+        )}
+      </div>
     </div>
   );
 }
@@ -4115,6 +4818,30 @@ function IntegrationsPage() {
   const [testingSpotify, setTestingSpotify] = useState(false);
   const [spotifyTestResult, setSpotifyTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
 
+  // Custom Web Integrations state
+  const [customWebIntegrations, setCustomWebIntegrations] = useState<any[]>([]);
+  const [showAddWebIntegration, setShowAddWebIntegration] = useState(false);
+  const [showManageIntegrations, setShowManageIntegrations] = useState(false);
+
+  // Load custom web integrations
+  const loadCustomIntegrations = async () => {
+    try {
+      if ((window as any).wovly?.webscraper) {
+        const result = await (window as any).wovly.webscraper.listIntegrations();
+        if (result.success) {
+          setCustomWebIntegrations(result.integrations || []);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to load custom integrations:', err);
+    }
+  };
+
+  // Load custom integrations on mount
+  useEffect(() => {
+    loadCustomIntegrations();
+  }, []);
+
   useEffect(() => {
     const checkConnections = async () => {
       if (!window.wovly) return;
@@ -4164,6 +4891,12 @@ function IntegrationsPage() {
 
       const spotifyResult = await window.wovly.spotify?.checkAuth();
       if (spotifyResult?.authorized) setSpotifyConnected(true);
+
+      // Load custom web integrations
+      const webIntegrationsResult = await window.wovly.webscraper?.listIntegrations();
+      if (webIntegrationsResult?.ok) {
+        setCustomWebIntegrations(webIntegrationsResult.integrations || []);
+      }
     };
     checkConnections();
   }, []);
@@ -4359,522 +5092,666 @@ function IntegrationsPage() {
   };
 
   return (
-    <div className="integrations-page">
-      <h1>Integrations</h1>
-      
-      <div className="integration-row">
-        <div className="integration-icon">
-          <GoogleIcon size={32} />
+    <div className="main-content">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">Integrations</h1>
+          <p className="page-subtitle">Connect your tools and services</p>
         </div>
-        <div className="integration-info">
-          <h3>Google Workspace</h3>
-          <p>Calendar, Gmail, Drive</p>
-        </div>
-        <div className="integration-status">
-          {googleConnected ? (
-            <>
-              <span className="status connected">Connected</span>
-              <button className="secondary small" onClick={handleTestGoogle} disabled={testingGoogle}>
-                {testingGoogle ? "Testing..." : "Test"}
-              </button>
-              <button className="secondary small" onClick={() => setShowGoogleSetup(true)}>Re-auth</button>
-              <button className="danger small" onClick={handleDisconnectGoogle}>Disconnect</button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Not connected</span>
-              <button className="primary small" onClick={() => setShowGoogleSetup(true)}>Setup</button>
-            </>
-          )}
-        </div>
-        {googleTestResult && (
-          <div className={`test-result ${googleTestResult.ok ? "success" : "error"}`}>
-            {googleTestResult.ok ? `✓ ${googleTestResult.message}` : `✗ ${googleTestResult.message}`}
+      </div>
+
+      <div className="page-content">
+        <div className="integrations-grid">
+          <div className={`integration-card ${googleConnected ? "connected" : ""}`}>
+            <div className="integration-header">
+              <GoogleIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Google</h3>
+              <span className={`connection-status ${googleConnected ? "connected" : "disconnected"}`}>
+                {googleConnected ? "Connected" : "Not connected"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Calendar, Gmail, Drive
+            </p>
+            <div className="integration-actions">
+              {googleConnected ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestGoogle} disabled={testingGoogle}>
+                    {testingGoogle ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-secondary" onClick={() => setShowGoogleSetup(true)}>Re-auth</button>
+                  <button className="btn btn-danger" onClick={handleDisconnectGoogle}>Disconnect</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setShowGoogleSetup(true)}>Setup</button>
+              )}
+            </div>
+            {googleTestResult && (
+              <div className={`badge ${googleTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {googleTestResult.ok ? `✓ ${googleTestResult.message}` : `✗ ${googleTestResult.message}`}
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      <div className="integration-row">
-        <div className="integration-icon">
-          <IMessageIcon size={32} />
-        </div>
-        <div className="integration-info">
-          <h3>iMessage</h3>
-          <p>Read and send text messages</p>
-        </div>
-        <div className="integration-status">
-          <span className="status disconnected">Requires setup</span>
-          <button className="primary small" onClick={() => setShowIMessageSetup(true)}>Setup</button>
-        </div>
-      </div>
-
-      {/* Weather - Open-Meteo (No API key required) */}
-      <div className="integration-row">
-        <div className="integration-icon">
-          <WeatherIcon size={32} />
-        </div>
-        <div className="integration-info">
-          <h3>Weather</h3>
-          <p>Forecasts, current conditions, alerts (powered by Open-Meteo)</p>
-          <span className="integration-detail no-key">No API key required</span>
-        </div>
-        <div className="integration-status">
-          {weatherEnabled ? (
-            <>
-              <span className="status connected">Enabled</span>
-              <button className="secondary small" onClick={handleTestWeather} disabled={testingWeather}>
-                {testingWeather ? "Testing..." : "Test"}
-              </button>
-              <button className="secondary small" onClick={handleToggleWeather}>Disable</button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Disabled</span>
-              <button className="primary small" onClick={handleToggleWeather}>Enable</button>
-            </>
-          )}
-        </div>
-        {weatherTestResult && (
-          <div className={`test-result ${weatherTestResult.ok ? "success" : "error"}`}>
-            {weatherTestResult.ok ? `✓ ${weatherTestResult.message}` : `✗ ${weatherTestResult.message}`}
+          {/* Weather */}
+          <div className={`integration-card ${weatherEnabled ? "connected" : ""}`}>
+            <div className="integration-header">
+              <WeatherIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Weather</h3>
+              <span className={`connection-status ${weatherEnabled ? "connected" : "disconnected"}`}>
+                {weatherEnabled ? "Enabled" : "Disabled"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Forecasts, current conditions, alerts
+              <span style={{ display: 'block', fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-1)' }}>
+                No API key required (Open-Meteo)
+              </span>
+            </p>
+            <div className="integration-actions">
+              {weatherEnabled ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestWeather} disabled={testingWeather}>
+                    {testingWeather ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-secondary" onClick={handleToggleWeather}>Disable</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={handleToggleWeather}>Enable</button>
+              )}
+            </div>
+            {weatherTestResult && (
+              <div className={`badge ${weatherTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {weatherTestResult.ok ? `✓ ${weatherTestResult.message}` : `✗ ${weatherTestResult.message}`}
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      <div className="integration-row">
-        <div className="integration-icon">
-          <SlackIcon size={32} />
-        </div>
-        <div className="integration-info">
-          <h3>Slack</h3>
-          <p>Team messaging {slackTeam && <span style={{ color: "#666" }}>• {slackTeam}</span>}</p>
-        </div>
-        <div className="integration-status">
-          {slackConnected ? (
-            <>
-              <span className="status connected">Connected</span>
-              <button className="secondary small" onClick={handleTestSlack} disabled={testingSlack}>
-                {testingSlack ? "Testing..." : "Test"}
-              </button>
-              <button className="secondary small" onClick={() => setShowSlackSetup(true)}>Re-auth</button>
-              <button className="danger small" onClick={handleDisconnectSlack}>Disconnect</button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Not connected</span>
-              <button className="primary small" onClick={() => setShowSlackSetup(true)}>Setup</button>
-            </>
-          )}
-        </div>
-        {slackTestResult && (
-          <div className={`test-result ${slackTestResult.ok ? "success" : "error"}`}>
-            {slackTestResult.ok ? `✓ ${slackTestResult.message}` : `✗ ${slackTestResult.message}`}
+          {/* Slack */}
+          <div className={`integration-card ${slackConnected ? "connected" : ""}`}>
+            <div className="integration-header">
+              <SlackIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Slack</h3>
+              <span className={`connection-status ${slackConnected ? "connected" : "disconnected"}`}>
+                {slackConnected ? "Connected" : "Not connected"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Team messaging and collaboration
+              {slackTeam && <span style={{ display: 'block', fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-1)' }}>
+                {slackTeam}
+              </span>}
+            </p>
+            <div className="integration-actions">
+              {slackConnected ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestSlack} disabled={testingSlack}>
+                    {testingSlack ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-secondary" onClick={() => setShowSlackSetup(true)}>Re-auth</button>
+                  <button className="btn btn-danger" onClick={handleDisconnectSlack}>Disconnect</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setShowSlackSetup(true)}>Setup</button>
+              )}
+            </div>
+            {slackTestResult && (
+              <div className={`badge ${slackTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {slackTestResult.ok ? `✓ ${slackTestResult.message}` : `✗ ${slackTestResult.message}`}
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* Browser Automation */}
-      <div className="integration-row">
-        <div className="integration-icon">
-          <PlaywrightIcon size={32} />
-        </div>
-        <div className="integration-info">
-          <h3>Browser Automation</h3>
-          <p>Web navigation, clicking, typing, screenshots for researching online.</p>
-          <span className="integration-detail no-key">No API key required</span>
-        </div>
-        <div className="integration-status">
-          {browserEnabled ? (
-            <>
-              <span className="status connected">Enabled</span>
-              <button 
-                className="secondary small" 
-                onClick={handleTestBrowser} 
-                disabled={testingBrowser}
-              >
-                {testingBrowser ? "Testing..." : "Test"}
-              </button>
-              <button className="secondary small" onClick={handleToggleBrowser}>Disable</button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Disabled</span>
-              <button className="primary small" onClick={handleToggleBrowser}>Enable</button>
-            </>
-          )}
-        </div>
-        {browserTestResult && (
-          <div className={`test-result ${browserTestResult.ok ? "success" : "error"}`}>
-            {browserTestResult.ok ? `✓ ${browserTestResult.message}` : `✗ ${browserTestResult.message}`}
+          {/* Browser Automation */}
+          <div className={`integration-card ${browserEnabled ? "connected" : ""}`}>
+            <div className="integration-header">
+              <PlaywrightIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Browser Automation</h3>
+              <span className={`connection-status ${browserEnabled ? "connected" : "disconnected"}`}>
+                {browserEnabled ? "Enabled" : "Disabled"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Web navigation, clicking, typing, screenshots for researching online
+              <span style={{ display: 'block', fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-1)' }}>
+                No API key required
+              </span>
+            </p>
+            <div className="integration-actions">
+              {browserEnabled ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestBrowser} disabled={testingBrowser}>
+                    {testingBrowser ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-secondary" onClick={handleToggleBrowser}>Disable</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={handleToggleBrowser}>Enable</button>
+              )}
+            </div>
+            {browserTestResult && (
+              <div className={`badge ${browserTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {browserTestResult.ok ? `✓ ${browserTestResult.message}` : `✗ ${browserTestResult.message}`}
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* Telegram */}
-      <div className="integration-row">
-        <div className="integration-icon">
-          <TelegramIcon size={32} />
-        </div>
-        <div className="integration-info">
-          <h3>Telegram</h3>
-          <p>Send and receive messages via Telegram bot</p>
-        </div>
-        <div className="integration-status">
-          {telegramConnected ? (
-            <>
-              <span className="status connected">Connected</span>
-              <button className="secondary small" onClick={handleTestTelegram} disabled={testingTelegram}>
-                {testingTelegram ? "Testing..." : "Test"}
-              </button>
-              <button className="danger small" onClick={handleDisconnectTelegram}>Disconnect</button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Not connected</span>
-              <button className="primary small" onClick={() => setShowTelegramSetup(true)}>Setup</button>
-            </>
-          )}
-        </div>
-        {telegramTestResult && (
-          <div className={`test-result ${telegramTestResult.ok ? "success" : "error"}`}>
-            {telegramTestResult.ok ? `✓ ${telegramTestResult.message}` : `✗ ${telegramTestResult.message}`}
+          {/* Telegram */}
+          <div className={`integration-card ${telegramConnected ? "connected" : ""}`}>
+            <div className="integration-header">
+              <TelegramIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Telegram</h3>
+              <span className={`connection-status ${telegramConnected ? "connected" : "disconnected"}`}>
+                {telegramConnected ? "Connected" : "Not connected"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Send and receive messages via Telegram bot
+            </p>
+            <div className="integration-actions">
+              {telegramConnected ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestTelegram} disabled={testingTelegram}>
+                    {testingTelegram ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-danger" onClick={handleDisconnectTelegram}>Disconnect</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setShowTelegramSetup(true)}>Setup</button>
+              )}
+            </div>
+            {telegramTestResult && (
+              <div className={`badge ${telegramTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {telegramTestResult.ok ? `✓ ${telegramTestResult.message}` : `✗ ${telegramTestResult.message}`}
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* Discord */}
-      <div className="integration-row">
-        <div className="integration-icon">
-          <DiscordIcon size={32} />
-        </div>
-        <div className="integration-info">
-          <h3>Discord</h3>
-          <p>Send messages to Discord servers and DMs</p>
-        </div>
-        <div className="integration-status">
-          {discordConnected ? (
-            <>
-              <span className="status connected">Connected</span>
-              <button className="secondary small" onClick={handleTestDiscord} disabled={testingDiscord}>
-                {testingDiscord ? "Testing..." : "Test"}
-              </button>
-              <button className="danger small" onClick={handleDisconnectDiscord}>Disconnect</button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Not connected</span>
-              <button className="primary small" onClick={() => setShowDiscordSetup(true)}>Setup</button>
-            </>
-          )}
-        </div>
-        {discordTestResult && (
-          <div className={`test-result ${discordTestResult.ok ? "success" : "error"}`}>
-            {discordTestResult.ok ? `✓ ${discordTestResult.message}` : `✗ ${discordTestResult.message}`}
+          {/* Discord */}
+          <div className={`integration-card ${discordConnected ? "connected" : ""}`}>
+            <div className="integration-header">
+              <DiscordIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Discord</h3>
+              <span className={`connection-status ${discordConnected ? "connected" : "disconnected"}`}>
+                {discordConnected ? "Connected" : "Not connected"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Send messages to Discord servers and DMs
+            </p>
+            <div className="integration-actions">
+              {discordConnected ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestDiscord} disabled={testingDiscord}>
+                    {testingDiscord ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-danger" onClick={handleDisconnectDiscord}>Disconnect</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setShowDiscordSetup(true)}>Setup</button>
+              )}
+            </div>
+            {discordTestResult && (
+              <div className={`badge ${discordTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {discordTestResult.ok ? `✓ ${discordTestResult.message}` : `✗ ${discordTestResult.message}`}
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* X (Twitter) */}
-      <div className="integration-row">
-        <div className="integration-icon">
-          <span style={{ fontSize: "24px", fontWeight: "bold" }}>𝕏</span>
-        </div>
-        <div className="integration-info">
-          <h3>X (Twitter)</h3>
-          <p>Post tweets, read timeline, send DMs</p>
-        </div>
-        <div className="integration-status">
-          {xConnected ? (
-            <>
-              <span className="status connected">Connected</span>
-              <button className="secondary small" onClick={handleTestX} disabled={testingX}>
-                {testingX ? "Testing..." : "Test"}
-              </button>
-              <button className="danger small" onClick={handleDisconnectX}>Disconnect</button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Not connected</span>
-              <button className="primary small" onClick={() => setShowXSetup(true)}>Setup</button>
-            </>
-          )}
-        </div>
-        {xTestResult && (
-          <div className={`test-result ${xTestResult.ok ? "success" : "error"}`}>
-            {xTestResult.ok ? `✓ ${xTestResult.message}` : `✗ ${xTestResult.message}`}
+          {/* X (Twitter) */}
+          <div className={`integration-card ${xConnected ? "connected" : ""}`}>
+            <div className="integration-header">
+              <div className="integration-icon" style={{ fontSize: "32px", fontWeight: "bold", display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                𝕏
+              </div>
+              <h3 className="integration-name">X (Twitter)</h3>
+              <span className={`connection-status ${xConnected ? "connected" : "disconnected"}`}>
+                {xConnected ? "Connected" : "Not connected"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Post tweets, read timeline, send DMs
+            </p>
+            <div className="integration-actions">
+              {xConnected ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestX} disabled={testingX}>
+                    {testingX ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-danger" onClick={handleDisconnectX}>Disconnect</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setShowXSetup(true)}>Setup</button>
+              )}
+            </div>
+            {xTestResult && (
+              <div className={`badge ${xTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {xTestResult.ok ? `✓ ${xTestResult.message}` : `✗ ${xTestResult.message}`}
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* Notion */}
-      <div className="integration-row">
-        <div className="integration-icon">
-          <NotionIcon size={32} />
-        </div>
-        <div className="integration-info">
-          <h3>Notion</h3>
-          <p>Search, read, and create pages and databases</p>
-        </div>
-        <div className="integration-status">
-          {notionConnected ? (
-            <>
-              <span className="status connected">Connected</span>
-              <button className="secondary small" onClick={handleTestNotion} disabled={testingNotion}>
-                {testingNotion ? "Testing..." : "Test"}
-              </button>
-              <button className="danger small" onClick={handleDisconnectNotion}>Disconnect</button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Not connected</span>
-              <button className="primary small" onClick={() => setShowNotionSetup(true)}>Setup</button>
-            </>
-          )}
-        </div>
-        {notionTestResult && (
-          <div className={`test-result ${notionTestResult.ok ? "success" : "error"}`}>
-            {notionTestResult.ok ? `✓ ${notionTestResult.message}` : `✗ ${notionTestResult.message}`}
+          {/* Notion */}
+          <div className={`integration-card ${notionConnected ? "connected" : ""}`}>
+            <div className="integration-header">
+              <NotionIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Notion</h3>
+              <span className={`connection-status ${notionConnected ? "connected" : "disconnected"}`}>
+                {notionConnected ? "Connected" : "Not connected"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Search, read, and create pages and databases
+            </p>
+            <div className="integration-actions">
+              {notionConnected ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestNotion} disabled={testingNotion}>
+                    {testingNotion ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-danger" onClick={handleDisconnectNotion}>Disconnect</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setShowNotionSetup(true)}>Setup</button>
+              )}
+            </div>
+            {notionTestResult && (
+              <div className={`badge ${notionTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {notionTestResult.ok ? `✓ ${notionTestResult.message}` : `✗ ${notionTestResult.message}`}
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* GitHub */}
-      <div className="integration-row">
-        <div className="integration-icon">
-          <GitHubIcon size={32} />
-        </div>
-        <div className="integration-info">
-          <h3>GitHub</h3>
-          <p>Repos, issues, PRs, and notifications</p>
-        </div>
-        <div className="integration-status">
-          {githubConnected ? (
-            <>
-              <span className="status connected">Connected</span>
-              <button className="secondary small" onClick={handleTestGithub} disabled={testingGithub}>
-                {testingGithub ? "Testing..." : "Test"}
-              </button>
-              <button className="danger small" onClick={handleDisconnectGithub}>Disconnect</button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Not connected</span>
-              <button className="primary small" onClick={() => setShowGithubSetup(true)}>Setup</button>
-            </>
-          )}
-        </div>
-        {githubTestResult && (
-          <div className={`test-result ${githubTestResult.ok ? "success" : "error"}`}>
-            {githubTestResult.ok ? `✓ ${githubTestResult.message}` : `✗ ${githubTestResult.message}`}
+          {/* GitHub */}
+          <div className={`integration-card ${githubConnected ? "connected" : ""}`}>
+            <div className="integration-header">
+              <GitHubIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">GitHub</h3>
+              <span className={`connection-status ${githubConnected ? "connected" : "disconnected"}`}>
+                {githubConnected ? "Connected" : "Not connected"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Repos, issues, PRs, and notifications
+            </p>
+            <div className="integration-actions">
+              {githubConnected ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestGithub} disabled={testingGithub}>
+                    {testingGithub ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-danger" onClick={handleDisconnectGithub}>Disconnect</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setShowGithubSetup(true)}>Setup</button>
+              )}
+            </div>
+            {githubTestResult && (
+              <div className={`badge ${githubTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {githubTestResult.ok ? `✓ ${githubTestResult.message}` : `✗ ${githubTestResult.message}`}
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* Asana */}
-      <div className="integration-row">
-        <div className="integration-icon">
-          <AsanaIcon size={32} />
-        </div>
-        <div className="integration-info">
-          <h3>Asana</h3>
-          <p>Task management and project tracking</p>
-        </div>
-        <div className="integration-status">
-          {asanaConnected ? (
-            <>
-              <span className="status connected">Connected</span>
-              <button className="secondary small" onClick={handleTestAsana} disabled={testingAsana}>
-                {testingAsana ? "Testing..." : "Test"}
-              </button>
-              <button className="danger small" onClick={handleDisconnectAsana}>Disconnect</button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Not connected</span>
-              <button className="primary small" onClick={() => setShowAsanaSetup(true)}>Setup</button>
-            </>
-          )}
-        </div>
-        {asanaTestResult && (
-          <div className={`test-result ${asanaTestResult.ok ? "success" : "error"}`}>
-            {asanaTestResult.ok ? `✓ ${asanaTestResult.message}` : `✗ ${asanaTestResult.message}`}
+          {/* Asana */}
+          <div className={`integration-card ${asanaConnected ? "connected" : ""}`}>
+            <div className="integration-header">
+              <AsanaIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Asana</h3>
+              <span className={`connection-status ${asanaConnected ? "connected" : "disconnected"}`}>
+                {asanaConnected ? "Connected" : "Not connected"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Task management and project tracking
+            </p>
+            <div className="integration-actions">
+              {asanaConnected ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestAsana} disabled={testingAsana}>
+                    {testingAsana ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-danger" onClick={handleDisconnectAsana}>Disconnect</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setShowAsanaSetup(true)}>Setup</button>
+              )}
+            </div>
+            {asanaTestResult && (
+              <div className={`badge ${asanaTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {asanaTestResult.ok ? `✓ ${asanaTestResult.message}` : `✗ ${asanaTestResult.message}`}
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* Reddit */}
-      <div className="integration-row">
-        <div className="integration-icon">
-          <RedditIcon size={32} />
-        </div>
-        <div className="integration-info">
-          <h3>Reddit</h3>
-          <p>Browse, post, and comment on Reddit</p>
-        </div>
-        <div className="integration-status">
-          {redditConnected ? (
-            <>
-              <span className="status connected">Connected</span>
-              <button className="secondary small" onClick={handleTestReddit} disabled={testingReddit}>
-                {testingReddit ? "Testing..." : "Test"}
-              </button>
-              <button className="danger small" onClick={handleDisconnectReddit}>Disconnect</button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Not connected</span>
-              <button className="primary small" onClick={() => setShowRedditSetup(true)}>Setup</button>
-            </>
-          )}
-        </div>
-        {redditTestResult && (
-          <div className={`test-result ${redditTestResult.ok ? "success" : "error"}`}>
-            {redditTestResult.ok ? `✓ ${redditTestResult.message}` : `✗ ${redditTestResult.message}`}
+          {/* Reddit */}
+          <div className={`integration-card ${redditConnected ? "connected" : ""}`}>
+            <div className="integration-header">
+              <RedditIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Reddit</h3>
+              <span className={`connection-status ${redditConnected ? "connected" : "disconnected"}`}>
+                {redditConnected ? "Connected" : "Not connected"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Browse, post, and comment on Reddit
+            </p>
+            <div className="integration-actions">
+              {redditConnected ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestReddit} disabled={testingReddit}>
+                    {testingReddit ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-danger" onClick={handleDisconnectReddit}>Disconnect</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setShowRedditSetup(true)}>Setup</button>
+              )}
+            </div>
+            {redditTestResult && (
+              <div className={`badge ${redditTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {redditTestResult.ok ? `✓ ${redditTestResult.message}` : `✗ ${redditTestResult.message}`}
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* Spotify */}
-      <div className="integration-row">
-        <div className="integration-icon">
-          <SpotifyIcon size={32} />
-        </div>
-        <div className="integration-info">
-          <h3>Spotify</h3>
-          <p>Playback control and music search</p>
-        </div>
-        <div className="integration-status">
-          {spotifyConnected ? (
-            <>
-              <span className="status connected">Connected</span>
-              <button className="secondary small" onClick={handleTestSpotify} disabled={testingSpotify}>
-                {testingSpotify ? "Testing..." : "Test"}
-              </button>
-              <button className="danger small" onClick={handleDisconnectSpotify}>Disconnect</button>
-            </>
-          ) : (
-            <>
-              <span className="status disconnected">Not connected</span>
-              <button className="primary small" onClick={() => setShowSpotifySetup(true)}>Setup</button>
-            </>
-          )}
-        </div>
-        {spotifyTestResult && (
-          <div className={`test-result ${spotifyTestResult.ok ? "success" : "error"}`}>
-            {spotifyTestResult.ok ? `✓ ${spotifyTestResult.message}` : `✗ ${spotifyTestResult.message}`}
+          {/* Spotify */}
+          <div className={`integration-card ${spotifyConnected ? "connected" : ""}`}>
+            <div className="integration-header">
+              <SpotifyIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Spotify</h3>
+              <span className={`connection-status ${spotifyConnected ? "connected" : "disconnected"}`}>
+                {spotifyConnected ? "Connected" : "Not connected"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Playback control and music search
+            </p>
+            <div className="integration-actions">
+              {spotifyConnected ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestSpotify} disabled={testingSpotify}>
+                    {testingSpotify ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-danger" onClick={handleDisconnectSpotify}>Disconnect</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setShowSpotifySetup(true)}>Setup</button>
+              )}
+            </div>
+            {spotifyTestResult && (
+              <div className={`badge ${spotifyTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {spotifyTestResult.ok ? `✓ ${spotifyTestResult.message}` : `✗ ${spotifyTestResult.message}`}
+              </div>
+            )}
           </div>
+
+          {/* Custom Websites - Connected ones first */}
+          {customWebIntegrations.filter((i: any) => i.enabled).map((integration: any) => (
+            <div key={integration.id} className={`integration-card ${integration.enabled ? "connected" : ""}`}>
+              <div className="integration-header">
+                <div className="integration-icon" style={{ fontSize: "32px", display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  🌐
+                </div>
+                <h3 className="integration-name">{integration.name}</h3>
+                <span className={`connection-status ${integration.enabled ? "connected" : "disconnected"}`}>
+                  {integration.enabled ? "Connected" : "Disabled"}
+                </span>
+              </div>
+              <p className="integration-description">
+                {integration.url}
+                <span style={{ display: 'block', fontSize: 'var(--text-xs)', marginTop: 'var(--space-1)', color: 'var(--text-tertiary)' }}>
+                  {integration.siteType ? `${integration.siteType} portal` : 'Custom website'}
+                </span>
+              </p>
+              <div className="integration-actions">
+                <button
+                  className="btn btn-ghost"
+                  onClick={async () => {
+                    try {
+                      await (window as any).wovly.webscraper.updateIntegration(integration.id, { enabled: false });
+                      await loadCustomIntegrations();
+                    } catch (err) {
+                      console.error('Failed to disable integration:', err);
+                    }
+                  }}
+                >
+                  Disconnect
+                </button>
+                <button className="btn btn-ghost" onClick={() => {
+                  setShowManageIntegrations(true);
+                }}>
+                  Settings
+                </button>
+              </div>
+            </div>
+          ))}
+
+          {/* Add New Custom Website - Show first after connected integrations */}
+          <div className="integration-card">
+            <div className="integration-header">
+              <div className="integration-icon" style={{ fontSize: "32px", display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                ➕
+              </div>
+              <h3 className="integration-name">Add Custom Website</h3>
+              <span className="connection-status disconnected">
+                {customWebIntegrations.length > 0 ? `${customWebIntegrations.length} configured` : 'Not configured'}
+              </span>
+            </div>
+            <p className="integration-description">
+              Scrape messages from websites without APIs
+              <span style={{ display: 'block', fontSize: 'var(--text-xs)', marginTop: 'var(--space-1)', color: 'var(--text-tertiary)' }}>
+                Daycare portals, tax sites, school systems, etc.
+              </span>
+            </p>
+            <div className="integration-actions">
+              <button className="btn btn-primary" onClick={() => setShowAddWebIntegration(true)}>
+                Add Website
+              </button>
+              {customWebIntegrations.length > 0 && (
+                <button className="btn btn-ghost" onClick={() => setShowManageIntegrations(true)}>
+                  Manage ({customWebIntegrations.length})
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Custom Websites - Disabled ones at the end */}
+          {customWebIntegrations.filter((i: any) => !i.enabled).map((integration: any) => (
+            <div key={integration.id} className="integration-card">
+              <div className="integration-header">
+                <div className="integration-icon" style={{ fontSize: "32px", display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  🌐
+                </div>
+                <h3 className="integration-name">{integration.name}</h3>
+                <span className="connection-status disconnected">
+                  Disabled
+                </span>
+              </div>
+              <p className="integration-description">
+                {integration.url}
+                <span style={{ display: 'block', fontSize: 'var(--text-xs)', marginTop: 'var(--space-1)', color: 'var(--text-tertiary)' }}>
+                  {integration.siteType ? `${integration.siteType} portal` : 'Custom website'}
+                </span>
+              </p>
+              <div className="integration-actions">
+                <button
+                  className="btn btn-primary"
+                  onClick={async () => {
+                    try {
+                      await (window as any).wovly.webscraper.updateIntegration(integration.id, { enabled: true });
+                      await loadCustomIntegrations();
+                    } catch (err) {
+                      console.error('Failed to enable integration:', err);
+                    }
+                  }}
+                >
+                  Connect
+                </button>
+                <button className="btn btn-ghost" onClick={() => {
+                  setShowManageIntegrations(true);
+                }}>
+                  Settings
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {showGoogleSetup && (
+          <GoogleSetupModal
+            onClose={() => setShowGoogleSetup(false)}
+            onComplete={() => {
+              setGoogleConnected(true);
+              setShowGoogleSetup(false);
+            }}
+          />
         )}
-      </div>
 
-      {showGoogleSetup && (
-        <GoogleSetupModal
-          onClose={() => setShowGoogleSetup(false)}
-          onComplete={() => {
-            setGoogleConnected(true);
-            setShowGoogleSetup(false);
-          }}
-        />
-      )}
+        {showIMessageSetup && (
+          <IMessageSetupModal onClose={() => setShowIMessageSetup(false)} />
+        )}
 
-      {showIMessageSetup && (
-        <IMessageSetupModal onClose={() => setShowIMessageSetup(false)} />
-      )}
+        {showSlackSetup && (
+          <SlackSetupModal
+            onClose={() => setShowSlackSetup(false)}
+            onComplete={() => {
+              setSlackConnected(true);
+              setShowSlackSetup(false);
+              // Refresh to get team name
+              window.wovly.integrations.checkSlackAuth().then(result => {
+                if (result.ok && result.team) {
+                  setSlackTeam(result.team.name);
+                }
+              });
+            }}
+          />
+        )}
 
-      {showSlackSetup && (
-        <SlackSetupModal
-          onClose={() => setShowSlackSetup(false)}
-          onComplete={() => {
-            setSlackConnected(true);
-            setShowSlackSetup(false);
-            // Refresh to get team name
-            window.wovly.integrations.checkSlackAuth().then(result => {
-              if (result.ok && result.team) {
-                setSlackTeam(result.team.name);
+        {showTelegramSetup && (
+          <TelegramSetupModal
+            onClose={() => setShowTelegramSetup(false)}
+            onComplete={() => {
+              setTelegramConnected(true);
+              setShowTelegramSetup(false);
+            }}
+          />
+        )}
+
+        {showDiscordSetup && (
+          <DiscordSetupModal
+            onClose={() => setShowDiscordSetup(false)}
+            onComplete={() => {
+              setDiscordConnected(true);
+              setShowDiscordSetup(false);
+            }}
+          />
+        )}
+
+        {showXSetup && (
+          <XSetupModal
+            onClose={() => setShowXSetup(false)}
+            onComplete={() => {
+              setXConnected(true);
+              setShowXSetup(false);
+            }}
+          />
+        )}
+
+        {showNotionSetup && (
+          <NotionSetupModal
+            onClose={() => setShowNotionSetup(false)}
+            onComplete={() => {
+              setNotionConnected(true);
+              setShowNotionSetup(false);
+            }}
+          />
+        )}
+
+        {showGithubSetup && (
+          <GitHubSetupModal
+            onClose={() => setShowGithubSetup(false)}
+            onComplete={() => {
+              setGithubConnected(true);
+              setShowGithubSetup(false);
+            }}
+          />
+        )}
+
+        {showAsanaSetup && (
+          <AsanaSetupModal
+            onClose={() => setShowAsanaSetup(false)}
+            onComplete={() => {
+              setAsanaConnected(true);
+              setShowAsanaSetup(false);
+            }}
+          />
+        )}
+
+        {showRedditSetup && (
+          <RedditSetupModal
+            onClose={() => setShowRedditSetup(false)}
+            onComplete={() => {
+              setRedditConnected(true);
+              setShowRedditSetup(false);
+            }}
+          />
+        )}
+
+        {showSpotifySetup && (
+          <SpotifySetupModal
+            onClose={() => setShowSpotifySetup(false)}
+            onComplete={() => {
+              setSpotifyConnected(true);
+              setShowSpotifySetup(false);
+            }}
+          />
+        )}
+
+        {showAddWebIntegration && (
+          <AddWebIntegrationModal
+            onClose={() => setShowAddWebIntegration(false)}
+            onSave={async (config) => {
+              try {
+                if (!(window as any).wovly?.webscraper) {
+                  alert("Web scraper API not available. Please restart the app.");
+                  return;
+                }
+                await (window as any).wovly.webscraper.saveConfiguration(config);
+                // Reload integrations list
+                const result = await (window as any).wovly.webscraper.listIntegrations();
+                if (result.success) {
+                  setCustomWebIntegrations(result.integrations || []);
+                }
+                setShowAddWebIntegration(false);
+              } catch (err) {
+                console.error("Failed to save web integration:", err);
+                alert(`Failed to save: ${err}`);
               }
-            });
-          }}
-        />
-      )}
+            }}
+          />
+        )}
 
-      {showTelegramSetup && (
-        <TelegramSetupModal
-          onClose={() => setShowTelegramSetup(false)}
-          onComplete={() => {
-            setTelegramConnected(true);
-            setShowTelegramSetup(false);
-          }}
-        />
-      )}
-
-      {showDiscordSetup && (
-        <DiscordSetupModal
-          onClose={() => setShowDiscordSetup(false)}
-          onComplete={() => {
-            setDiscordConnected(true);
-            setShowDiscordSetup(false);
-          }}
-        />
-      )}
-
-      {showXSetup && (
-        <XSetupModal
-          onClose={() => setShowXSetup(false)}
-          onComplete={() => {
-            setXConnected(true);
-            setShowXSetup(false);
-          }}
-        />
-      )}
-
-      {showNotionSetup && (
-        <NotionSetupModal
-          onClose={() => setShowNotionSetup(false)}
-          onComplete={() => {
-            setNotionConnected(true);
-            setShowNotionSetup(false);
-          }}
-        />
-      )}
-
-      {showGithubSetup && (
-        <GitHubSetupModal
-          onClose={() => setShowGithubSetup(false)}
-          onComplete={() => {
-            setGithubConnected(true);
-            setShowGithubSetup(false);
-          }}
-        />
-      )}
-
-      {showAsanaSetup && (
-        <AsanaSetupModal
-          onClose={() => setShowAsanaSetup(false)}
-          onComplete={() => {
-            setAsanaConnected(true);
-            setShowAsanaSetup(false);
-          }}
-        />
-      )}
-
-      {showRedditSetup && (
-        <RedditSetupModal
-          onClose={() => setShowRedditSetup(false)}
-          onComplete={() => {
-            setRedditConnected(true);
-            setShowRedditSetup(false);
-          }}
-        />
-      )}
-
-      {showSpotifySetup && (
-        <SpotifySetupModal
-          onClose={() => setShowSpotifySetup(false)}
-          onComplete={() => {
-            setSpotifyConnected(true);
-            setShowSpotifySetup(false);
-          }}
-        />
-      )}
+        {showManageIntegrations && (
+          <ManageWebIntegrationsModal
+            onClose={() => setShowManageIntegrations(false)}
+            onUpdate={async () => {
+              try {
+                if (!(window as any).wovly?.webscraper) {
+                  return;
+                }
+                // Reload integrations list
+                const result = await (window as any).wovly.webscraper.listIntegrations();
+                if (result.success) {
+                  setCustomWebIntegrations(result.integrations || []);
+                }
+              } catch (err) {
+                console.error("Failed to reload integrations:", err);
+              }
+            }}
+          />
+        )}
+      </div>
     </div>
   );
 }
@@ -5032,67 +5909,107 @@ function CredentialsPage() {
   };
 
   return (
-    <div className="credentials-page">
+    <div className="main-content">
       <div className="page-header">
         <div>
-          <h1>Credentials</h1>
-          <p className="page-subtitle">Securely stored website logins for browser automation. Credentials are encrypted locally and never sent to AI providers.</p>
+          <h1 className="page-title">Credentials</h1>
+          <p className="page-subtitle">Securely stored website logins for browser automation</p>
         </div>
-        <button className="primary" onClick={handleAdd}>
-          + Add Credential
-        </button>
+        <div className="page-actions">
+          <button className="btn btn-primary" onClick={handleAdd}>
+            + Add Credential
+          </button>
+        </div>
       </div>
 
-      {error && <div className="credentials-error">{error}</div>}
-
-      {loading ? (
-        <div className="credentials-loading">Loading credentials...</div>
-      ) : credentials.length === 0 ? (
-        <div className="credentials-empty">
-          <div className="empty-icon">🔐</div>
-          <h3>No credentials saved</h3>
-          <p>Add website credentials to enable automatic login during browser automation.</p>
-          <button className="primary" onClick={handleAdd}>Add Your First Credential</button>
+      <div className="page-content">
+        {/* Info Card */}
+        <div className="info-card">
+          <div className="info-card-icon">🔐</div>
+          <div className="info-card-content">
+            <h3 className="info-card-title">Secure Credential Storage</h3>
+            <p className="info-card-text">
+              Credentials are stored securely on your device using OS-level encryption.
+              They are used locally for browser automation when logging into websites.
+              Your passwords are never sent to AI providers.
+            </p>
+            <p className="info-card-note">
+              🔒 Encrypted locally and never shared
+            </p>
+          </div>
         </div>
-      ) : (
-        <div className="credentials-list">
+
+        {/* Error display */}
+        {error && (
+          <div className="error-card">
+            <span className="error-icon">⚠️</span>
+            <span className="error-text">{error}</span>
+          </div>
+        )}
+
+        {loading ? (
+          <div className="empty-state">
+            <div className="loading-spinner"></div>
+            <p>Loading credentials...</p>
+          </div>
+        ) : credentials.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-state-icon">🔐</div>
+            <h4>No credentials saved</h4>
+            <p>Add website credentials to enable automatic login during browser automation.</p>
+            <button className="btn btn-primary" onClick={handleAdd}>Add Your First Credential</button>
+          </div>
+        ) : (
+        <div className="credentials-container">
           {credentials.map((cred) => (
-            <div key={cred.domain} className="credential-row">
-              <div className="credential-icon">🔐</div>
-              <div className="credential-info">
-                <div className="credential-domain">{cred.displayName || cred.domain}</div>
-                <div className="credential-username">{cred.username || "(no username)"}</div>
+            <div key={cred.domain} className="credential-card">
+              <div className="credential-card-header">
+                <div className="credential-card-left">
+                  <div className="credential-icon">🔐</div>
+                  <div className="credential-main-info">
+                    <h4 className="credential-domain">{cred.displayName || cred.domain}</h4>
+                    <span className="credential-username">{cred.username || "(no username)"}</span>
+                  </div>
+                </div>
+                <div className="credential-card-actions">
+                  <button className="btn btn-secondary btn-sm" onClick={() => handleEdit(cred.domain)}>Edit</button>
+                  <button className="btn btn-danger btn-sm" onClick={() => handleDelete(cred.domain)}>Delete</button>
+                </div>
+              </div>
+              <div className="credential-card-body">
                 {cred.hasPassword && (
-                  <div className="credential-password">
-                    {showPassword[cred.domain] ? "••••••••" : "Password saved"}
-                    <button 
-                      className="show-password-btn"
+                  <div className="credential-detail">
+                    <span className="credential-label">Password:</span>
+                    <span className="credential-value">
+                      {showPassword[cred.domain] ? "••••••••" : "Saved"}
+                    </span>
+                    <button
+                      className="btn-ghost btn-xs"
                       onClick={() => togglePasswordVisibility(cred.domain)}
                     >
                       {showPassword[cred.domain] ? "Hide" : "Show"}
                     </button>
                   </div>
                 )}
-                {cred.notes && <div className="credential-notes">{cred.notes}</div>}
-                {cred.lastUsed && (
-                  <div className="credential-last-used">
-                    Last used: {new Date(cred.lastUsed).toLocaleDateString()}
+                {cred.notes && (
+                  <div className="credential-detail">
+                    <span className="credential-label">Notes:</span>
+                    <span className="credential-value">{cred.notes}</span>
                   </div>
                 )}
-              </div>
-              <div className="credential-actions">
-                <button className="secondary small" onClick={() => handleEdit(cred.domain)}>Edit</button>
-                <button className="danger small" onClick={() => handleDelete(cred.domain)}>Delete</button>
+                {cred.lastUsed && (
+                  <div className="credential-detail">
+                    <span className="credential-label">Last used:</span>
+                    <span className="credential-value">
+                      {new Date(cred.lastUsed).toLocaleDateString()}
+                    </span>
+                  </div>
+                )}
               </div>
             </div>
           ))}
         </div>
       )}
-
-      <div className="credentials-help">
-        <h4>How credentials work</h4>
-        <p>Credentials are stored securely on your device using OS-level encryption. They are used locally for browser automation when logging into websites - your passwords are never sent to AI providers.</p>
-      </div>
 
       {/* Add/Edit Modal */}
       {showAddModal && (
@@ -5168,9 +6085,9 @@ function CredentialsPage() {
               {error && <div className="form-error">{error}</div>}
             </div>
             <div className="modal-footer">
-              <button className="secondary" onClick={() => setShowAddModal(false)}>Cancel</button>
+              <button className="btn btn-secondary" onClick={() => setShowAddModal(false)}>Cancel</button>
               <button 
-                className="primary" 
+                className="btn btn-primary" 
                 onClick={handleSave}
                 disabled={saving || !formDomain.trim()}
               >
@@ -5180,6 +6097,7 @@ function CredentialsPage() {
           </div>
         </div>
       )}
+      </div>
     </div>
   );
 }
@@ -5195,6 +6113,13 @@ function AboutMePage() {
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Goals state
+  const [goals, setGoals] = useState<string[]>([]);
+  const [editingGoals, setEditingGoals] = useState(false);
+  const [newGoal, setNewGoal] = useState("");
+  const [goalsLoading, setGoalsLoading] = useState(false);
+  const [goalsSaving, setGoalsSaving] = useState(false);
 
   useEffect(() => {
     const loadProfile = async () => {
@@ -5217,6 +6142,24 @@ function AboutMePage() {
       }
     };
     loadProfile();
+  }, []);
+
+  // Load goals from profile
+  useEffect(() => {
+    const loadGoals = async () => {
+      setGoalsLoading(true);
+      try {
+        const result = await window.wovly.profile.get();
+        if (result.ok && result.profile.goals) {
+          setGoals(result.profile.goals);
+        }
+      } catch (err) {
+        console.error("Failed to load goals:", err);
+      } finally {
+        setGoalsLoading(false);
+      }
+    };
+    loadGoals();
   }, []);
 
   const handleSave = async () => {
@@ -5245,83 +6188,206 @@ function AboutMePage() {
     setEditedMarkdown(markdown);
   };
 
+  // Goals handlers
+  const handleAddGoal = () => {
+    if (newGoal.trim()) {
+      setGoals([...goals, newGoal.trim()]);
+      setNewGoal("");
+    }
+  };
+
+  const handleRemoveGoal = (index: number) => {
+    setGoals(goals.filter((_, i) => i !== index));
+  };
+
+  const handleSaveGoals = async () => {
+    setGoalsSaving(true);
+    setError(null);
+    try {
+      const result = await window.wovly.profile.update({ goals });
+      if (result.ok) {
+        setEditingGoals(false);
+      } else {
+        setError(result.error || "Failed to save goals");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save goals");
+    } finally {
+      setGoalsSaving(false);
+    }
+  };
+
+  const handleCancelGoals = async () => {
+    setEditingGoals(false);
+    // Reload goals from profile
+    try {
+      const result = await window.wovly.profile.get();
+      if (result.ok && result.profile.goals) {
+        setGoals(result.profile.goals);
+      }
+    } catch (err) {
+      console.error("Failed to reload goals:", err);
+    }
+  };
+
   if (loading) {
     return (
-      <div className="about-me-page">
-        <div className="loading-state">Loading profile...</div>
+      <div className="main-content">
+        <div className="empty-state">
+          <div className="loading-spinner"></div>
+          <p>Loading profile...</p>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="about-me-page">
-      {/* Important Description Header */}
-      <div className="about-me-header">
-        <h1>About Me</h1>
-        <div className="about-me-description">
-          <p><strong>This is your personal profile that Wovly uses to understand you better.</strong></p>
-          <p>
-            The information here helps me remember important details about your life, 
-            relationships, preferences, and context. The more I know about you, the 
-            better I can assist you with personalized responses and actions.
-          </p>
-          <p className="important-note">
-            🔒 This file is stored locally on your device and is never shared. 
-            Keep it updated with information you want me to remember!
-          </p>
+    <div className="main-content">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">About Me</h1>
+          <p className="page-subtitle">Your personal profile and preferences</p>
+        </div>
+        <div className="page-actions">
+          {!isEditing ? (
+            <button className="btn btn-primary" onClick={() => setIsEditing(true)}>Edit Profile</button>
+          ) : (
+            <>
+              <button className="btn btn-secondary" onClick={handleCancel} disabled={saving}>Cancel</button>
+              <button className="btn btn-primary" onClick={handleSave} disabled={saving}>
+                {saving ? "Saving..." : "Save Changes"}
+              </button>
+            </>
+          )}
         </div>
       </div>
 
-      {/* Error display */}
-      {error && (
-        <div className="error-banner">
-          {error}
+      <div className="page-content">
+        {/* Info Card */}
+        <div className="info-card">
+          <div className="info-card-icon">ℹ️</div>
+          <div className="info-card-content">
+            <h3 className="info-card-title">Your Personal Profile</h3>
+            <p className="info-card-text">
+              This is your personal profile that Wovly uses to understand you better.
+              The information here helps me remember important details about your life,
+              relationships, preferences, and context.
+            </p>
+            <p className="info-card-note">
+              🔒 Stored locally on your device and never shared
+            </p>
+          </div>
         </div>
-      )}
 
-      {/* View/Edit Toggle */}
-      <div className="about-me-actions">
-        {isEditing ? (
-          <>
-            <button 
-              className="btn-primary" 
-              onClick={handleSave} 
-              disabled={saving}
-            >
-              {saving ? "Saving..." : "Save"}
-            </button>
-            <button 
-              className="btn-secondary" 
-              onClick={handleCancel}
-              disabled={saving}
-            >
-              Cancel
-            </button>
-          </>
-        ) : (
-          <button 
-            className="btn-primary" 
-            onClick={() => setIsEditing(true)}
-          >
-            Edit Profile
-          </button>
-        )}
-      </div>
-
-      {/* Content Area */}
-      <div className="about-me-content">
-        {isEditing ? (
-          <textarea
-            value={editedMarkdown}
-            onChange={(e) => setEditedMarkdown(e.target.value)}
-            className="profile-editor"
-            placeholder="Enter your profile information in markdown format..."
-          />
-        ) : (
-          <div className="profile-viewer">
-            <pre>{markdown || "No profile information yet. Click 'Edit Profile' to add your information."}</pre>
+        {/* Error display */}
+        {error && (
+          <div className="error-card">
+            <span className="error-icon">⚠️</span>
+            <span className="error-text">{error}</span>
           </div>
         )}
+
+        {/* Goals Section */}
+        <div className="goals-section">
+          <div className="section-header">
+            <h3>My Goals & Priorities</h3>
+            {!editingGoals ? (
+              <button className="btn btn-secondary" onClick={() => setEditingGoals(true)}>
+                Edit Goals
+              </button>
+            ) : (
+              <div className="button-group">
+                <button className="btn btn-secondary" onClick={handleCancelGoals} disabled={goalsSaving}>
+                  Cancel
+                </button>
+                <button className="btn btn-primary" onClick={handleSaveGoals} disabled={goalsSaving}>
+                  {goalsSaving ? "Saving..." : "Save Goals"}
+                </button>
+              </div>
+            )}
+          </div>
+
+          <p className="goals-helper-text">
+            Your goals help Wovly prioritize insights from your messages. Important issues related to your goals
+            will be surfaced first in the Insights panel.
+          </p>
+
+          {goalsLoading ? (
+            <div className="loading-spinner"></div>
+          ) : editingGoals ? (
+            <div className="goals-editor">
+              <div className="goals-list">
+                {goals.map((goal, index) => (
+                  <div key={index} className="goal-item">
+                    <span>{goal}</span>
+                    <button
+                      className="btn-ghost goal-remove-btn"
+                      onClick={() => handleRemoveGoal(index)}
+                      aria-label="Remove goal"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <div className="add-goal">
+                <input
+                  value={newGoal}
+                  onChange={(e) => setNewGoal(e.target.value)}
+                  placeholder="Add a goal or priority..."
+                  onKeyPress={(e) => e.key === 'Enter' && handleAddGoal()}
+                />
+                <button className="btn btn-primary" onClick={handleAddGoal}>
+                  Add
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="goals-display">
+              {goals.length === 0 ? (
+                <p className="empty-goals">No goals set. Click Edit Goals to add your priorities.</p>
+              ) : (
+                <ul className="goals-list">
+                  {goals.map((goal, index) => (
+                    <li key={index}>{goal}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Content Editor/Viewer */}
+        <div className="profile-content-container">
+          {isEditing ? (
+            <div className="profile-editor-wrapper">
+              <div className="editor-label-row">
+                <label className="input-label">Profile Content (Markdown)</label>
+                <span className="editor-hint">{editedMarkdown.length} characters</span>
+              </div>
+              <textarea
+                value={editedMarkdown}
+                onChange={(e) => setEditedMarkdown(e.target.value)}
+                className="profile-editor"
+                placeholder="Enter your profile information in markdown format..."
+                spellCheck={false}
+              />
+            </div>
+          ) : (
+            <div className="profile-viewer-wrapper">
+              <label className="input-label">Profile Content</label>
+              {markdown ? (
+                <pre className="profile-viewer">{markdown}</pre>
+              ) : (
+                <div className="empty-state">
+                  <div className="empty-state-icon">📝</div>
+                  <h4>No profile information yet</h4>
+                  <p>Click 'Edit Profile' to add your information</p>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -5386,49 +6452,76 @@ function SettingsPage() {
   };
 
   if (loading) {
-    return <div className="settings-page"><p>Loading...</p></div>;
+    return (
+      <div className="main-content">
+        <div className="empty-state">
+          <div className="loading-spinner"></div>
+          <p>Loading...</p>
+        </div>
+      </div>
+    );
   }
 
   return (
-    <div className="settings-page">
-      <h1>Settings</h1>
-      
-      <div className="settings-section">
-        <h2>LLM Providers</h2>
-        <p className="settings-description">Configure your AI providers. The active provider will be used for chat.</p>
-        
-        {/* Anthropic */}
-        <div className={`provider-row ${activeProvider === "anthropic" ? "active" : ""}`}>
-          <div className="provider-header">
-            <div className="provider-info">
-              <div className="provider-name">
-                <span className="provider-icon"><ClaudeIcon size={24} /></span>
-                Anthropic (Claude)
-              </div>
-              {anthropicKey && <span className="provider-configured">Configured</span>}
-            </div>
-            <button 
-              className={`provider-select-btn ${activeProvider === "anthropic" ? "selected" : ""}`}
-              onClick={() => selectProvider("anthropic")}
-              disabled={!anthropicKey}
-            >
-              {activeProvider === "anthropic" ? "✓ Active" : "Use"}
-            </button>
+    <div className="main-content">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">Settings</h1>
+          <p className="page-subtitle">Configure your AI providers and preferences</p>
+        </div>
+      </div>
+
+      <div className="page-content">
+        <div className="info-card" style={{ marginBottom: 'var(--space-6)' }}>
+          <div className="info-card-icon">⚙️</div>
+          <div className="info-card-content">
+            <h3 className="info-card-title">LLM Providers</h3>
+            <p className="info-card-text">Configure your AI providers. The active provider will be used for chat.</p>
           </div>
-          <div className="provider-fields">
-            <div className="form-row">
-              <div className="form-group flex-2">
-                <label>API Key</label>
+        </div>
+
+        <div className="providers-grid">
+          {/* Anthropic */}
+          <div className={`provider-card ${activeProvider === "anthropic" ? "active" : ""}`}>
+            <div className="provider-card-header">
+              <div className="provider-card-top">
+                <div className="provider-card-info">
+                  <ClaudeIcon className="provider-card-icon" size={32} />
+                  <div>
+                    <h3 className="provider-card-name">Anthropic</h3>
+                    <p className="provider-card-model">Claude</p>
+                  </div>
+                </div>
+                {anthropicKey && <span className="provider-status configured">Configured</span>}
+                {!anthropicKey && <span className="provider-status not-configured">Not configured</span>}
+              </div>
+              {anthropicKey && (
+                <button
+                  className={`provider-select-btn ${activeProvider === "anthropic" ? "selected" : ""}`}
+                  onClick={() => selectProvider("anthropic")}
+                >
+                  {activeProvider === "anthropic" ? "✓ Active" : "Set Active"}
+                </button>
+              )}
+            </div>
+            <div className="provider-card-body">
+              <div className="form-group">
+                <label className="input-label">API Key</label>
                 <input
                   type="password"
+                  className="provider-input"
                   value={anthropicKey}
                   onChange={e => setAnthropicKey(e.target.value)}
                   placeholder="sk-ant-api03-..."
                 />
               </div>
-              <div className="form-group flex-1">
-                <label>Model</label>
-                <select value={anthropicModel} onChange={e => setAnthropicModel(e.target.value)}>
+              <div className="form-group">
+                <label className="input-label">Model</label>
+                <select
+                  className="provider-select"
+                  value={anthropicModel}
+                  onChange={e => setAnthropicModel(e.target.value)}
+                >
                   {ANTHROPIC_MODELS.map(m => (
                     <option key={m.id} value={m.id}>{m.name}</option>
                   ))}
@@ -5436,40 +6529,48 @@ function SettingsPage() {
               </div>
             </div>
           </div>
-        </div>
 
-        {/* OpenAI */}
-        <div className={`provider-row ${activeProvider === "openai" ? "active" : ""}`}>
-          <div className="provider-header">
-            <div className="provider-info">
-              <div className="provider-name">
-                <span className="provider-icon"><OpenAIIcon size={24} /></span>
-                OpenAI (GPT)
+          {/* OpenAI */}
+          <div className={`provider-card ${activeProvider === "openai" ? "active" : ""}`}>
+            <div className="provider-card-header">
+              <div className="provider-card-top">
+                <div className="provider-card-info">
+                  <OpenAIIcon className="provider-card-icon" size={32} />
+                  <div>
+                    <h3 className="provider-card-name">OpenAI</h3>
+                    <p className="provider-card-model">GPT</p>
+                  </div>
+                </div>
+                {openaiKey && <span className="provider-status configured">Configured</span>}
+                {!openaiKey && <span className="provider-status not-configured">Not configured</span>}
               </div>
-              {openaiKey && <span className="provider-configured">Configured</span>}
+              {openaiKey && (
+                <button
+                  className={`provider-select-btn ${activeProvider === "openai" ? "selected" : ""}`}
+                  onClick={() => selectProvider("openai")}
+                >
+                  {activeProvider === "openai" ? "✓ Active" : "Set Active"}
+                </button>
+              )}
             </div>
-            <button 
-              className={`provider-select-btn ${activeProvider === "openai" ? "selected" : ""}`}
-              onClick={() => selectProvider("openai")}
-              disabled={!openaiKey}
-            >
-              {activeProvider === "openai" ? "✓ Active" : "Use"}
-            </button>
-          </div>
-          <div className="provider-fields">
-            <div className="form-row">
-              <div className="form-group flex-2">
-                <label>API Key</label>
+            <div className="provider-card-body">
+              <div className="form-group">
+                <label className="input-label">API Key</label>
                 <input
                   type="password"
+                  className="provider-input"
                   value={openaiKey}
                   onChange={e => setOpenaiKey(e.target.value)}
                   placeholder="sk-..."
                 />
               </div>
-              <div className="form-group flex-1">
-                <label>Model</label>
-                <select value={openaiModel} onChange={e => setOpenaiModel(e.target.value)}>
+              <div className="form-group">
+                <label className="input-label">Model</label>
+                <select
+                  className="provider-select"
+                  value={openaiModel}
+                  onChange={e => setOpenaiModel(e.target.value)}
+                >
                   {OPENAI_MODELS.map(m => (
                     <option key={m.id} value={m.id}>{m.name}</option>
                   ))}
@@ -5477,40 +6578,48 @@ function SettingsPage() {
               </div>
             </div>
           </div>
-        </div>
 
-        {/* Google */}
-        <div className={`provider-row ${activeProvider === "google" ? "active" : ""}`}>
-          <div className="provider-header">
-            <div className="provider-info">
-              <div className="provider-name">
-                <span className="provider-icon"><GeminiIcon size={24} /></span>
-                Google (Gemini)
+          {/* Google */}
+          <div className={`provider-card ${activeProvider === "google" ? "active" : ""}`}>
+            <div className="provider-card-header">
+              <div className="provider-card-top">
+                <div className="provider-card-info">
+                  <GeminiIcon className="provider-card-icon" size={32} />
+                  <div>
+                    <h3 className="provider-card-name">Google</h3>
+                    <p className="provider-card-model">Gemini</p>
+                  </div>
+                </div>
+                {googleKey && <span className="provider-status configured">Configured</span>}
+                {!googleKey && <span className="provider-status not-configured">Not configured</span>}
               </div>
-              {googleKey && <span className="provider-configured">Configured</span>}
+              {googleKey && (
+                <button
+                  className={`provider-select-btn ${activeProvider === "google" ? "selected" : ""}`}
+                  onClick={() => selectProvider("google")}
+                >
+                  {activeProvider === "google" ? "✓ Active" : "Set Active"}
+                </button>
+              )}
             </div>
-            <button 
-              className={`provider-select-btn ${activeProvider === "google" ? "selected" : ""}`}
-              onClick={() => selectProvider("google")}
-              disabled={!googleKey}
-            >
-              {activeProvider === "google" ? "✓ Active" : "Use"}
-            </button>
-          </div>
-          <div className="provider-fields">
-            <div className="form-row">
-              <div className="form-group flex-2">
-                <label>API Key</label>
+            <div className="provider-card-body">
+              <div className="form-group">
+                <label className="input-label">API Key</label>
                 <input
                   type="password"
+                  className="provider-input"
                   value={googleKey}
                   onChange={e => setGoogleKey(e.target.value)}
                   placeholder="AIza..."
                 />
               </div>
-              <div className="form-group flex-1">
-                <label>Model</label>
-                <select value={googleModel} onChange={e => setGoogleModel(e.target.value)}>
+              <div className="form-group">
+                <label className="input-label">Model</label>
+                <select
+                  className="provider-select"
+                  value={googleModel}
+                  onChange={e => setGoogleModel(e.target.value)}
+                >
                   {GOOGLE_MODELS.map(m => (
                     <option key={m.id} value={m.id}>{m.name}</option>
                   ))}
@@ -5521,7 +6630,7 @@ function SettingsPage() {
         </div>
 
         <div className="settings-actions">
-          <button className="primary" onClick={handleSave}>
+          <button className="btn btn-primary" onClick={handleSave}>
             {saved ? "✓ Saved" : "Save Settings"}
           </button>
         </div>
@@ -5996,6 +7105,23 @@ function LoginPage({ onLogin }: { onLogin: (user: AuthUser) => void }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function App() {
+  // Theme state
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    // Check localStorage for saved theme, default to light
+    const saved = localStorage.getItem('wovly-theme');
+    return (saved === 'dark' || saved === 'light') ? saved : 'light';
+  });
+
+  // Apply theme to document
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('wovly-theme', theme);
+  }, [theme]);
+
+  const toggleTheme = () => {
+    setTheme(prev => prev === 'light' ? 'dark' : 'light');
+  };
+
   // Authentication state
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
@@ -6189,103 +7315,122 @@ export default function App() {
   return (
     <div className="app-shell">
       <nav className="sidebar">
-        <div className="logo">
-          <WovlyIcon size={32} />
+        <div className="sidebar-header">
+          <div className="logo">
+            <div className="logo-icon">
+              <WovlyIcon size={18} />
+            </div>
+            <span className="logo-text">Wovly</span>
+          </div>
+          <button
+            className="theme-toggle"
+            onClick={toggleTheme}
+            title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+          >
+            {theme === 'light' ? '🌙' : '☀️'}
+          </button>
         </div>
-        <ul className="nav-list">
-          <li>
+
+        <div className="sidebar-nav">
+          <div className="nav-section">
             <button
-              className={`nav-btn ${navItem === "chat" ? "active" : ""}`}
+              className={`nav-item ${navItem === "chat" ? "active" : ""}`}
               onClick={() => setNavItem("chat")}
             >
-              <ChatIcon size={18} /> Chat
+              <ChatIcon className="nav-icon" size={18} />
+              Chat
             </button>
-          </li>
-          <li>
             <button
-              className={`nav-btn ${navItem === "tasks" ? "active" : ""}`}
+              className={`nav-item ${navItem === "tasks" ? "active" : ""}`}
               onClick={() => setNavItem("tasks")}
             >
-              <span className="nav-icon-wrapper">
-                <TasksIcon size={18} />
-                {pendingApprovalsCount > 0 && (
-                  <span className="nav-badge">{pendingApprovalsCount > 9 ? '9+' : pendingApprovalsCount}</span>
-                )}
-              </span>
+              <TasksIcon className="nav-icon" size={18} />
               Tasks
+              {pendingApprovalsCount > 0 && (
+                <span className="badge badge-primary" style={{ marginLeft: 'auto' }}>
+                  {pendingApprovalsCount > 9 ? '9+' : pendingApprovalsCount}
+                </span>
+              )}
             </button>
-          </li>
-          <li>
             <button
-              className={`nav-btn ${navItem === "skills" ? "active" : ""}`}
+              className={`nav-item ${navItem === "skills" ? "active" : ""}`}
               onClick={() => setNavItem("skills")}
             >
-              <SkillsIcon size={18} /> Skills
+              <SkillsIcon className="nav-icon" size={18} />
+              Skills
             </button>
-          </li>
-          <li>
             <button
-              className={`nav-btn ${navItem === "about-me" ? "active" : ""}`}
+              className={`nav-item ${navItem === "about-me" ? "active" : ""}`}
               onClick={() => setNavItem("about-me")}
             >
-              <AboutMeIcon size={18} /> About Me
+              <AboutMeIcon className="nav-icon" size={18} />
+              About Me
             </button>
-          </li>
-          <li>
+          </div>
+
+          <div className="nav-section">
+            <div className="nav-section-title">Connections</div>
             <button
-              className={`nav-btn ${navItem === "interfaces" ? "active" : ""}`}
+              className={`nav-item ${navItem === "interfaces" ? "active" : ""}`}
               onClick={() => setNavItem("interfaces")}
             >
-              <InterfacesIcon size={18} /> Interfaces
+              <InterfacesIcon className="nav-icon" size={18} />
+              Interfaces
             </button>
-          </li>
-          <li>
             <button
-              className={`nav-btn ${navItem === "integrations" ? "active" : ""}`}
+              className={`nav-item ${navItem === "integrations" ? "active" : ""}`}
               onClick={() => setNavItem("integrations")}
             >
-              <IntegrationsIcon size={18} /> Integrations
+              <IntegrationsIcon className="nav-icon" size={18} />
+              Integrations
             </button>
-          </li>
-          <li>
             <button
-              className={`nav-btn ${navItem === "credentials" ? "active" : ""}`}
+              className={`nav-item ${navItem === "credentials" ? "active" : ""}`}
               onClick={() => setNavItem("credentials")}
             >
-              <CredentialsIcon size={18} /> Credentials
+              <CredentialsIcon className="nav-icon" size={18} />
+              Credentials
             </button>
-          </li>
-          <li>
+          </div>
+
+          <div className="nav-section">
+            <div className="nav-section-title">Settings</div>
             <button
-              className={`nav-btn ${navItem === "settings" ? "active" : ""}`}
+              className={`nav-item ${navItem === "settings" ? "active" : ""}`}
               onClick={() => setNavItem("settings")}
             >
-              <SettingsIcon size={18} /> Settings
+              <SettingsIcon className="nav-icon" size={18} />
+              Settings
             </button>
-          </li>
-          <li>
             <button
-              className="nav-btn nav-btn-external"
+              className="nav-item"
               onClick={() => window.wovly.shell.openExternal("https://wovly.mintlify.app/")}
             >
-              <DocsIcon size={18} /> Docs
+              <DocsIcon className="nav-icon" size={18} />
+              Docs
             </button>
-          </li>
-        </ul>
-        
-        {/* Bottom section with user info and logout */}
-        <div className="nav-bottom">
+            <button
+              className="nav-item"
+              onClick={handleLogout}
+            >
+              <LogoutIcon className="nav-icon" size={18} />
+              Logout
+            </button>
+          </div>
+        </div>
+
+        <div className="sidebar-footer">
           {currentUser && (
-            <div className="nav-user">
-              <span className="nav-user-name">{currentUser.displayName}</span>
+            <div className="user-profile">
+              <div className="user-avatar">
+                {currentUser.displayName.charAt(0).toUpperCase()}
+              </div>
+              <div className="user-info">
+                <div className="user-name">{currentUser.displayName}</div>
+                <div className="user-status">Online</div>
+              </div>
             </div>
           )}
-          <button
-            className="nav-btn nav-btn-logout"
-            onClick={handleLogout}
-          >
-            <LogoutIcon size={18} /> Logout
-          </button>
         </div>
       </nav>
 
@@ -6313,7 +7458,7 @@ export default function App() {
         
         {navItem === "chat" && (
           <div className="content-grid">
-            <AgendaPanel />
+            <AgendaPanel onNavigate={setNavItem} />
             <ChatPanel
               messages={chatMessages}
               setMessages={setChatMessages}

@@ -3,7 +3,7 @@
  */
 
 const fs = require("fs/promises");
-const { getSettingsPath } = require("../utils/helpers");
+const { getSettingsPath } = require("../../dist/utils/helpers");
 
 // Get Google access token (with refresh if needed)
 const getGoogleAccessToken = async (username) => {
