@@ -33,3 +33,6 @@ settings.json
 # Electron
 *.asar
 .playwright-cli/
+
+# Development notes and test files
+.dev-notes/
