@@ -170,9 +170,7 @@ export class WebScraper {
       console.error(`[WebScraper] Error scraping ${siteConfig.name}:`, err);
 
       const errorType = classifyError(err, page, siteConfig);
-      const detectResult = page
-        ? await detectPageChange(page, siteConfig).catch(() => null)
-        : null;
+      const detectResult = page ? await detectPageChange(page, siteConfig).catch(() => null) : null;
       const errorMessage = generateErrorMessage(errorType, err, detectResult);
 
       // Clear session if it's expired or auth failed
@@ -307,7 +305,7 @@ export class WebScraper {
             elementFound = true;
           } catch (selectorError) {
             // Log available interactive elements to help debug
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
             const availableElements = (await page.evaluate(() => {
               const elements: AvailableElement[] = [];
               // @ts-expect-error - document available in browser context
@@ -350,11 +348,12 @@ export class WebScraper {
 
               console.warn(`[WebScraper] Cleaned search text: "${searchText}"`);
 
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
               const foundByText = (await page.evaluate((text: any) => {
                 // @ts-expect-error - document available in browser context
-                const elements = Array.from(document.querySelectorAll('a, button, [role="button"]'));
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const elements = Array.from(
+                  document.querySelectorAll('a, button, [role="button"]')
+                );
+
                 const match = elements.find((el: any) => {
                   const elText = el.textContent?.trim() || '';
                   return elText.toLowerCase().includes(text.toLowerCase());
@@ -380,9 +379,11 @@ export class WebScraper {
               try {
                 await Promise.race([
                   // Wait for navigation if it happens
-                  page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 }).catch(() => {
-                    // Navigation didn't happen, that's fine
-                  }),
+                  page
+                    .waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 })
+                    .catch(() => {
+                      // Navigation didn't happen, that's fine
+                    }),
                   // Perform the click
                   page.click(step.selector),
                 ]);
@@ -390,7 +391,9 @@ export class WebScraper {
               } catch (navigationError) {
                 // If the click caused a navigation that destroyed the context,
                 // wait a bit for the new page to load
-                console.warn(`[WebScraper] Click may have triggered navigation, waiting for page to stabilize...`);
+                console.warn(
+                  `[WebScraper] Click may have triggered navigation, waiting for page to stabilize...`
+                );
                 await new Promise((resolve) => setTimeout(resolve, 2000));
               }
             } catch (clickError) {
@@ -404,19 +407,15 @@ export class WebScraper {
                 searchText = searchText.split(/\s{2,}/)[0].trim();
                 searchText = searchText.substring(0, 100);
 
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 await page.evaluate((text: string) => {
                   const doc = (globalThis as any).document;
-                  const elements = Array.from(
-                    doc.querySelectorAll('a, button, [role="button"]')
-                  );
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const elements = Array.from(doc.querySelectorAll('a, button, [role="button"]'));
+
                   const match = elements.find((el: any) => {
                     const elText = el.textContent?.trim() || '';
                     return elText.toLowerCase().includes(text.toLowerCase());
                   });
                   if (match) {
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
                     (match as any).click();
                   }
                 }, searchText);
@@ -474,7 +473,7 @@ export class WebScraper {
     await page.waitForSelector(selectors.container, { timeout: 10000 });
 
     // Extract all text from the messages area (browser context code)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     const messagesText = (await page.evaluate((containerSelector: string): any => {
       // @ts-expect-error - document available in browser context
       const container = document.querySelector(containerSelector);
@@ -506,10 +505,7 @@ export class WebScraper {
    * @param siteConfig - Site configuration
    * @returns Parsed messages
    */
-  private async parseMessagesWithLLM(
-    text: string,
-    siteConfig: SiteConfig
-  ): Promise<RawMessage[]> {
+  private async parseMessagesWithLLM(text: string, siteConfig: SiteConfig): Promise<RawMessage[]> {
     try {
       // Get API keys
       const apiKeys = await this.getApiKeys();
@@ -659,8 +655,9 @@ Return ONLY the JSON array, no other text.`;
         );
       }
 
-      const messageFormat = (siteConfig as SiteConfig & { messageFormat?: { platform?: string; subject?: string } })
-        .messageFormat;
+      const messageFormat = (
+        siteConfig as SiteConfig & { messageFormat?: { platform?: string; subject?: string } }
+      ).messageFormat;
 
       return {
         platform: messageFormat?.platform || `custom-${siteConfig.id}`,
@@ -820,8 +817,21 @@ Return ONLY the JSON array, no other text.`;
         if (!isPM && hours === 12) hours = 0;
 
         // Parse month name
-        const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-        const month = monthNames.findIndex(m => monthStr.toLowerCase().startsWith(m));
+        const monthNames = [
+          'jan',
+          'feb',
+          'mar',
+          'apr',
+          'may',
+          'jun',
+          'jul',
+          'aug',
+          'sep',
+          'oct',
+          'nov',
+          'dec',
+        ];
+        const month = monthNames.findIndex((m) => monthStr.toLowerCase().startsWith(m));
 
         if (month !== -1) {
           const date = new Date(now.getFullYear(), month, day, hours, minutes, 0, 0);
@@ -894,7 +904,7 @@ Return ONLY the JSON array, no other text.`;
     if (!result.ok || !result.credential) {
       throw new Error(
         `No credentials found for ${siteConfig.credentialDomain}. ` +
-        `Please add credentials in Settings > Credentials or during site configuration.`
+          `Please add credentials in Settings > Credentials or during site configuration.`
       );
     }
 
@@ -904,7 +914,7 @@ Return ONLY the JSON array, no other text.`;
 
     return {
       username: result.credential.username,
-      password: result.credential.password
+      password: result.credential.password,
     };
   }
 }

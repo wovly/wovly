@@ -3,14 +3,11 @@
  * Two-stage LLM pipeline for analyzing messages and generating insights
  */
 
-// @ts-nocheck - Runtime-validated data from external APIs
-
-import fs from "fs/promises";
-import { saveFactToDaily } from "../storage/memory";
-import { loadRecentHistory } from "../storage/insights";
-import { getUserProfilePath } from "../storage/profile";
-import type { Insight } from "../storage/insights";
-import { SettingsService } from "../services/settings";
+import fs from 'fs/promises';
+import { saveFactToDaily } from '../storage/memory';
+import { loadRecentHistory } from '../storage/insights';
+import { getUserProfilePath } from '../storage/profile';
+import { SettingsService } from '../services/settings';
 
 export interface ApiKeys {
   anthropic?: string;
@@ -39,7 +36,6 @@ export interface ExtractedFact {
 
 export type ContactMappings = Record<string, string>;
 
-
 /**
  * Helper: Extract contact mappings from user profile
  * Looks for patterns like "Igor: +16034383242" or "email: igor@example.com"
@@ -51,13 +47,32 @@ function extractContactMappings(profileMarkdown) {
 
   // Blacklist of common profile fields that are NOT contacts
   const blacklist = new Set([
-    'date of birth', 'dob', 'birthday', 'birthdate',
-    'age', 'zip code', 'postal code', 'zipcode',
-    'address', 'street', 'city', 'state', 'country',
-    'occupation', 'job', 'title', 'company',
-    'anniversary', 'license', 'ssn', 'id',
-    'height', 'weight', 'blood type',
-    'emergency contact', 'ice'
+    'date of birth',
+    'dob',
+    'birthday',
+    'birthdate',
+    'age',
+    'zip code',
+    'postal code',
+    'zipcode',
+    'address',
+    'street',
+    'city',
+    'state',
+    'country',
+    'occupation',
+    'job',
+    'title',
+    'company',
+    'anniversary',
+    'license',
+    'ssn',
+    'id',
+    'height',
+    'weight',
+    'blood type',
+    'emergency contact',
+    'ice',
   ]);
 
   // Common patterns for contact information
@@ -128,7 +143,11 @@ function resolveContact(contact, contactMappings) {
 
   for (const [key, name] of Object.entries(contactMappings)) {
     const normalizedKey = key.replace(/[\s\-()]/g, '').replace(/^\+1/, '');
-    if (normalized === normalizedKey || normalized.includes(normalizedKey) || normalizedKey.includes(normalized)) {
+    if (
+      normalized === normalizedKey ||
+      normalized.includes(normalizedKey) ||
+      normalizedKey.includes(normalized)
+    ) {
       return name;
     }
   }
@@ -143,7 +162,10 @@ function stripMarkdownCodeBlocks(text) {
   if (!text) return '{}';
 
   // Remove ```json and ``` markers
-  let cleaned = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+  let cleaned = text
+    .replace(/```json\s*/g, '')
+    .replace(/```\s*/g, '')
+    .trim();
 
   // If the response starts with non-JSON text, try to extract JSON
   // Look for the first { and last } to extract just the JSON part
@@ -166,58 +188,58 @@ async function callLLM(messages, apiKeys, options = {}) {
   try {
     // Try Anthropic first if available
     if (apiKeys.anthropic) {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
         headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKeys.anthropic,
-          "anthropic-version": "2023-06-01"
+          'Content-Type': 'application/json',
+          'x-api-key': apiKeys.anthropic,
+          'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
+          model: 'claude-sonnet-4-20250514',
           max_tokens: maxTokens,
           temperature,
-          messages
-        })
+          messages,
+        }),
       });
 
       if (response.ok) {
         const data = await response.json();
-        return { content: data.content?.[0]?.text || "" };
+        return { content: data.content?.[0]?.text || '' };
       }
     }
 
     // Fallback to OpenAI
     if (apiKeys.openai) {
       const body = {
-        model: "gpt-4o",
+        model: 'gpt-4o',
         max_tokens: maxTokens,
         temperature,
-        messages
+        messages,
       };
 
-      if (responseFormat?.type === "json_object") {
-        body.response_format = { type: "json_object" };
+      if (responseFormat?.type === 'json_object') {
+        body.response_format = { type: 'json_object' };
       }
 
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
         headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKeys.openai}`
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKeys.openai}`,
         },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
       });
 
       if (response.ok) {
         const data = await response.json();
-        return { content: data.choices?.[0]?.message?.content || "" };
+        return { content: data.choices?.[0]?.message?.content || '' };
       }
     }
 
-    throw new Error("No LLM API keys available");
+    throw new Error('No LLM API keys available');
   } catch (err) {
-    console.error("[Insights] LLM call failed:", err.message);
+    console.error('[Insights] LLM call failed:', err.message);
     throw err;
   }
 }
@@ -233,12 +255,12 @@ async function collectGmailMessages(accessToken, sinceTimestamp, contactMappings
     const afterDate = Math.floor(new Date(sinceTimestamp).getTime() / 1000);
     const query = `after:${afterDate}`;
 
-    const url = new URL("https://www.googleapis.com/gmail/v1/users/me/messages");
-    url.searchParams.set("q", query);
-    url.searchParams.set("maxResults", "50"); // Limit to 50 most recent
+    const url = new globalThis.URL('https://www.googleapis.com/gmail/v1/users/me/messages');
+    url.searchParams.set('q', query);
+    url.searchParams.set('maxResults', '50'); // Limit to 50 most recent
 
     const response = await fetch(url.toString(), {
-      headers: { "Authorization": `Bearer ${accessToken}` }
+      headers: { Authorization: `Bearer ${accessToken}` },
     });
 
     if (!response.ok) {
@@ -254,7 +276,7 @@ async function collectGmailMessages(accessToken, sinceTimestamp, contactMappings
       try {
         const msgUrl = `https://www.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`;
         const msgResponse = await fetch(msgUrl, {
-          headers: { "Authorization": `Bearer ${accessToken}` }
+          headers: { Authorization: `Bearer ${accessToken}` },
         });
 
         if (msgResponse.ok) {
@@ -262,9 +284,9 @@ async function collectGmailMessages(accessToken, sinceTimestamp, contactMappings
 
           // Extract headers
           const headers = msgData.payload.headers;
-          const from = headers.find(h => h.name === "From")?.value || "Unknown";
-          const subject = headers.find(h => h.name === "Subject")?.value || "(no subject)";
-          const date = headers.find(h => h.name === "Date")?.value || "";
+          const from = headers.find((h) => h.name === 'From')?.value || 'Unknown';
+          const subject = headers.find((h) => h.name === 'Subject')?.value || '(no subject)';
+          const date = headers.find((h) => h.name === 'Date')?.value || '';
 
           // Extract body
           let body = '';
@@ -273,7 +295,7 @@ async function collectGmailMessages(accessToken, sinceTimestamp, contactMappings
           if (payload.body?.data) {
             body = Buffer.from(payload.body.data, 'base64').toString('utf8');
           } else if (payload.parts) {
-            const textPart = payload.parts.find(p => p.mimeType === 'text/plain');
+            const textPart = payload.parts.find((p) => p.mimeType === 'text/plain');
             if (textPart?.body?.data) {
               body = Buffer.from(textPart.body.data, 'base64').toString('utf8');
             }
@@ -286,12 +308,12 @@ async function collectGmailMessages(accessToken, sinceTimestamp, contactMappings
           const resolvedFrom = resolveContact(from, contactMappings);
 
           messages.push({
-            platform: "Gmail",
+            platform: 'Gmail',
             from: resolvedFrom,
             subject,
             body: cleanBody.substring(0, 1000),
             timestamp: date || sinceTimestamp,
-            snippet: cleanBody.substring(0, 200)
+            snippet: cleanBody.substring(0, 200),
           });
         }
       } catch (msgErr) {
@@ -299,7 +321,7 @@ async function collectGmailMessages(accessToken, sinceTimestamp, contactMappings
       }
     }
   } catch (err) {
-    console.error("[Insights] Error collecting Gmail messages:", err);
+    console.error('[Insights] Error collecting Gmail messages:', err);
   }
 
   return messages;
@@ -316,8 +338,8 @@ async function collectSlackMessages(accessToken, sinceTimestamp, contactMappings
 
     // Get list of conversations (channels + DMs)
     const convoResponse = await fetch(
-      "https://slack.com/api/conversations.list?types=public_channel,private_channel,mpim,im&limit=100",
-      { headers: { "Authorization": `Bearer ${accessToken}` } }
+      'https://slack.com/api/conversations.list?types=public_channel,private_channel,mpim,im&limit=100',
+      { headers: { Authorization: `Bearer ${accessToken}` } }
     );
 
     if (!convoResponse.ok) {
@@ -331,11 +353,12 @@ async function collectSlackMessages(accessToken, sinceTimestamp, contactMappings
     }
 
     // Fetch messages from each conversation
-    for (const channel of convoData.channels.slice(0, 20)) { // Limit to 20 most recent conversations
+    for (const channel of convoData.channels.slice(0, 20)) {
+      // Limit to 20 most recent conversations
       try {
         const historyUrl = `https://slack.com/api/conversations.history?channel=${channel.id}&oldest=${afterTime}&limit=20`;
         const historyResponse = await fetch(historyUrl, {
-          headers: { "Authorization": `Bearer ${accessToken}` }
+          headers: { Authorization: `Bearer ${accessToken}` },
         });
 
         if (historyResponse.ok) {
@@ -343,17 +366,18 @@ async function collectSlackMessages(accessToken, sinceTimestamp, contactMappings
 
           if (historyData.ok && historyData.messages) {
             for (const msg of historyData.messages) {
-              if (msg.text && !msg.bot_id) { // Skip bot messages
+              if (msg.text && !msg.bot_id) {
+                // Skip bot messages
                 // Resolve contact to name if possible
-                const resolvedFrom = resolveContact(msg.user || "Unknown", contactMappings);
+                const resolvedFrom = resolveContact(msg.user || 'Unknown', contactMappings);
 
                 messages.push({
-                  platform: "Slack",
+                  platform: 'Slack',
                   from: resolvedFrom,
-                  subject: channel.name || "Direct Message",
+                  subject: channel.name || 'Direct Message',
                   body: msg.text,
                   timestamp: new Date(parseFloat(msg.ts) * 1000).toISOString(),
-                  snippet: msg.text.substring(0, 200)
+                  snippet: msg.text.substring(0, 200),
                 });
               }
             }
@@ -364,7 +388,7 @@ async function collectSlackMessages(accessToken, sinceTimestamp, contactMappings
       }
     }
   } catch (err) {
-    console.error("[Insights] Error collecting Slack messages:", err);
+    console.error('[Insights] Error collecting Slack messages:', err);
   }
 
   return messages;
@@ -377,7 +401,7 @@ async function collectIMessages(sinceTimestamp, contactMappings = {}) {
   const messages = [];
 
   try {
-    const { execSync } = require("child_process");
+    const { execSync } = require('child_process');
     const afterDate = Math.floor(new Date(sinceTimestamp).getTime() / 1000000000) + 978307200; // macOS epoch offset
 
     // Query iMessage database
@@ -396,31 +420,31 @@ async function collectIMessages(sinceTimestamp, contactMappings = {}) {
     `;
 
     const dbPath = `${process.env.HOME}/Library/Messages/chat.db`;
-    const result = execSync(
-      `sqlite3 "${dbPath}" "${query.replace(/\n/g, ' ')}"`,
-      { encoding: 'utf8', timeout: 5000 }
-    );
+    const result = execSync(`sqlite3 "${dbPath}" "${query.replace(/\n/g, ' ')}"`, {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
 
     const lines = result.trim().split('\n');
     for (const line of lines) {
       const [contact, text, timestamp] = line.split('|');
       if (text && text.trim()) {
         // Resolve contact to name if possible
-        const resolvedFrom = resolveContact(contact || "Unknown", contactMappings);
+        const resolvedFrom = resolveContact(contact || 'Unknown', contactMappings);
 
         messages.push({
-          platform: "iMessage",
+          platform: 'iMessage',
           from: resolvedFrom,
-          subject: "iMessage",
+          subject: 'iMessage',
           body: text,
           timestamp: timestamp || sinceTimestamp,
-          snippet: text.substring(0, 200)
+          snippet: text.substring(0, 200),
         });
       }
     }
   } catch (err) {
     // iMessage collection may fail on non-macOS or if permissions aren't granted
-    console.log("[Insights] iMessage collection not available:", err.message);
+    console.log('[Insights] iMessage collection not available:', err.message);
   }
 
   return messages;
@@ -475,23 +499,25 @@ async function collectWebScraperMessages(username, sinceTimestamp, contactMappin
           );
 
           // Filter messages since timestamp
-          const newMessages = result.messages.filter(m =>
-            new Date(m.timestamp) > new Date(sinceTimestamp)
+          const newMessages = result.messages.filter(
+            (m) => new Date(m.timestamp) > new Date(sinceTimestamp)
           );
 
           // Resolve contacts
-          const resolvedMessages = newMessages.map(m => ({
+          const resolvedMessages = newMessages.map((m) => ({
             ...m,
-            from: resolveContact(m.from, contactMappings)
+            from: resolveContact(m.from, contactMappings),
           }));
 
           messages.push(...resolvedMessages);
-          console.log(`[Insights] Collected ${newMessages.length} messages from ${siteConfig.name}`);
+          console.log(
+            `[Insights] Collected ${newMessages.length} messages from ${siteConfig.name}`
+          );
 
           // Update success status
           await configManager.updateStatus(username, siteConfig.id, {
             lastSuccess: new Date().toISOString(),
-            consecutiveFailures: 0
+            consecutiveFailures: 0,
           });
         } else {
           console.error(`[Insights] Failed to scrape ${siteConfig.name}:`, result.error);
@@ -502,22 +528,29 @@ async function collectWebScraperMessages(username, sinceTimestamp, contactMappin
             expiredOAuthSites.push({
               siteId: siteConfig.id,
               siteName: siteConfig.name,
-              authMethod: siteConfig.authMethod
+              authMethod: siteConfig.authMethod,
             });
           }
 
           // 🔄 FALL BACK TO CACHED MESSAGES
-          const cached = await webMessages.loadMessagesSince(username, siteConfig.id, sinceTimestamp, 7);
+          const cached = await webMessages.loadMessagesSince(
+            username,
+            siteConfig.id,
+            sinceTimestamp,
+            7
+          );
 
           if (cached.length > 0) {
-            console.log(`[Insights] Using ${cached.length} cached messages from ${siteConfig.name}`);
+            console.log(
+              `[Insights] Using ${cached.length} cached messages from ${siteConfig.name}`
+            );
 
             // Mark messages as cached
-            const cachedMessages = cached.map(m => ({
+            const cachedMessages = cached.map((m) => ({
               ...m,
               from: resolveContact(m.from, contactMappings),
               _cached: true,
-              _cacheAge: Date.now() - new Date(m.scrapedAt || m.timestamp).getTime()
+              _cacheAge: Date.now() - new Date(m.scrapedAt || m.timestamp).getTime(),
             }));
 
             messages.push(...cachedMessages);
@@ -526,16 +559,20 @@ async function collectWebScraperMessages(username, sinceTimestamp, contactMappin
           // Update error status
           const consecutiveFailures = (siteConfig.status?.consecutiveFailures || 0) + 1;
           // Don't auto-pause OAuth sites on session expiry - notify user instead
-          const shouldPause = result.requiresManualLogin ? false : errors.shouldAutoPause(result.errorType, consecutiveFailures);
+          const shouldPause = result.requiresManualLogin
+            ? false
+            : errors.shouldAutoPause(result.errorType, consecutiveFailures);
 
           await configManager.updateStatus(username, siteConfig.id, {
             lastError: result.error,
             consecutiveFailures,
-            paused: shouldPause
+            paused: shouldPause,
           });
 
           if (shouldPause) {
-            console.log(`[Insights] Auto-paused ${siteConfig.name} after ${consecutiveFailures} failures`);
+            console.log(
+              `[Insights] Auto-paused ${siteConfig.name} after ${consecutiveFailures} failures`
+            );
           }
         }
       } catch (err) {
@@ -543,19 +580,29 @@ async function collectWebScraperMessages(username, sinceTimestamp, contactMappin
 
         // 🔄 ALWAYS ATTEMPT CACHE RECOVERY ON ERROR
         try {
-          const cached = await webMessages.loadMessagesSince(username, siteConfig.id, sinceTimestamp, 7);
+          const cached = await webMessages.loadMessagesSince(
+            username,
+            siteConfig.id,
+            sinceTimestamp,
+            7
+          );
 
           if (cached.length > 0) {
-            console.log(`[Insights] Recovered ${cached.length} cached messages from ${siteConfig.name}`);
-            const cachedMessages = cached.map(m => ({
+            console.log(
+              `[Insights] Recovered ${cached.length} cached messages from ${siteConfig.name}`
+            );
+            const cachedMessages = cached.map((m) => ({
               ...m,
               from: resolveContact(m.from, contactMappings),
-              _cached: true
+              _cached: true,
             }));
             messages.push(...cachedMessages);
           }
         } catch (cacheErr) {
-          console.error(`[Insights] Could not load cache for ${siteConfig.name}:`, cacheErr.message);
+          console.error(
+            `[Insights] Could not load cache for ${siteConfig.name}:`,
+            cacheErr.message
+          );
         }
 
         // Update error status
@@ -564,7 +611,7 @@ async function collectWebScraperMessages(username, sinceTimestamp, contactMappin
         await configManager.updateStatus(username, siteConfig.id, {
           lastError: err.message,
           consecutiveFailures,
-          paused: consecutiveFailures >= 3
+          paused: consecutiveFailures >= 3,
         });
       }
     }
@@ -576,14 +623,16 @@ async function collectWebScraperMessages(username, sinceTimestamp, contactMappin
   if (expiredOAuthSites.length > 0) {
     try {
       const { BrowserWindow } = require('electron');
-      const mainWindow = BrowserWindow.getAllWindows().find(w => !w.isDestroyed());
+      const mainWindow = BrowserWindow.getAllWindows().find((w) => !w.isDestroyed());
 
       if (mainWindow) {
         mainWindow.webContents.send('webscraper:oauthExpired', {
           sites: expiredOAuthSites,
-          message: `Session expired for ${expiredOAuthSites.length} OAuth integration(s). Please log in again.`
+          message: `Session expired for ${expiredOAuthSites.length} OAuth integration(s). Please log in again.`,
         });
-        console.log(`[Insights] Sent OAuth expiry notification for ${expiredOAuthSites.length} site(s)`);
+        console.log(
+          `[Insights] Sent OAuth expiry notification for ${expiredOAuthSites.length} site(s)`
+        );
       }
     } catch (notificationErr) {
       console.error('[Insights] Error sending OAuth expiry notification:', notificationErr);
@@ -608,22 +657,30 @@ const collectNewMessages = async (username, accessTokens, sinceTimestamp, contac
   // Collect Gmail messages
   if (accessTokens.google) {
     try {
-      const gmailMessages = await collectGmailMessages(accessTokens.google, sinceTimestamp, contactMappings);
+      const gmailMessages = await collectGmailMessages(
+        accessTokens.google,
+        sinceTimestamp,
+        contactMappings
+      );
       allMessages.push(...gmailMessages);
       console.log(`[Insights] Collected ${gmailMessages.length} Gmail messages`);
     } catch (err) {
-      console.error("[Insights] Error collecting Gmail messages:", err);
+      console.error('[Insights] Error collecting Gmail messages:', err);
     }
   }
 
   // Collect Slack messages
   if (accessTokens.slack) {
     try {
-      const slackMessages = await collectSlackMessages(accessTokens.slack, sinceTimestamp, contactMappings);
+      const slackMessages = await collectSlackMessages(
+        accessTokens.slack,
+        sinceTimestamp,
+        contactMappings
+      );
       allMessages.push(...slackMessages);
       console.log(`[Insights] Collected ${slackMessages.length} Slack messages`);
     } catch (err) {
-      console.error("[Insights] Error collecting Slack messages:", err);
+      console.error('[Insights] Error collecting Slack messages:', err);
     }
   }
 
@@ -635,7 +692,7 @@ const collectNewMessages = async (username, accessTokens, sinceTimestamp, contac
       allMessages.push(...iMessages);
       console.log(`[Insights] Collected ${iMessages.length} iMessages`);
     } catch (err) {
-      console.error("[Insights] Error collecting iMessages:", err);
+      console.error('[Insights] Error collecting iMessages:', err);
     }
   } else {
     console.log('[Insights] iMessage integration disabled, skipping collection');
@@ -647,7 +704,7 @@ const collectNewMessages = async (username, accessTokens, sinceTimestamp, contac
     allMessages.push(...webMessages);
     console.log(`[Insights] Collected ${webMessages.length} custom web messages`);
   } catch (err) {
-    console.error("[Insights] Error collecting web messages:", err);
+    console.error('[Insights] Error collecting web messages:', err);
   }
 
   // Sort by timestamp
@@ -672,13 +729,17 @@ const extractFactsFromMessages = async (messages, apiKeys, userGoals = []) => {
   console.log(`[Insights] Extracting facts from ${messages.length} messages`);
 
   // Prepare messages for LLM
-  const messagesText = messages.map(m =>
-    `[${m.platform}] From: ${m.from}\nSubject: ${m.subject}\nTime: ${m.timestamp}\n${m.body || m.snippet}`
-  ).join("\n\n---\n\n");
+  const messagesText = messages
+    .map(
+      (m) =>
+        `[${m.platform}] From: ${m.from}\nSubject: ${m.subject}\nTime: ${m.timestamp}\n${m.body || m.snippet}`
+    )
+    .join('\n\n---\n\n');
 
-  const goalsContext = userGoals.length > 0
-    ? `\n\nUser's Current Goals and Priorities:\n${userGoals.map(g => `- ${g}`).join('\n')}`
-    : '';
+  const goalsContext =
+    userGoals.length > 0
+      ? `\n\nUser's Current Goals and Priorities:\n${userGoals.map((g) => `- ${g}`).join('\n')}`
+      : '';
 
   const prompt = `You are analyzing messages to extract important facts. Pay special attention to information related to the user's goals.${goalsContext}
 
@@ -721,27 +782,26 @@ Return a JSON object with this structure:
 }`;
 
   try {
-    const response = await callLLM(
-      [{ role: "user", content: prompt }],
-      apiKeys,
-      { temperature: 0.3, response_format: { type: "json_object" } }
-    );
+    const response = await callLLM([{ role: 'user', content: prompt }], apiKeys, {
+      temperature: 0.3,
+      response_format: { type: 'json_object' },
+    });
 
     const cleanContent = stripMarkdownCodeBlocks(response.content);
     let facts;
     try {
       facts = JSON.parse(cleanContent);
     } catch (parseErr) {
-      console.error("[Insights] Failed to parse fact extraction response as JSON");
-      console.error("[Insights] Raw response:", response.content.substring(0, 500));
-      console.error("[Insights] Cleaned content:", cleanContent.substring(0, 500));
-      console.error("[Insights] Parse error:", parseErr.message);
+      console.error('[Insights] Failed to parse fact extraction response as JSON');
+      console.error('[Insights] Raw response:', response.content.substring(0, 500));
+      console.error('[Insights] Cleaned content:', cleanContent.substring(0, 500));
+      console.error('[Insights] Parse error:', parseErr.message);
       return [];
     }
     console.log(`[Insights] Extracted ${facts.facts?.length || 0} facts`);
     return facts.facts || [];
   } catch (err) {
-    console.error("[Insights] Error extracting facts:", err);
+    console.error('[Insights] Error extracting facts:', err);
     return [];
   }
 };
@@ -757,27 +817,37 @@ Return a JSON object with this structure:
  * @param {number} limit - Number of top insights to return for display (default 5, analysis is not limited)
  * @returns {Promise<Array>} Array of top N prioritized insights (from full analysis)
  */
-const crossCheckWithHistory = async (extractedFacts, username, apiKeys, userGoals = [], limit = 5) => {
+const crossCheckWithHistory = async (
+  extractedFacts,
+  username,
+  apiKeys,
+  userGoals = [],
+  limit = 5
+) => {
   if (extractedFacts.length === 0) {
     return [];
   }
 
-  console.log(`[Insights] Cross-checking facts with 7-day history (will select top ${limit} insights)`);
+  console.log(
+    `[Insights] Cross-checking facts with 7-day history (will select top ${limit} insights)`
+  );
 
   // Load recent memory
   const recentMemories = await loadRecentHistory(username, 7);
 
-  const factsText = extractedFacts.map(f =>
-    `[${f.type}] ${f.content} (From: ${f.from || 'Unknown'} via ${f.platform || 'Unknown'}, Priority: ${f.priority}${f.relatedGoal ? ', Goal: ' + f.relatedGoal : ''})`
-  ).join("\n");
+  const factsText = extractedFacts
+    .map(
+      (f) =>
+        `[${f.type}] ${f.content} (From: ${f.from || 'Unknown'} via ${f.platform || 'Unknown'}, Priority: ${f.priority}${f.relatedGoal ? ', Goal: ' + f.relatedGoal : ''})`
+    )
+    .join('\n');
 
-  const memoriesText = recentMemories.map(m =>
-    `--- ${m.date} ---\n${m.content}`
-  ).join("\n\n");
+  const memoriesText = recentMemories.map((m) => `--- ${m.date} ---\n${m.content}`).join('\n\n');
 
-  const goalsContext = userGoals.length > 0
-    ? `\n\nUser's Current Goals and Priorities:\n${userGoals.map(g => `- ${g}`).join('\n')}`
-    : '';
+  const goalsContext =
+    userGoals.length > 0
+      ? `\n\nUser's Current Goals and Priorities:\n${userGoals.map((g) => `- ${g}`).join('\n')}`
+      : '';
 
   const currentDateTime = new Date().toISOString();
   const currentDateFormatted = new Date().toLocaleString('en-US', {
@@ -786,7 +856,7 @@ const crossCheckWithHistory = async (extractedFacts, username, apiKeys, userGoal
     month: 'long',
     day: 'numeric',
     hour: '2-digit',
-    minute: '2-digit'
+    minute: '2-digit',
   });
 
   const prompt = `You are analyzing recent facts against historical context to identify important issues. Prioritize insights that relate to the user's goals.${goalsContext}
@@ -844,28 +914,25 @@ Return a JSON object with ALL insights sorted by priority (highest priority firs
 Remember: Return ALL insights you identify, sorted by priority. Don't limit your analysis!`;
 
   try {
-    const response = await callLLM(
-      [{ role: "user", content: prompt }],
-      apiKeys,
-      { temperature: 0.4, response_format: { type: "json_object" } }
-    );
+    const response = await callLLM([{ role: 'user', content: prompt }], apiKeys, {
+      temperature: 0.4,
+      response_format: { type: 'json_object' },
+    });
 
     const cleanContent = stripMarkdownCodeBlocks(response.content);
     let result;
     try {
       result = JSON.parse(cleanContent);
     } catch (parseErr) {
-      console.error("[Insights] Failed to parse LLM response as JSON");
-      console.error("[Insights] Raw response:", response.content.substring(0, 500));
-      console.error("[Insights] Cleaned content:", cleanContent.substring(0, 500));
+      console.error('[Insights] Failed to parse LLM response as JSON');
+      console.error('[Insights] Raw response:', response.content.substring(0, 500));
+      console.error('[Insights] Cleaned content:', cleanContent.substring(0, 500));
       throw new Error(`JSON parse error: ${parseErr.message}`);
     }
     const insights = result.insights || [];
 
-    const now = new Date();
-
     // Filter out insights about past events
-    const futureRelevantInsights = insights.filter(insight => {
+    const futureRelevantInsights = insights.filter((insight) => {
       // Check if the title or description mentions a past date
       const text = `${insight.title} ${insight.description}`.toLowerCase();
 
@@ -878,11 +945,11 @@ Remember: Return ALL insights you identify, sorted by priority. Don't limit your
         'previous',
         'already happened',
         'occurred',
-        'was scheduled'
+        'was scheduled',
       ];
 
       // If it contains past indicators, it might be about a past event
-      const hasPastIndicator = pastIndicators.some(indicator => text.includes(indicator));
+      const hasPastIndicator = pastIndicators.some((indicator) => text.includes(indicator));
 
       if (hasPastIndicator) {
         console.log(`[Insights] Filtering out past event: ${insight.title}`);
@@ -893,15 +960,17 @@ Remember: Return ALL insights you identify, sorted by priority. Don't limit your
     });
 
     // Select only top N insights based on user's display preference
-    const topInsights = futureRelevantInsights.slice(0, limit).map(insight => ({
+    const topInsights = futureRelevantInsights.slice(0, limit).map((insight) => ({
       ...insight,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     }));
 
-    console.log(`[Insights] Found ${insights.length} total insights, filtered ${insights.length - futureRelevantInsights.length} past events, returning top ${topInsights.length} of ${futureRelevantInsights.length}`);
+    console.log(
+      `[Insights] Found ${insights.length} total insights, filtered ${insights.length - futureRelevantInsights.length} past events, returning top ${topInsights.length} of ${futureRelevantInsights.length}`
+    );
     return topInsights;
   } catch (err) {
-    console.error("[Insights] Error cross-checking:", err);
+    console.error('[Insights] Error cross-checking:', err);
     return [];
   }
 };
@@ -926,7 +995,7 @@ const processMessagesAndGenerateInsights = async (
   userGoals = [],
   limit = 5
 ) => {
-  console.log("[Insights] Starting insights generation pipeline");
+  console.log('[Insights] Starting insights generation pipeline');
   console.log(`[Insights] User has ${userGoals.length} goals, limit: ${limit}`);
 
   try {
@@ -934,18 +1003,25 @@ const processMessagesAndGenerateInsights = async (
     let contactMappings = {};
     try {
       const profilePath = await getUserProfilePath(username);
-      const profileContent = await fs.readFile(profilePath, "utf8");
+      const profileContent = await fs.readFile(profilePath, 'utf8');
       contactMappings = extractContactMappings(profileContent);
-      console.log(`[Insights] Extracted ${Object.keys(contactMappings).length} contact mappings from profile`);
+      console.log(
+        `[Insights] Extracted ${Object.keys(contactMappings).length} contact mappings from profile`
+      );
     } catch (profileErr) {
-      console.log("[Insights] Could not load contact mappings:", profileErr.message);
+      console.log('[Insights] Could not load contact mappings:', profileErr.message);
     }
 
     // Stage 1: Collect messages with contact resolution
-    const messages = await collectNewMessages(username, accessTokens, sinceTimestamp, contactMappings);
+    const messages = await collectNewMessages(
+      username,
+      accessTokens,
+      sinceTimestamp,
+      contactMappings
+    );
 
     if (messages.length === 0) {
-      console.log("[Insights] No new messages to process");
+      console.log('[Insights] No new messages to process');
       return [];
     }
 
@@ -957,17 +1033,17 @@ const processMessagesAndGenerateInsights = async (
       await saveFactToDaily(
         username,
         fact.content,
-        messages.find(m => m.timestamp === fact.timestamp)?.platform || "message"
+        messages.find((m) => m.timestamp === fact.timestamp)?.platform || 'message'
       );
     }
 
     // Stage 3: Cross-check with history (goal-prioritized)
     const insights = await crossCheckWithHistory(facts, username, apiKeys, userGoals, limit);
 
-    console.log("[Insights] Pipeline complete");
+    console.log('[Insights] Pipeline complete');
     return insights;
   } catch (err) {
-    console.error("[Insights] Error in processing pipeline:", err);
+    console.error('[Insights] Error in processing pipeline:', err);
     throw err;
   }
 };
@@ -976,5 +1052,5 @@ export {
   collectNewMessages,
   extractFactsFromMessages,
   crossCheckWithHistory,
-  processMessagesAndGenerateInsights
+  processMessagesAndGenerateInsights,
 };

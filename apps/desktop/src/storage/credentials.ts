@@ -38,7 +38,6 @@ export interface CredentialResolutionResult {
 let _safeStorage: SafeStorage | null = null;
 const getSafeStorage = (): SafeStorage => {
   if (!_safeStorage) {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     _safeStorage = require('electron').safeStorage as SafeStorage;
   }
   return _safeStorage!; // Assert non-null after assignment
@@ -130,7 +129,10 @@ export const getAvailableCredentialDomains = async (username: string): Promise<s
  * @param credentials - Credentials object to save
  * @param username - Username for user-specific credentials
  */
-export const saveCredentials = async (credentials: Credentials, username: string): Promise<void> => {
+export const saveCredentials = async (
+  credentials: Credentials,
+  username: string
+): Promise<void> => {
   const credentialsPath = await getCredentialsPath(username);
 
   try {
@@ -138,7 +140,7 @@ export const saveCredentials = async (credentials: Credentials, username: string
       console.warn('[Credentials] Encryption not available - storing with basic protection');
       // Fallback: store as JSON but with restricted permissions
       await fs.writeFile(credentialsPath + '.json', JSON.stringify(credentials, null, 2), {
-        mode: 0o600 // Owner read/write only
+        mode: 0o600, // Owner read/write only
       });
       credentialsCache.set(username, credentials);
       return;
@@ -276,7 +278,10 @@ export const resolveCredentialPlaceholders = async (
  * @param credentials - Array of credential objects to check against
  * @returns True if safe (no credentials found), false if credentials detected
  */
-export const validateNoCredentialLeakage = (text: string, credentials: Credential[] = []): boolean => {
+export const validateNoCredentialLeakage = (
+  text: string,
+  credentials: Credential[] = []
+): boolean => {
   if (!text || typeof text !== 'string') return true;
 
   // Check each stored credential's password and username

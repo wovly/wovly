@@ -53,7 +53,10 @@ export class OAuthLoginHandler {
    * @param options - Login options
    * @returns Login result
    */
-  async launchManualLogin(siteConfig: SiteConfig, options: LoginOptions = {}): Promise<LoginResult> {
+  async launchManualLogin(
+    siteConfig: SiteConfig,
+    options: LoginOptions = {}
+  ): Promise<LoginResult> {
     console.warn(`[OAuthLogin] Starting manual login for ${siteConfig.name}`);
 
     const page = await this.browser.newPage({
@@ -122,7 +125,6 @@ export class OAuthLoginHandler {
    * @param siteConfig - Site configuration
    */
   private async injectInstructionOverlay(page: Page, siteConfig: SiteConfig): Promise<void> {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await page.evaluate((siteName: any) => {
       // @ts-expect-error - document available in browser context
       const overlay = document.createElement('div');
@@ -209,7 +211,7 @@ export class OAuthLoginHandler {
     });
 
     // Attach event listeners (browser context code)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     await page.evaluate(() => {
       // @ts-expect-error - document and window available in browser context
       document.getElementById('wovly-oauth-done')?.addEventListener('click', () => {

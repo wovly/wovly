@@ -125,29 +125,21 @@ export async function generateSelectorsWithAI(
     });
 
     // Extract simplified HTML (browser context code)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     const html = (await page.evaluate(() => {
       // @ts-expect-error - document available in browser context
       const clone = document.documentElement.cloneNode(true);
 
       // Remove scripts, styles, and other non-essential elements
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
       clone.querySelectorAll('script, style, noscript, svg, img').forEach((el: any) => el.remove());
 
       // Simplify by removing most attributes except important ones
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
       clone.querySelectorAll('*').forEach((el: any) => {
-        const importantAttrs = [
-          'id',
-          'class',
-          'name',
-          'type',
-          'role',
-          'placeholder',
-          'aria-label',
-        ];
+        const importantAttrs = ['id', 'class', 'name', 'type', 'role', 'placeholder', 'aria-label'];
         const attrs = Array.from(el.attributes);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
         attrs.forEach((attr: any) => {
           if (!importantAttrs.includes(attr.name)) {
             el.removeAttribute(attr.name);
@@ -510,7 +502,7 @@ function parseAndValidateSelectors(response: string): GeneratedSelectors {
     }
 
     // Parse JSON
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     const parsed = JSON.parse(jsonStr) as any;
 
     // Validate structure
