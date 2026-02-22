@@ -1,6 +1,6 @@
 # Wovly
 
-**Your Autonomous Personal AI Communication Assistant**
+**Wovly: The Private Assistant That Focuses on What Matters Most**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Platform-macOS-blue)](https://github.com/wovly/wovly)
@@ -8,7 +8,11 @@
 [![Electron](https://img.shields.io/badge/Electron-Latest-47848F)](https://www.electronjs.org/)
 [![Documentation](https://img.shields.io/badge/Docs-wovly.mintlify.app-blue.svg)](https://wovly.mintlify.app/)
 
-A privacy-first desktop AI communication assistant that manages your contacts, follow ups, chat analysis, and remembers context across Email, Slack, iMessage, WhatsApp, Telegram, and more.
+Between endless emails, texts, and portal notifications, it’s easy to miss what's important. Wovly fixes this by focusing entirely on your goals. Tell it what matters—like "never miss a school event"—and it filters the noise to highlight only the insights that impact you.
+
+Wovly securely connects to your main communication apps like gmail, imessage, slack and even bespoke websites (like childcare or accountant portals) to gather crucial information.
+
+Beyond insights, Wovly takes action. Just say, "Schedule a meeting with Pam next week to discuss daycare." Wovly handles the email outreach in your natural voice, manages follow-ups, and finalizes the calendar invite automatically.
 
 > **🚧 Beta Notice:** Wovly is currently in beta. We appreciate your feedback! Please [report bugs and request features](https://github.com/wovly/wovly/issues) on GitHub.
 >
