@@ -252,6 +252,79 @@ const TOOLS_REQUIRING_CONFIRMATION = [
 ];
 
 /**
+ * Load a setting from user's settings.json
+ */
+async function loadSetting(username, key, defaultValue = null) {
+  try {
+    const settingsPath = await getSettingsPath(username);
+    const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+    const keys = key.split('.');
+    let value = settings;
+    for (const k of keys) {
+      if (value && typeof value === 'object' && k in value) {
+        value = value[k];
+      } else {
+        return defaultValue;
+      }
+    }
+    return value ?? defaultValue;
+  } catch (err) {
+    console.log(`[Settings] Failed to load setting ${key}:`, err.message);
+    return defaultValue;
+  }
+}
+
+/**
+ * Save a setting to user's settings.json
+ */
+async function saveSetting(username, key, value) {
+  try {
+    const settingsPath = await getSettingsPath(username);
+    let settings = {};
+    try {
+      settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+    } catch {}
+    settings[key] = value;
+    await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
+  } catch (err) {
+    console.error(`[Settings] Failed to save setting ${key}:`, err.message);
+    throw err;
+  }
+}
+
+/**
+ * Platform-specific handlers for sending follow-up messages
+ */
+const followupPlatformHandlers = {
+  slack: async (contact, message, conversationId, username) => {
+    const slackAccessToken = await getSlackAccessToken(username);
+    if (!slackAccessToken) {
+      return { success: false, error: "Slack credentials not available for follow-up" };
+    }
+    const { postMessage } = require("./src/integrations/slack-integration");
+    return await postMessage(slackAccessToken, conversationId || contact, message);
+  },
+
+  telegram: async (contact, message, conversationId, username) => {
+    const telegramBotToken = await loadSetting(username, 'telegramBotToken', null);
+    if (!telegramBotToken) {
+      return { success: false, error: "Telegram credentials not available for follow-up" };
+    }
+    const { sendMessage: sendTelegramMessage } = require("./src/integrations/telegram-integration");
+    return await sendTelegramMessage(telegramBotToken, conversationId || contact, message);
+  },
+
+  discord: async (contact, message, conversationId, username) => {
+    const discordAccessToken = await loadSetting(username, 'discordTokens.access_token', null);
+    if (!discordAccessToken) {
+      return { success: false, error: "Discord credentials not available for follow-up" };
+    }
+    const { sendMessage: sendDiscordMessage } = require("./src/integrations/discord-integration");
+    return await sendDiscordMessage(discordAccessToken, conversationId || contact, message);
+  }
+};
+
+/**
  * Build a human-readable preview for a message tool
  * @param {string} toolName - The tool being called
  * @param {Object} toolInput - The tool input parameters
@@ -745,55 +818,21 @@ async function sendFollowupMessage(params, username) {
         break;
       }
       
-      case "slack": {
-        // Get Slack access token using the correct function
-        const slackAccessToken = await getSlackAccessToken(username);
-        if (!slackAccessToken) {
-          return { success: false, error: "Slack credentials not available for follow-up" };
-        }
-        
-        const { postMessage } = require("./src/integrations/slack-integration");
-        // For Slack, the conversationId is the channel/DM ID
-        result = await postMessage(slackAccessToken, conversationId || contact, message);
-        break;
-      }
-      
-      case "telegram": {
-        // Get Telegram bot token from settings
-        const settingsPath = await getSettingsPath(username);
-        let telegramBotToken = null;
-        try {
-          const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-          telegramBotToken = settings.telegramBotToken;
-        } catch { /* No settings */ }
-        
-        if (!telegramBotToken) {
-          return { success: false, error: "Telegram credentials not available for follow-up" };
-        }
-        
-        const { sendMessage: sendTelegramMessage } = require("./src/integrations/telegram-integration");
-        result = await sendTelegramMessage(telegramBotToken, conversationId || contact, message);
-        break;
-      }
-      
+      case "slack":
+      case "telegram":
       case "discord": {
-        // Get Discord access token from settings
-        const settingsPath = await getSettingsPath(username);
-        let discordAccessToken = null;
-        try {
-          const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-          discordAccessToken = settings.discordTokens?.access_token;
-        } catch { /* No settings */ }
-        
-        if (!discordAccessToken) {
-          return { success: false, error: "Discord credentials not available for follow-up" };
+        // Use platform dispatch table
+        const handler = followupPlatformHandlers[platform];
+        if (!handler) {
+          return { success: false, error: `Unknown platform: ${platform}` };
         }
-        
-        const { sendMessage: sendDiscordMessage } = require("./src/integrations/discord-integration");
-        result = await sendDiscordMessage(discordAccessToken, conversationId || contact, message);
+        result = await handler(contact, message, conversationId, username);
+        if (!result.success) {
+          return result;
+        }
         break;
       }
-      
+
       default:
         return { success: false, error: `Unknown platform: ${platform}` };
     }
@@ -809,6 +848,146 @@ async function sendFollowupMessage(params, username) {
     return { success: false, error: err.message };
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Web Scraper Scheduler
+// ─────────────────────────────────────────────────────────────────────────────
+
+let webScraperSchedulerInterval = null;
+let webScraperCheckRunning = false;
+
+const runWebScraperCheck = async () => {
+  try {
+    // Prevent concurrent executions
+    if (webScraperCheckRunning) {
+      console.log("[WebScraper] Check already running, skipping duplicate request");
+      return;
+    }
+
+    webScraperCheckRunning = true;
+
+    if (!currentUser?.username) {
+      console.log("[WebScraper] No user logged in, skipping scraper check");
+      webScraperCheckRunning = false;
+      return;
+    }
+
+    console.log("[WebScraper] Running scheduled scrape for custom integrations");
+
+    const { config: configManager, WebScraper } = require("./dist/webscraper/index");
+    const { getBrowserController } = require("./dist/browser");
+
+    // Get all integrations for current user
+    const integrations = await configManager.listIntegrations(currentUser.username);
+
+    if (!integrations || integrations.length === 0) {
+      console.log("[WebScraper] No custom web integrations configured");
+      webScraperCheckRunning = false;
+      return;
+    }
+
+    // Filter for enabled integrations only
+    const enabledIntegrations = integrations.filter(integration =>
+      integration.enabled !== false && integration.sessionType !== 'form'
+    );
+
+    if (enabledIntegrations.length === 0) {
+      console.log("[WebScraper] No enabled integrations to scrape");
+      webScraperCheckRunning = false;
+      return;
+    }
+
+    console.log(`[WebScraper] Found ${enabledIntegrations.length} enabled integration(s) to scrape`);
+
+    // Get browser controller once for all scraping operations
+    const browserController = await getBrowserController(currentUser.username);
+    const scraper = new WebScraper(browserController, currentUser.username);
+
+    let totalMessages = 0;
+    let successCount = 0;
+    let failureCount = 0;
+
+    // Scrape each enabled integration
+    for (const integration of enabledIntegrations) {
+      try {
+        console.log(`[WebScraper] Scraping ${integration.siteName} (${integration.id})...`);
+
+        // Load full config
+        const siteConfig = await configManager.getIntegration(currentUser.username, integration.id);
+
+        if (!siteConfig) {
+          console.warn(`[WebScraper] Config not found for ${integration.id}`);
+          failureCount++;
+          continue;
+        }
+
+        // Run the scraper
+        const result = await scraper.scrapeMessages(siteConfig);
+
+        if (result.success && result.messages) {
+          const messageCount = result.messages.length;
+          totalMessages += messageCount;
+          successCount++;
+          console.log(`[WebScraper] ✓ ${integration.siteName}: ${messageCount} messages scraped`);
+
+          // Save messages to storage
+          if (messageCount > 0) {
+            try {
+              const { saveMessages } = require("./dist/storage/webmessages");
+              const saveResult = await saveMessages(currentUser.username, integration.id, result.messages);
+              console.log(`[WebScraper] Saved ${saveResult.newMessages} new messages from ${integration.siteName}`);
+            } catch (err) {
+              console.error(`[WebScraper] Error saving messages from ${integration.siteName}:`, err.message);
+            }
+          }
+        } else {
+          failureCount++;
+          console.warn(`[WebScraper] ✗ ${integration.siteName}: ${result.error || 'Unknown error'}`);
+        }
+
+      } catch (err) {
+        failureCount++;
+        console.error(`[WebScraper] Error scraping ${integration.siteName}:`, err.message);
+      }
+    }
+
+    console.log(`[WebScraper] Scrape complete: ${successCount} succeeded, ${failureCount} failed, ${totalMessages} total messages`);
+
+    // Notify UI if there were new messages
+    if (totalMessages > 0 && win) {
+      win.webContents.send("webscraper:newMessages", {
+        count: totalMessages,
+        timestamp: Date.now()
+      });
+    }
+
+  } catch (err) {
+    console.error("[WebScraper] Scheduler error:", err.message);
+  } finally {
+    webScraperCheckRunning = false;
+  }
+};
+
+const startWebScraperScheduler = () => {
+  if (webScraperSchedulerInterval) {
+    clearInterval(webScraperSchedulerInterval);
+  }
+
+  console.log("[WebScraper] Starting scraper scheduler (checking every hour)");
+
+  // Run on schedule (every hour)
+  webScraperSchedulerInterval = setInterval(async () => {
+    await runWebScraperCheck();
+  }, 60 * 60 * 1000); // 1 hour
+};
+
+const stopWebScraperScheduler = () => {
+  if (webScraperSchedulerInterval) {
+    clearInterval(webScraperSchedulerInterval);
+    webScraperSchedulerInterval = null;
+    console.log("[WebScraper] Stopped scraper scheduler");
+  }
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Task Scheduler
@@ -1365,10 +1544,7 @@ const startInsightsScheduler = () => {
     let limit = 5; // default
     try {
       if (currentUser?.username) {
-        const settingsPath = await getSettingsPath(currentUser.username);
-        const settingsData = await fs.readFile(settingsPath, "utf8");
-        const settings = JSON.parse(settingsData);
-        limit = settings.insightsLimit || 5;
+        limit = await loadSetting(currentUser.username, 'insightsLimit', 5);
       }
     } catch (err) {
       // Use default if settings not found
@@ -2348,6 +2524,7 @@ app.whenReady().then(async () => {
   startTaskScheduler();
   startMemoryScheduler();
   startInsightsScheduler();
+  startWebScraperScheduler();
 
   // Auto-reconnect WhatsApp if previously connected
   try {
@@ -2737,6 +2914,18 @@ app.whenReady().then(async () => {
     return await IntegrationsService.testIMessage();
   });
 
+  ipcMain.handle("integrations:enableIMessage", async () => {
+    return await IntegrationsService.enableIMessage(currentUser?.username);
+  });
+
+  ipcMain.handle("integrations:disableIMessage", async () => {
+    return await IntegrationsService.disableIMessage(currentUser?.username);
+  });
+
+  ipcMain.handle("integrations:getIMessageStatus", async () => {
+    return await IntegrationsService.getIMessageStatus(currentUser?.username);
+  });
+
   // Weather test handler
   ipcMain.handle("integrations:testWeather", async () => {
     return await IntegrationsService.testWeather();
@@ -2841,18 +3030,17 @@ app.whenReady().then(async () => {
 
       // Run insights check after login (in background)
       (async () => {
-        let limit = 5;
         try {
-          const settingsPath = await getSettingsPath(username);
-          const settingsData = await fs.readFile(settingsPath, "utf8");
-          const settings = JSON.parse(settingsData);
-          limit = settings.insightsLimit || 5;
+          const limit = await loadSetting(username, 'insightsLimit', 5);
+          await runInsightsCheck(limit);
         } catch (err) {
-          // Use default if settings not found
+          console.error("[Insights] Error running initial check:", err.message);
         }
-        await runInsightsCheck(limit);
-      })().catch(err => {
-        console.error("[Insights] Error running initial check:", err.message);
+      })();
+
+      // Run web scraper check after login (in background)
+      runWebScraperCheck().catch(err => {
+        console.error("[WebScraper] Error running initial scrape:", err.message);
       });
     },
     onSessionRestore: async (username) => {
@@ -2868,18 +3056,17 @@ app.whenReady().then(async () => {
 
       // Run insights check in background
       (async () => {
-        let limit = 5;
         try {
-          const settingsPath = await getSettingsPath(username);
-          const settingsData = await fs.readFile(settingsPath, "utf8");
-          const settings = JSON.parse(settingsData);
-          limit = settings.insightsLimit || 5;
+          const limit = await loadSetting(username, 'insightsLimit', 5);
+          await runInsightsCheck(limit);
         } catch (err) {
-          // Use default if settings not found
+          console.error("[Insights] Error running check:", err.message);
         }
-        await runInsightsCheck(limit);
-      })().catch(err => {
-        console.error("[Insights] Error running check:", err.message);
+      })();
+
+      // Run web scraper check in background
+      runWebScraperCheck().catch(err => {
+        console.error("[WebScraper] Error running scrape on session restore:", err.message);
       });
     }
   });
@@ -8352,18 +8539,14 @@ app.whenReady().then(async () => {
           console.log("[Profile] Goals changed, triggering insights refresh");
           // Run insights check in background
           setTimeout(async () => {
-            let limit = 5;
             try {
-              const settingsPath = await getSettingsPath(currentUser.username);
-              const settingsData = await fs.readFile(settingsPath, "utf8");
-              const settings = JSON.parse(settingsData);
-              limit = settings.insightsLimit || 5;
+              const limit = await loadSetting(currentUser.username, 'insightsLimit', 5);
+              runInsightsCheck(limit).catch(err =>
+                console.error("[Profile] Error refreshing insights after goal change:", err)
+              );
             } catch (err) {
-              // Use default if settings not found
+              console.error("[Profile] Error loading settings for insights:", err);
             }
-            runInsightsCheck(limit).catch(err =>
-              console.error("[Profile] Error refreshing insights after goal change:", err)
-            );
           }, 1000);
         }
 

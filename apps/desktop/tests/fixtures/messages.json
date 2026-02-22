@@ -1,0 +1,72 @@
+{
+  "daycareMessages": [
+    {
+      "id": "msg_brightwheel_abc123",
+      "platform": "custom-brightwheel",
+      "from": "Teacher Sarah",
+      "subject": "Brightwheel",
+      "body": "Field trip permission forms are due Friday. Please sign and return.",
+      "timestamp": "2026-02-16T14:30:00.000Z",
+      "snippet": "Field trip permission forms are due Friday",
+      "source": "brightwheel",
+      "scrapedAt": "2026-02-16T23:14:00.000Z"
+    },
+    {
+      "id": "msg_brightwheel_def456",
+      "platform": "custom-brightwheel",
+      "from": "Admin Office",
+      "subject": "Brightwheel",
+      "body": "Reminder: School is closed on Monday, February 18th for President's Day.",
+      "timestamp": "2026-02-15T09:00:00.000Z",
+      "snippet": "Reminder: School is closed on Monday",
+      "source": "brightwheel",
+      "scrapedAt": "2026-02-15T22:00:00.000Z"
+    }
+  ],
+  "taxMessages": [
+    {
+      "id": "msg_turbotax_xyz789",
+      "platform": "custom-turbotax",
+      "from": "TurboTax Support",
+      "subject": "TurboTax",
+      "body": "Your tax return has been submitted successfully. Confirmation number: TX-2026-12345",
+      "timestamp": "2026-02-16T10:15:00.000Z",
+      "snippet": "Your tax return has been submitted successfully",
+      "source": "turbotax",
+      "scrapedAt": "2026-02-16T22:00:00.000Z"
+    }
+  ],
+  "gmailMessages": [
+    {
+      "id": "msg_gmail_aaa111",
+      "platform": "gmail",
+      "from": "john@company.com",
+      "subject": "Project Status Update",
+      "body": "The Q1 project is on track. We'll have the final deliverables ready by next week.",
+      "timestamp": "2026-02-16T16:00:00.000Z",
+      "snippet": "The Q1 project is on track"
+    }
+  ],
+  "slackMessages": [
+    {
+      "id": "msg_slack_bbb222",
+      "platform": "slack",
+      "from": "jane_doe",
+      "subject": "#general",
+      "body": "Team meeting moved to 3pm today",
+      "timestamp": "2026-02-16T11:30:00.000Z",
+      "snippet": "Team meeting moved to 3pm today"
+    }
+  ],
+  "imessages": [
+    {
+      "id": "msg_imsg_ccc333",
+      "platform": "imessage",
+      "from": "+1234567890",
+      "subject": "iMessage",
+      "body": "Running 10 minutes late",
+      "timestamp": "2026-02-16T08:15:00.000Z",
+      "snippet": "Running 10 minutes late"
+    }
+  ]
+}

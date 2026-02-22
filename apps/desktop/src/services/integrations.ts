@@ -9,6 +9,7 @@ import os from 'os';
 
 // Import helper functions
 import { getSettingsPath } from '../utils/helpers';
+import { SettingsService } from './settings';
 
 /**
  * Service response interface
@@ -95,8 +96,76 @@ export class IntegrationsService {
       await fs.access(dbPath);
       return { ok: true, message: 'iMessage database accessible' };
     } catch {
-      return { ok: false, error: 'Cannot access Messages database. Grant Full Disk Access to this app.' };
+      // Detect if running in development (via terminal/npm) vs production (packaged app)
+      const isDev = !require('electron').app.isPackaged;
+      const appName = isDev ? 'Terminal (or your terminal app)' : 'Wovly';
+
+      return {
+        ok: false,
+        error: `Cannot access Messages database. Grant Full Disk Access to ${appName} in System Settings > Privacy & Security > Full Disk Access.`
+      };
     }
+  }
+
+  /**
+   * Enable iMessage integration for current user
+   * @param username - Current username
+   * @returns Success/error response
+   */
+  static async enableIMessage(username: string | null | undefined): Promise<IntegrationsResponse> {
+    // First test if iMessage is accessible
+    const testResult = await this.testIMessage();
+    if (!testResult.ok) {
+      return testResult; // Return error if database not accessible
+    }
+
+    // Enable in settings
+    const settingsResult = await SettingsService.setIMessageEnabled(username, true);
+    if (!settingsResult.ok) {
+      return { ok: false, error: settingsResult.error };
+    }
+
+    return {
+      ok: true,
+      message: 'iMessage integration enabled successfully'
+    };
+  }
+
+  /**
+   * Disable iMessage integration for current user
+   * @param username - Current username
+   * @returns Success/error response
+   */
+  static async disableIMessage(username: string | null | undefined): Promise<IntegrationsResponse> {
+    const settingsResult = await SettingsService.setIMessageEnabled(username, false);
+    if (!settingsResult.ok) {
+      return { ok: false, error: settingsResult.error };
+    }
+
+    return {
+      ok: true,
+      message: 'iMessage integration disabled'
+    };
+  }
+
+  /**
+   * Get iMessage integration status for current user
+   * @param username - Current username
+   * @returns Status object with enabled and accessible flags
+   */
+  static async getIMessageStatus(username: string | null | undefined): Promise<{
+    enabled: boolean;
+    accessible: boolean;
+    error?: string;
+  }> {
+    const enabled = await SettingsService.getIMessageEnabled(username);
+    const testResult = await this.testIMessage();
+
+    return {
+      enabled,
+      accessible: testResult.ok,
+      error: testResult.ok ? undefined : testResult.error
+    };
   }
 
   /**

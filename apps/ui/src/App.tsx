@@ -4772,6 +4772,12 @@ function IntegrationsPage() {
   const [testingWeather, setTestingWeather] = useState(false);
   const [weatherTestResult, setWeatherTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
 
+  // iMessage state
+  const [iMessageEnabled, setIMessageEnabled] = useState(false);
+  const [iMessageAccessible, setIMessageAccessible] = useState(false);
+  const [testingIMessage, setTestingIMessage] = useState(false);
+  const [iMessageTestResult, setIMessageTestResult] = useState<{ ok: boolean; message?: string } | null>(null);
+
   // Browser Automation state (CDP-based)
   const [browserEnabled, setBrowserEnabled] = useState(false);
   const [testingBrowser, setTestingBrowser] = useState(false);
@@ -4967,6 +4973,41 @@ function IntegrationsPage() {
       setBrowserEnabled(newValue);
     } else {
       setBrowserTestResult({ ok: false, message: result?.error || "Failed to toggle" });
+    }
+  };
+
+  const handleTestIMessage = async () => {
+    setTestingIMessage(true);
+    setIMessageTestResult(null);
+    const result = await window.wovly.integrations.testIMessage?.();
+    setIMessageTestResult(result || { ok: false, message: "iMessage test not available" });
+    setTestingIMessage(false);
+  };
+
+  const handleToggleIMessage = async () => {
+    const newValue = !iMessageEnabled;
+    setIMessageTestResult(null);
+
+    if (newValue) {
+      // Enabling - check accessibility first
+      const result = await window.wovly.integrations.enableIMessage?.();
+      if (result?.ok) {
+        setIMessageEnabled(true);
+        setIMessageAccessible(true);
+        setIMessageTestResult({ ok: true, message: "iMessage integration enabled successfully" });
+      } else {
+        // Backend provides detailed error message including correct app name (Terminal vs Wovly)
+        setIMessageTestResult({ ok: false, message: result?.error || "Failed to enable iMessage" });
+      }
+    } else {
+      // Disabling
+      const result = await window.wovly.integrations.disableIMessage?.();
+      if (result?.ok) {
+        setIMessageEnabled(false);
+        setIMessageTestResult({ ok: true, message: "iMessage integration disabled" });
+      } else {
+        setIMessageTestResult({ ok: false, message: result?.error || "Failed to disable" });
+      }
     }
   };
 
@@ -5166,6 +5207,47 @@ function IntegrationsPage() {
               </div>
             )}
           </div>
+
+          {/* iMessage/SMS - Only show on macOS */}
+          {navigator.platform.includes('Mac') && (
+            <div className={`integration-card ${iMessageEnabled ? "connected" : ""}`}>
+              <div className="integration-header">
+                <IMessageIcon className="integration-icon" size={40} />
+                <h3 className="integration-name">iMessage/SMS</h3>
+                <span className={`connection-status ${iMessageEnabled ? "connected" : "disconnected"}`}>
+                  {iMessageEnabled ? "Enabled" : "Disabled"}
+                </span>
+              </div>
+              <p className="integration-description">
+                Access iMessages and SMS from your Mac
+                <span style={{ display: 'block', fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-1)' }}>
+                  Requires Full Disk Access (Terminal in dev, Wovly in production)
+                </span>
+              </p>
+              <div className="integration-actions">
+                {iMessageEnabled ? (
+                  <>
+                    <button className="btn btn-ghost" onClick={handleTestIMessage} disabled={testingIMessage}>
+                      {testingIMessage ? "Testing..." : "Test"}
+                    </button>
+                    <button className="btn btn-secondary" onClick={handleToggleIMessage}>Disable</button>
+                  </>
+                ) : (
+                  <button
+                    className="btn btn-primary"
+                    onClick={handleToggleIMessage}
+                  >
+                    Enable
+                  </button>
+                )}
+              </div>
+              {iMessageTestResult && (
+                <div className={`badge ${iMessageTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                  {iMessageTestResult.ok ? `✓ ${iMessageTestResult.message}` : `✗ ${iMessageTestResult.message}`}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Slack */}
           <div className={`integration-card ${slackConnected ? "connected" : ""}`}>
@@ -6414,7 +6496,7 @@ function SettingsPage() {
         const apiKeys = result.settings.apiKeys as Record<string, string> || {};
         const models = result.settings.models as Record<string, string> || {};
         const provider = result.settings.activeProvider as LLMProvider || "anthropic";
-        
+
         setAnthropicKey(apiKeys.anthropic || "");
         setOpenaiKey(apiKeys.openai || "");
         setGoogleKey(apiKeys.google || "");
@@ -6422,6 +6504,17 @@ function SettingsPage() {
         setOpenaiModel(models.openai || OPENAI_MODELS[0].id);
         setGoogleModel(models.google || GOOGLE_MODELS[0].id);
         setActiveProvider(provider);
+
+        // Load integration settings
+        setWeatherEnabled(result.settings.weatherEnabled !== false);
+        setBrowserEnabled(result.settings.browserEnabled === true);
+        setIMessageEnabled(result.settings.iMessageEnabled === true);
+      }
+
+      // Load iMessage accessibility status
+      const iMessageStatus = await window.wovly.integrations.getIMessageStatus?.();
+      if (iMessageStatus) {
+        setIMessageAccessible(iMessageStatus.accessible);
       }
       setLoading(false);
     };

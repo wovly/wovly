@@ -6,6 +6,7 @@
  */
 
 import type { Page } from 'puppeteer-core';
+import { sanitizeHTMLForLLM, validatePromptNoCredentials } from './security-sanitizer';
 
 // ─────────────────────────────────────────────────────────────────────────
 // Type Definitions
@@ -157,11 +158,17 @@ export async function generateSelectorsWithAI(
       return clone.outerHTML.substring(0, 50000); // Limit to 50k chars for token budget
     })) as string;
 
+    // SECURITY: Sanitize HTML to remove any credential data
+    const sanitizedHTML = sanitizeHTMLForLLM(html);
+
     // Get page URL for context
     const url = page.url();
 
     // Build prompt for LLM
-    const prompt = buildAnalysisPrompt(url, siteType, html);
+    const prompt = buildAnalysisPrompt(url, siteType, sanitizedHTML);
+
+    // SECURITY: Validate prompt doesn't contain credentials
+    validatePromptNoCredentials(prompt);
 
     // Call LLM with vision
     const response = await callLLMWithVision(prompt, screenshot as string, apiKeys);

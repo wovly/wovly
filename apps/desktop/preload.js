@@ -71,6 +71,9 @@ contextBridge.exposeInMainWorld("wovly", {
     testGoogle: () => ipcRenderer.invoke("integrations:testGoogle"),
     testSlack: () => ipcRenderer.invoke("integrations:testSlack"),
     testIMessage: () => ipcRenderer.invoke("integrations:testIMessage"),
+    enableIMessage: () => ipcRenderer.invoke("integrations:enableIMessage"),
+    disableIMessage: () => ipcRenderer.invoke("integrations:disableIMessage"),
+    getIMessageStatus: () => ipcRenderer.invoke("integrations:getIMessageStatus"),
     testWeather: () => ipcRenderer.invoke("integrations:testWeather"),
     startGoogleOAuth: (clientId, clientSecret) => ipcRenderer.invoke("integrations:startGoogleOAuth", { clientId, clientSecret }),
     checkGoogleAuth: () => ipcRenderer.invoke("integrations:checkGoogleAuth"),
@@ -258,6 +261,10 @@ contextBridge.exposeInMainWorld("wovly", {
     testConfiguration: (config) => ipcRenderer.invoke("webscraper:testConfiguration", { config }),
     testIntegration: (siteId) => ipcRenderer.invoke("webscraper:testIntegration", { siteId }),
     launchOAuthLogin: (config) => ipcRenderer.invoke("webscraper:launchOAuthLogin", config),
+    // Credential management (secure, local-only storage)
+    checkCredentials: (domain) => ipcRenderer.invoke("webscraper:checkCredentials", { domain }),
+    saveCredentials: (request) => ipcRenderer.invoke("webscraper:saveCredentials", { request }),
+    deleteCredentials: (domain) => ipcRenderer.invoke("webscraper:deleteCredentials", { domain }),
     onOAuthExpired: (callback) => {
       const handler = (_event, data) => callback(data);
       ipcRenderer.on("webscraper:oauthExpired", handler);

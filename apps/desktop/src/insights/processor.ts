@@ -10,6 +10,7 @@ import { saveFactToDaily } from "../storage/memory";
 import { loadRecentHistory } from "../storage/insights";
 import { getUserProfilePath } from "../storage/profile";
 import type { Insight } from "../storage/insights";
+import { SettingsService } from "../services/settings";
 
 export interface ApiKeys {
   anthropic?: string;
@@ -626,13 +627,18 @@ const collectNewMessages = async (username, accessTokens, sinceTimestamp, contac
     }
   }
 
-  // Collect iMessages
-  try {
-    const iMessages = await collectIMessages(sinceTimestamp, contactMappings);
-    allMessages.push(...iMessages);
-    console.log(`[Insights] Collected ${iMessages.length} iMessages`);
-  } catch (err) {
-    console.error("[Insights] Error collecting iMessages:", err);
+  // Collect iMessages (only if enabled for this user)
+  const iMessageEnabled = await SettingsService.getIMessageEnabled(username);
+  if (iMessageEnabled) {
+    try {
+      const iMessages = await collectIMessages(sinceTimestamp, contactMappings);
+      allMessages.push(...iMessages);
+      console.log(`[Insights] Collected ${iMessages.length} iMessages`);
+    } catch (err) {
+      console.error("[Insights] Error collecting iMessages:", err);
+    }
+  } else {
+    console.log('[Insights] iMessage integration disabled, skipping collection');
   }
 
   // Collect from custom web integrations

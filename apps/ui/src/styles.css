@@ -3446,21 +3446,23 @@ button {
 }
 
 .integration-card {
-  background: var(--bg-primary);
+  background: var(--bg-elevated);
   border: 1px solid var(--border-primary);
   border-radius: var(--radius-lg);
   padding: var(--space-5);
   transition: all var(--transition-fast);
+  box-shadow: var(--shadow-sm);
 }
 
 .integration-card:hover {
   border-color: var(--text-quaternary);
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--shadow-md);
 }
 
 .integration-card.connected {
   border-color: var(--success);
   background: var(--success-bg);
+  box-shadow: var(--shadow-md);
 }
 
 .integration-header {

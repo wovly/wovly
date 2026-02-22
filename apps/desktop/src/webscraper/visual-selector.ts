@@ -2145,6 +2145,166 @@ Response: 701216`;
       `;
     }, message, type);
   }
+
+  /**
+   * Analyze URL and generate selectors using AI
+   * Extracted from main.js webscraper:analyzeUrl handler
+   *
+   * @param url - Website URL to analyze
+   * @param siteType - Type of site (e.g., 'messaging', 'email')
+   * @param apiKeys - API keys for AI providers
+   * @returns Analysis result with selectors and confidence
+   */
+  async analyzeUrl(url: string, siteType: string | null, apiKeys: any): Promise<{
+    ok: boolean;
+    success?: boolean;
+    selectors?: any;
+    confidence?: string;
+    loginPageUrl?: string;
+    originalUrl?: string;
+    error?: string;
+  }> {
+    try {
+      const { ai } = await import('./index');
+
+      // Create a temporary page to analyze
+      const sessionId = `analyze-${Date.now()}`;
+      const page = await this.browserController.getPage(sessionId);
+
+      // Navigate with more lenient options
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      } catch (err: any) {
+        // If navigation fails, try with load event only
+        if (err.message?.includes('timeout')) {
+          console.log('[VisualSelector] Navigation timeout, trying with load event...');
+          await page.goto(url, { waitUntil: 'load', timeout: 10000 }).catch(() => {
+            // If still fails, we'll work with whatever loaded
+            console.log('[VisualSelector] Using partially loaded page');
+          });
+        } else {
+          throw err;
+        }
+      }
+
+      // Show banner to user
+      await this.injectStatusBanner(page, '🔍 Analyzing page... Please wait, do not touch anything.');
+
+      // Wait a bit for any dynamic content
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // Check if we're already on a login page (has password field)
+      const hasPasswordField = await page.evaluate(() => {
+        return !!document.querySelector('input[type="password"]');
+      });
+
+      // If not on login page, try to find and click a login button/link
+      if (!hasPasswordField) {
+        console.log('[VisualSelector] Not on login page, looking for login button...');
+
+        const loginClicked = await page.evaluate(() => {
+          // Look for login/sign in buttons or links
+          const patterns = [
+            /log\s*in/i,
+            /sign\s*in/i,
+            /login/i,
+            /signin/i,
+            /log-in/i,
+            /sign-in/i,
+            /member\s*login/i,
+            /account\s*login/i
+          ];
+
+          // Check buttons
+          const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+          for (const btn of buttons) {
+            const text = (btn as HTMLElement).textContent?.trim() || '';
+            const ariaLabel = btn.getAttribute('aria-label') || '';
+            const href = btn.getAttribute('href') || '';
+
+            const combined = `${text} ${ariaLabel} ${href}`.toLowerCase();
+
+            for (const pattern of patterns) {
+              if (pattern.test(combined)) {
+                console.log('Found login button:', text || href);
+                (btn as HTMLElement).click();
+                return true;
+              }
+            }
+          }
+          return false;
+        });
+
+        if (loginClicked) {
+          console.log('[VisualSelector] Clicked login button, waiting for login page...');
+
+          // Wait for navigation or new content
+          await Promise.race([
+            page.waitForNavigation({ timeout: 5000 }).catch(() => {}),
+            new Promise(resolve => setTimeout(resolve, 3000))
+          ]);
+
+          // Wait for password field to appear
+          await page.waitForSelector('input[type="password"]', { timeout: 5000 }).catch(() => {
+            console.log('[VisualSelector] Password field not found after clicking login button');
+          });
+        } else {
+          console.log('[VisualSelector] No login button found on page');
+        }
+      }
+
+      // Use AI to generate selectors (with fallback if it fails)
+      let selectors = null;
+      let confidence = 'low';
+
+      try {
+        selectors = await ai.generateSelectorsWithAI(page, siteType, apiKeys);
+        confidence = selectors.confidence;
+        console.log(`[VisualSelector] AI analysis complete with ${confidence} confidence`);
+      } catch (aiError: any) {
+        console.log('[VisualSelector] AI analysis failed, falling back to manual setup');
+        console.log('[VisualSelector] Error:', aiError.message);
+
+        // Provide empty selectors for manual setup
+        selectors = {
+          login: {
+            usernameField: '',
+            passwordField: '',
+            submitButton: '',
+            successIndicator: ''
+          },
+          navigation: [],
+          messages: {
+            container: '',
+            messageItem: '',
+            sender: '',
+            content: '',
+            timestamp: ''
+          },
+          confidence: 'low'
+        };
+      }
+
+      // Get the final URL after any navigation (this is the actual login page URL)
+      const finalUrl = page.url();
+      console.log(`[VisualSelector] Analysis complete. Final URL: ${finalUrl}`);
+
+      // Close the page
+      await page.close();
+
+      return {
+        ok: true,
+        success: true,
+        selectors: selectors,
+        confidence: confidence,
+        loginPageUrl: finalUrl, // The actual URL where the login form is
+        originalUrl: url // The URL the user entered
+      };
+    } catch (err: any) {
+      console.error("[VisualSelector] Error analyzing URL:", err);
+      return { ok: false, error: err.message };
+    }
+  }
 }
 
 export { VisualSelectorTool };

@@ -7,6 +7,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { getWovlyDir } from '../utils/helpers';
+import { SettingsService } from './settings';
 
 // @ts-ignore - session module is JavaScript
 import { saveSession, loadSession, clearSession } from '../../src/auth/session';
@@ -189,6 +190,15 @@ export class AuthService {
 
       await this.saveUsers(users);
       console.log(`[AuthService] User registered: ${normalizedUsername}`);
+
+      // Initialize default settings for new user
+      await SettingsService.updateSettings(normalizedUsername, {
+        theme: 'dark',
+        weatherEnabled: false,
+        browserEnabled: false,
+        iMessageEnabled: false
+      });
+      console.log(`[AuthService] Initialized default settings for user: ${normalizedUsername}`);
 
       return { ok: true, username: normalizedUsername };
     } catch (err) {

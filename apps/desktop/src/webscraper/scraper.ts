@@ -376,7 +376,23 @@ export class WebScraper {
           // Click the element (either by CSS selector or by text)
           if (elementFound) {
             try {
-              await page.click(step.selector);
+              // Try clicking with navigation handling (in case click triggers navigation)
+              try {
+                await Promise.race([
+                  // Wait for navigation if it happens
+                  page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 }).catch(() => {
+                    // Navigation didn't happen, that's fine
+                  }),
+                  // Perform the click
+                  page.click(step.selector),
+                ]);
+                console.warn(`[WebScraper] Click successful (selector: ${step.selector})`);
+              } catch (navigationError) {
+                // If the click caused a navigation that destroyed the context,
+                // wait a bit for the new page to load
+                console.warn(`[WebScraper] Click may have triggered navigation, waiting for page to stabilize...`);
+                await new Promise((resolve) => setTimeout(resolve, 2000));
+              }
             } catch (clickError) {
               // If CSS selector click fails, try clicking by text
               if (step.description) {
@@ -406,6 +422,9 @@ export class WebScraper {
                 }, searchText);
 
                 console.warn(`[WebScraper] Clicked by text fallback: "${searchText}"`);
+
+                // Wait for potential navigation after text-based click
+                await new Promise((resolve) => setTimeout(resolve, 2000));
               } else {
                 throw clickError;
               }
@@ -785,6 +804,37 @@ Return ONLY the JSON array, no other text.`;
         return date.toISOString();
       }
 
+      // Handle date + time with separator (e.g., "Feb 9 • 3:12 PM", "Feb 9 - 3:12 PM")
+      const dateTimeMatch = timestampStr.match(
+        /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})\s*[•\-–—:]\s*(\d{1,2}):(\d{2})\s*(am|pm)?/i
+      );
+      if (dateTimeMatch) {
+        const monthStr = dateTimeMatch[1];
+        const day = parseInt(dateTimeMatch[2]);
+        let hours = parseInt(dateTimeMatch[3]);
+        const minutes = parseInt(dateTimeMatch[4]);
+        const isPM = dateTimeMatch[5]?.toLowerCase() === 'pm';
+
+        // Convert 12-hour to 24-hour format
+        if (isPM && hours < 12) hours += 12;
+        if (!isPM && hours === 12) hours = 0;
+
+        // Parse month name
+        const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+        const month = monthNames.findIndex(m => monthStr.toLowerCase().startsWith(m));
+
+        if (month !== -1) {
+          const date = new Date(now.getFullYear(), month, day, hours, minutes, 0, 0);
+
+          // If date is in the future, assume it was last year
+          if (date > now) {
+            date.setFullYear(now.getFullYear() - 1);
+          }
+
+          return date.toISOString();
+        }
+      }
+
       // Handle short date formats (e.g., "Feb 15", "2/15", "15 Feb")
       const shortDatePatterns = [
         // Month name + day (e.g., "Feb 15")
@@ -826,25 +876,36 @@ Return ONLY the JSON array, no other text.`;
 
   /**
    * Get credentials for the site
+   * SECURITY: Credentials retrieved from encrypted local storage ONLY
+   * NEVER sent to LLMs - only used for local browser automation
+   *
    * @param siteConfig - Site configuration
    * @returns Credentials object
    */
   private async getCredentials(siteConfig: SiteConfig): Promise<Credentials> {
-    // TODO: Integrate with actual credential management system
-    // For now, return from config if present
-    const configWithCreds = siteConfig as SiteConfig & { credentials?: Credentials };
-    if (configWithCreds.credentials) {
-      return configWithCreds.credentials;
+    // Use the WebScraperCredentialService to retrieve credentials securely
+    const { WebScraperCredentialService } = await import('../services/webscraper-credentials');
+
+    const result = await WebScraperCredentialService.getCredentialsForAutomation(
+      this.username,
+      siteConfig.credentialDomain
+    );
+
+    if (!result.ok || !result.credential) {
+      throw new Error(
+        `No credentials found for ${siteConfig.credentialDomain}. ` +
+        `Please add credentials in Settings > Credentials or during site configuration.`
+      );
     }
 
-    // Try to get from credential domain
-    if (siteConfig.credentialDomain) {
-      // This would integrate with the existing credential system
-      // const { getCredentialForDomain } = require('../storage/credentials');
-      // return await getCredentialForDomain(siteConfig.credentialDomain);
-    }
+    console.warn(
+      `[WebScraper] Retrieved credentials for ${siteConfig.credentialDomain} (local use only, never sent to LLM)`
+    );
 
-    throw new Error('No credentials configured for this site');
+    return {
+      username: result.credential.username,
+      password: result.credential.password
+    };
   }
 }
 

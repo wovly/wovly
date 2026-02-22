@@ -1,0 +1,108 @@
+{
+  "brightwheel": {
+    "id": "brightwheel",
+    "name": "Brightwheel Daycare",
+    "url": "https://schools.mybrightwheel.com/sign-in",
+    "enabled": true,
+    "authMethod": "form",
+    "credentialDomain": "mybrightwheel.com",
+    "selectors": {
+      "login": {
+        "usernameField": "input[name='email']",
+        "passwordField": "input[name='password']",
+        "submitButton": "button[type='submit']",
+        "successIndicator": "div.dashboard"
+      },
+      "navigation": [
+        {
+          "step": 1,
+          "action": "click",
+          "selector": "a[href*='/messages']",
+          "waitFor": "div.messages-container",
+          "description": "Click Messages tab"
+        }
+      ],
+      "messages": {
+        "container": "div.messages-list",
+        "messageItem": "div.message-card",
+        "sender": ".message-author",
+        "content": ".message-body",
+        "timestamp": ".message-date"
+      }
+    },
+    "sessionManagement": {
+      "saveSession": true,
+      "sessionTimeout": 3600000
+    },
+    "status": {
+      "lastError": null,
+      "consecutiveFailures": 0,
+      "paused": false
+    }
+  },
+  "brightwheel-oauth": {
+    "id": "brightwheel-oauth",
+    "name": "Brightwheel (Google OAuth)",
+    "url": "https://schools.mybrightwheel.com/sign-in",
+    "enabled": true,
+    "authMethod": "oauth",
+    "credentialDomain": "mybrightwheel.com",
+    "oauth": {
+      "oauthProvider": "google",
+      "loginDetectionSelector": "button[aria-label*='Sign in with Google']",
+      "successDetectionSelector": "div.dashboard"
+    },
+    "selectors": {
+      "navigation": [],
+      "messages": {
+        "container": "div.messages-list",
+        "messageItem": "div.message-card",
+        "sender": ".message-author",
+        "content": ".message-body",
+        "timestamp": ".message-date"
+      }
+    },
+    "sessionManagement": {
+      "saveSession": true,
+      "sessionTimeout": 604800000
+    },
+    "status": {
+      "lastError": null,
+      "consecutiveFailures": 0,
+      "paused": false
+    }
+  },
+  "generic-portal": {
+    "id": "generic-portal",
+    "name": "Generic School Portal",
+    "url": "https://portal.school.edu/login",
+    "enabled": false,
+    "authMethod": "form",
+    "credentialDomain": "school.edu",
+    "selectors": {
+      "login": {
+        "usernameField": "#username",
+        "passwordField": "#password",
+        "submitButton": "button.login-btn",
+        "successIndicator": "div.home-page"
+      },
+      "navigation": [],
+      "messages": {
+        "container": "#messages-container",
+        "messageItem": ".msg-item",
+        "sender": ".msg-from",
+        "content": ".msg-text",
+        "timestamp": ".msg-time"
+      }
+    },
+    "sessionManagement": {
+      "saveSession": true,
+      "sessionTimeout": 3600000
+    },
+    "status": {
+      "lastError": "page_structure_changed",
+      "consecutiveFailures": 3,
+      "paused": true
+    }
+  }
+}
