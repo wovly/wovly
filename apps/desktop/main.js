@@ -1,3 +1,6 @@
+// Load environment variables from .env file
+require('dotenv').config();
+
 const { app, BrowserWindow, ipcMain, safeStorage } = require("electron");
 const path = require("path");
 const fs = require("fs/promises");
