@@ -28,16 +28,20 @@ export interface GoogleOAuthConfig {
 
 /**
  * Get Google OAuth configuration
- * Prefers environment variables, falls back to bundled defaults
+ * Uses Desktop App OAuth type - no client secret needed (uses PKCE instead)
+ *
+ * The client ID is safe to bundle publicly in desktop apps.
+ * See: https://developers.google.com/identity/protocols/oauth2/native-app
  */
 export function getGoogleOAuthConfig(): GoogleOAuthConfig {
   return {
-    // TODO: Replace with your actual OAuth credentials
-    // Or set environment variables: GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET
-    clientId: process.env.GOOGLE_CLIENT_ID || 'YOUR_CLIENT_ID_HERE.apps.googleusercontent.com',
+    // Desktop App Client ID (safe to bundle publicly - like VS Code does)
+    clientId:
+      process.env.GOOGLE_CLIENT_ID ||
+      '150582525788-vle1h3jtf04odf5dh8b3pnmo5l7re4vk.apps.googleusercontent.com',
 
-    // Client secret (only needed for "Web application" type, not "Desktop app")
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET || 'YOUR_CLIENT_SECRET_HERE',
+    // Client secret not needed for Desktop app type (PKCE provides security)
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
 
     // Localhost redirect for OAuth callback
     redirectUri: 'http://localhost:18923/oauth/callback',

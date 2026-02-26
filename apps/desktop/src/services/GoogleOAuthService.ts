@@ -1,11 +1,13 @@
 /**
  * Google OAuth Service
  * Handles one-click Google OAuth flow with localhost callback
+ * Uses PKCE (Proof Key for Code Exchange) for Desktop App security
  */
 
 import { BrowserWindow, shell } from 'electron';
-import http from 'http';
+import * as http from 'http';
 import { URL } from 'url';
+import * as crypto from 'crypto';
 import { getGoogleOAuthConfig, isGoogleOAuthConfigured } from '../config/google-oauth';
 
 export interface OAuthTokens {
@@ -25,6 +27,7 @@ export interface OAuthResult {
 export class GoogleOAuthService {
   private callbackServer: http.Server | null = null;
   private readonly CALLBACK_PORT = 18923;
+  private codeVerifier: string | null = null;
 
   /**
    * Launch one-click Google OAuth flow
@@ -78,6 +81,20 @@ export class GoogleOAuthService {
   }
 
   /**
+   * Generate PKCE code verifier and challenge
+   * Used for Desktop App OAuth security (replaces client secret)
+   */
+  private generatePKCE(): { verifier: string; challenge: string } {
+    // Generate random code verifier (43-128 characters)
+    const verifier = crypto.randomBytes(32).toString('base64url');
+
+    // Generate code challenge (SHA256 hash of verifier)
+    const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+
+    return { verifier, challenge };
+  }
+
+  /**
    * Start localhost callback server and open browser for authorization
    * @returns Authorization code from callback
    */
@@ -85,7 +102,11 @@ export class GoogleOAuthService {
     return new Promise((resolve) => {
       const config = getGoogleOAuthConfig();
 
-      // Build OAuth URL
+      // Generate PKCE challenge for Desktop App security
+      const { verifier, challenge } = this.generatePKCE();
+      this.codeVerifier = verifier;
+
+      // Build OAuth URL with PKCE
       const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
       authUrl.searchParams.set('client_id', config.clientId);
       authUrl.searchParams.set('redirect_uri', redirectUri);
@@ -93,6 +114,9 @@ export class GoogleOAuthService {
       authUrl.searchParams.set('scope', config.scopes.join(' '));
       authUrl.searchParams.set('access_type', 'offline');
       authUrl.searchParams.set('prompt', 'consent');
+      // PKCE parameters (Desktop App security)
+      authUrl.searchParams.set('code_challenge', challenge);
+      authUrl.searchParams.set('code_challenge_method', 'S256');
 
       let resolved = false;
 
@@ -183,26 +207,40 @@ export class GoogleOAuthService {
 
   /**
    * Exchange authorization code for access/refresh tokens
+   * Uses PKCE code verifier instead of client secret
    */
   private async exchangeCodeForTokens(
     code: string,
     config: ReturnType<typeof getGoogleOAuthConfig>
   ): Promise<OAuthTokens | null> {
     try {
-      console.log('[GoogleOAuth] Exchanging code for tokens...');
+      console.log('[GoogleOAuth] Exchanging code for tokens (with PKCE)...');
+
+      const tokenParams: Record<string, string> = {
+        code,
+        client_id: config.clientId,
+        redirect_uri: config.redirectUri,
+        grant_type: 'authorization_code',
+      };
+
+      // Add PKCE code verifier (Desktop App - replaces client secret)
+      if (this.codeVerifier) {
+        tokenParams.code_verifier = this.codeVerifier;
+        console.log('[GoogleOAuth] Using PKCE code verifier for Desktop App');
+      } else if (config.clientSecret) {
+        // Fallback to client secret if PKCE not available (Web App type)
+        tokenParams.client_secret = config.clientSecret;
+        console.warn(
+          '[GoogleOAuth] Using client secret (consider migrating to Desktop App + PKCE)'
+        );
+      }
 
       const response = await fetch('https://oauth2.googleapis.com/token', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
-        body: new URLSearchParams({
-          code,
-          client_id: config.clientId,
-          client_secret: config.clientSecret,
-          redirect_uri: config.redirectUri,
-          grant_type: 'authorization_code',
-        }).toString(),
+        body: new URLSearchParams(tokenParams).toString(),
       });
 
       if (!response.ok) {
@@ -212,7 +250,10 @@ export class GoogleOAuthService {
       }
 
       const tokens = (await response.json()) as OAuthTokens;
-      console.log('[GoogleOAuth] Successfully obtained tokens');
+      console.log('[GoogleOAuth] ✅ Successfully obtained tokens with PKCE');
+
+      // Clear code verifier after use
+      this.codeVerifier = null;
 
       return tokens;
     } catch (error) {
@@ -224,6 +265,7 @@ export class GoogleOAuthService {
 
   /**
    * Refresh an expired access token
+   * Desktop apps don't need client secret for refresh
    */
   async refreshAccessToken(refreshToken: string): Promise<OAuthTokens | null> {
     try {
@@ -231,17 +273,23 @@ export class GoogleOAuthService {
 
       console.log('[GoogleOAuth] Refreshing access token...');
 
+      const tokenParams: Record<string, string> = {
+        refresh_token: refreshToken,
+        client_id: config.clientId,
+        grant_type: 'refresh_token',
+      };
+
+      // Only add client secret if it exists (Web App type compatibility)
+      if (config.clientSecret) {
+        tokenParams.client_secret = config.clientSecret;
+      }
+
       const response = await fetch('https://oauth2.googleapis.com/token', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
-        body: new URLSearchParams({
-          refresh_token: refreshToken,
-          client_id: config.clientId,
-          client_secret: config.clientSecret,
-          grant_type: 'refresh_token',
-        }).toString(),
+        body: new URLSearchParams(tokenParams).toString(),
       });
 
       if (!response.ok) {
