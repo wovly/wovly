@@ -974,8 +974,8 @@ export class RecordingWizard {
         };
 
         // Get all potentially relevant elements (lists, tables, divs with multiple children)
-        // @ts-ignore - document exists in browser context
         const candidates = Array.from(
+          // @ts-expect-error - document exists in browser context (page.evaluate)
           document.querySelectorAll(
             'ul, ol, table, div[class*="list"], div[class*="message"], div[class*="item"], div[class*="conversation"]'
           )

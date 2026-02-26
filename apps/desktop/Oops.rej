@@ -1,0 +1,13 @@
+***************
+*** 36,38
+- async function getXAccessToken(username?: string): Promise<string | null> {
+-   try {
+-     const settingsPath = await getSettingsPath(username);
+--- 36,42 -----
++ async function getXAccessToken(username?: string): Promise<string | null> {
++   try {
++     if (!username) {
++       return null;
++     }
++     
++     const settingsPath = await getSettingsPath(username);
