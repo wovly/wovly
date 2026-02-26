@@ -26,6 +26,14 @@ export interface Insight {
   suggestedAction?: string;
   relatedGoal?: string;
   timestamp: string;
+  // NEW FIELDS for actionable insights
+  actionType?: 'chat_prompt' | 'calendar_update';
+  actionData?: {
+    action?: string; // 'delete', 'create', 'update'
+    eventIds?: string[];
+    prompt: string; // Human-readable prompt to send to chat
+    toolsNeeded?: string[];
+  };
 }
 
 /**
@@ -99,11 +107,33 @@ export const saveInsights = async (username: string, insights: Insight[]): Promi
   const data: InsightsData = {
     date: new Date().toISOString().split('T')[0],
     timestamp: new Date().toISOString(),
-    insights: insights || []
+    insights: insights || [],
   };
 
-  await fs.writeFile(insightsPath, JSON.stringify(data, null, 2), 'utf8');
-  console.log(`[Insights] Saved ${insights.length} insights to ${insightsPath}`);
+  // Validate JSON before writing
+  const jsonString = JSON.stringify(data, null, 2);
+  try {
+    JSON.parse(jsonString); // Validate it's valid JSON
+  } catch (err) {
+    console.error('[Insights] Generated invalid JSON, not saving:', err);
+    throw new Error('Generated invalid JSON structure');
+  }
+
+  // Use atomic write pattern: write to temp file, then rename
+  const tempPath = `${insightsPath}.tmp`;
+  try {
+    await fs.writeFile(tempPath, jsonString, 'utf8');
+    await fs.rename(tempPath, insightsPath);
+    console.log(`[Insights] Saved ${insights.length} insights to ${insightsPath}`);
+  } catch (err) {
+    // Clean up temp file if it exists
+    try {
+      await fs.unlink(tempPath);
+    } catch {
+      // Ignore cleanup errors
+    }
+    throw err;
+  }
 };
 
 /**
@@ -120,12 +150,69 @@ export const loadTodayInsights = async (username: string): Promise<Insight[]> =>
   } catch (err) {
     const error = err as NodeJS.ErrnoException;
     if (error.code === 'ENOENT') {
-      // File doesn't exist yet
+      // File doesn't exist yet - return empty array
       return [];
     }
+
+    // If JSON parse error, backup the corrupted file and return empty
+    if (err instanceof SyntaxError && err.message.includes('JSON')) {
+      console.error('[Insights] Corrupted JSON file detected, backing up and returning empty');
+      const insightsPath = await getTodayInsightsPath(username);
+      const backupPath = `${insightsPath}.corrupted-${Date.now()}`;
+      try {
+        await fs.rename(insightsPath, backupPath);
+        console.log(`[Insights] Backed up corrupted file to ${backupPath}`);
+      } catch {
+        // If backup fails, just log it
+        console.error('[Insights] Failed to backup corrupted file');
+      }
+      return [];
+    }
+
     console.error("[Insights] Error loading today's insights:", err);
     throw err;
   }
+};
+
+/**
+ * Load the most recent insights (from today or previous days if today is empty)
+ * @param username - The username
+ * @param daysBack - Number of days to look back (default 7)
+ * @returns Array of insights from the most recent available day
+ */
+export const loadRecentInsights = async (
+  username: string,
+  daysBack: number = 7
+): Promise<Insight[]> => {
+  const insightsDir = await getInsightsDir(username);
+  const today = new Date();
+
+  // Try to load insights from today going backwards
+  for (let i = 0; i < daysBack; i++) {
+    const date = new Date(today);
+    date.setDate(date.getDate() - i);
+    const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD
+    const insightsPath = path.join(insightsDir, `${dateStr}.json`);
+
+    try {
+      const content = await fs.readFile(insightsPath, 'utf8');
+      const data = JSON.parse(content) as InsightsData;
+
+      if (data.insights && data.insights.length > 0) {
+        console.log(`[Insights] Loaded ${data.insights.length} insights from ${dateStr}`);
+        return data.insights;
+      }
+    } catch (err) {
+      const error = err as NodeJS.ErrnoException;
+      if (error.code !== 'ENOENT') {
+        console.error(`[Insights] Error reading insights for ${dateStr}:`, err);
+      }
+      // Continue to next day
+    }
+  }
+
+  console.log('[Insights] No insights found in the last 7 days');
+  return [];
 };
 
 /**
@@ -134,7 +221,10 @@ export const loadTodayInsights = async (username: string): Promise<Insight[]> =>
  * @param daysBack - Number of days to look back (default 7)
  * @returns Array of memory entries
  */
-export const loadRecentHistory = async (username: string, daysBack: number = 7): Promise<MemoryEntry[]> => {
+export const loadRecentHistory = async (
+  username: string,
+  daysBack: number = 7
+): Promise<MemoryEntry[]> => {
   const userDir = await getUserDataDir(username);
   const memoryDir = path.join(userDir, 'memory', 'daily');
 
@@ -151,7 +241,7 @@ export const loadRecentHistory = async (username: string, daysBack: number = 7):
       const content = await fs.readFile(memoryPath, 'utf8');
       memories.push({
         date: dateStr,
-        content: content
+        content: content,
       });
     } catch (err) {
       const error = err as NodeJS.ErrnoException;
@@ -188,7 +278,7 @@ export const getLastCheckData = async (username: string): Promise<LastCheckData>
     const data = JSON.parse(content) as LastCheckFile;
     return {
       lastCheckTimestamp: data.lastCheckTimestamp || null,
-      goalsHash: data.goalsHash || ''
+      goalsHash: data.goalsHash || '',
     };
   } catch (err) {
     const error = err as NodeJS.ErrnoException;
@@ -227,7 +317,7 @@ export const saveLastCheckTimestamp = async (
   const data: LastCheckFile = {
     lastCheckTimestamp: timestamp,
     lastCheckDate: new Date(timestamp).toISOString().split('T')[0],
-    goalsHash: goalsHash
+    goalsHash: goalsHash,
   };
 
   await fs.writeFile(lastCheckPath, JSON.stringify(data, null, 2), 'utf8');

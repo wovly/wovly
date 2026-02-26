@@ -50,6 +50,7 @@ const { ProfileService } = require("../dist/services/profile");
 const { CredentialsService } = require("../dist/services/credentials");
 const { AuthService } = require("../dist/services/auth");
 const { OnboardingService } = require("../dist/services/onboarding");
+const { TutorialService } = require("../dist/services/TutorialService");
 const { SkillsService } = require("../dist/services/skills");
 const { TasksService } = require("../dist/services/tasks");
 const { IntegrationsService } = require("../dist/services/integrations");
@@ -67,6 +68,12 @@ const { RedditService } = require("../dist/services/reddit");
 const { GoogleOAuthService } = require("../dist/services/google-oauth");
 const { SlackOAuthService } = require("../dist/services/slack-oauth");
 const { WelcomeService } = require("../dist/services/welcome");
+const { TaskMessagingService } = require("../dist/services/TaskMessagingService");
+const { TaskExecutionEngine } = require("../dist/services/TaskExecutionEngine");
+const { TaskSchedulerService } = require("../dist/services/TaskSchedulerService");
+
+// Conversation style utilities
+const conversationStyle = require("../dist/services/utils/conversationStyle");
 
 module.exports = {
   // ─────────────────────────────────────────────────────────────────────────────
@@ -101,6 +108,10 @@ module.exports = {
   parseSSEStream: streaming.parseSSEStream,
   streamAnthropicResponse: streaming.streamAnthropicResponse,
   streamOpenAIResponse: streaming.streamOpenAIResponse,
+
+  // Conversation style
+  getConversationStyleContext: conversationStyle.getConversationStyleContext,
+  generateStyleGuide: conversationStyle.generateStyleGuide,
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Auth
@@ -256,6 +267,7 @@ module.exports = {
   CredentialsService: CredentialsService,
   AuthService: AuthService,
   OnboardingService: OnboardingService,
+  TutorialService: TutorialService,
   SkillsService: SkillsService,
   TasksService: TasksService,
   IntegrationsService: IntegrationsService,
@@ -272,5 +284,8 @@ module.exports = {
   RedditService: RedditService,
   GoogleOAuthService: GoogleOAuthService,
   SlackOAuthService: SlackOAuthService,
-  WelcomeService: WelcomeService
+  WelcomeService: WelcomeService,
+  TaskMessagingService: TaskMessagingService,
+  TaskExecutionEngine: TaskExecutionEngine,
+  TaskSchedulerService: TaskSchedulerService
 };

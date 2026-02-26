@@ -15,22 +15,20 @@
     "build:win": "electron-builder --win",
     "build:linux": "electron-builder --linux",
     "dist": "electron-builder --mac --win --linux",
-
     "type-check": "tsc --noEmit",
     "lint": "eslint src/**/*.ts",
     "lint:fix": "eslint src/**/*.ts --fix",
     "format": "prettier --write \"src/**/*.{ts,tsx,json}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,json}\"",
-
     "test": "vitest run",
     "test:watch": "vitest",
     "test:ui": "vitest --ui",
     "test:coverage": "vitest run --coverage",
-
     "prepare": "husky install",
     "pre-commit": "lint-staged"
   },
   "dependencies": {
+    "@browserbasehq/stagehand": "^3.1.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@playwright/mcp": "^0.0.61",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
@@ -38,6 +36,7 @@
     "@wovly/llm": "*",
     "@wovly/memory": "*",
     "@wovly/tools": "*",
+    "better-sqlite3": "^12.6.2",
     "esbuild": "^0.27.2",
     "esbuild-register": "^3.6.0",
     "inversify": "^7.11.0",
@@ -49,6 +48,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/electron": "^1.4.38",
     "@types/node": "^20.19.33",
     "@typescript-eslint/eslint-plugin": "^8.56.0",
@@ -69,6 +69,7 @@
   "build": {
     "appId": "com.wovly.assistant",
     "productName": "Wovly",
+    "electronVersion": "40.0.0",
     "directories": {
       "output": "dist",
       "buildResources": "build"
@@ -76,6 +77,17 @@
     "files": [
       "main.js",
       "preload.js",
+      "dist/**/*",
+      "!dist/mac",
+      "!dist/mac-arm64",
+      "!dist/win-unpacked",
+      "!dist/linux-unpacked",
+      "!dist/*.dmg",
+      "!dist/*.exe",
+      "!dist/*.AppImage",
+      "!dist/*.deb",
+      "!dist/*.blockmap",
+      "!dist/builder-debug.yml",
       "node_modules/**/*",
       "!node_modules/*/{CHANGELOG.md,README.md,readme.md,changelog.md}",
       "!node_modules/**/*.{ts,map}"
@@ -91,6 +103,7 @@
     ],
     "mac": {
       "category": "public.app-category.productivity",
+      "icon": "build/icon.icns",
       "target": [
         {
           "target": "dmg",

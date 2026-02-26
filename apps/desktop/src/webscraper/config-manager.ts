@@ -19,6 +19,7 @@ export interface IntegrationStatus {
   lastError: string | null;
   consecutiveFailures: number;
   paused: boolean;
+  twoFactorMode?: 'automated' | 'manual';
 }
 
 export interface SiteMetadata {
@@ -39,6 +40,15 @@ export interface SiteConfigSelectors {
     passwordField?: string;
     submitButton?: string;
     successIndicator?: string;
+    twoFactorField?: string;
+    sequence?: Array<{
+      type: string;
+      selector: string;
+      isUsernameField?: boolean;
+      isPasswordField?: boolean;
+      is2FAField?: boolean;
+      description?: string;
+    }>;
   };
   navigation?: Array<{
     step: number;
@@ -62,6 +72,15 @@ export interface SiteConfigSelectors {
   };
 }
 
+export interface TwoFactorAuth {
+  enabled: boolean;
+  method: 'sms' | 'email' | 'authenticator' | 'unknown';
+  target?: string;
+  codeLength?: number;
+  requiredIntegration?: 'gmail' | 'imessage' | null;
+  selector?: string;
+}
+
 export interface SiteConfig {
   id: string;
   name: string;
@@ -69,6 +88,7 @@ export interface SiteConfig {
   enabled: boolean;
   credentialDomain: string;
   selectors: SiteConfigSelectors;
+  twoFactorAuth?: TwoFactorAuth;
   sessionManagement?: {
     saveSession: boolean;
     sessionTimeout: number;

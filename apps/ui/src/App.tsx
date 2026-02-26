@@ -9,8 +9,10 @@ type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
-  source?: "app" | "whatsapp" | "task" | "decomposed" | "clarification"; // Where the message originated from
+  source?: "app" | "whatsapp" | "task" | "decomposed" | "clarification" | "system"; // Where the message originated from
   images?: string[]; // Screenshot paths from browser automation
+  timestamp?: number | string;
+  streaming?: boolean;
 };
 
 type CalendarEvent = {
@@ -36,6 +38,14 @@ type Insight = {
   }[];
   suggestedAction?: string;
   relatedGoal?: string;
+  // NEW FIELDS for actionable insights
+  actionType?: 'chat_prompt' | 'calendar_update';
+  actionData?: {
+    action?: string;  // 'delete', 'create', 'update'
+    eventIds?: string[];
+    prompt: string;  // Human-readable prompt to send to chat
+    toolsNeeded?: string[];
+  };
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -218,11 +228,13 @@ function calculateEventColumns(events: CalendarEvent[]): Map<string, { column: n
 function InsightCard({
   insight,
   expanded,
-  onToggle
+  onToggle,
+  onActionClick
 }: {
   insight: Insight;
   expanded: boolean;
   onToggle: () => void;
+  onActionClick?: (insight: Insight) => void;
 }) {
   const getInsightIcon = (type: Insight['type']) => {
     const iconProps = {
@@ -378,6 +390,18 @@ function InsightCard({
               {platformIcon}
             </span>
           )}
+          {insight.actionData?.prompt && onActionClick && (
+            <button
+              className="insight-action-button-header"
+              onClick={(e) => {
+                e.stopPropagation(); // Prevent expanding/collapsing
+                onActionClick(insight);
+              }}
+              title={insight.actionData.prompt}
+            >
+              Draft Action
+            </button>
+          )}
           <span className="insight-priority">Priority: {insight.priority}</span>
           <button className="insight-expand-btn" aria-label={expanded ? "Collapse" : "Expand"}>
             {expanded ? '▼' : '▶'}
@@ -430,11 +454,12 @@ function InsightCard({
   );
 }
 
-function InsightsTabContent({ insights, loading, error, onNavigate }: {
+function InsightsTabContent({ insights, loading, error, onNavigate, onActionClick }: {
   insights: Insight[];
   loading: boolean;
   error: string | null;
   onNavigate?: (nav: NavItem) => void;
+  onActionClick?: (insight: Insight) => void;
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
@@ -475,13 +500,14 @@ function InsightsTabContent({ insights, loading, error, onNavigate }: {
           insight={insight}
           expanded={expandedId === insight.id}
           onToggle={() => setExpandedId(expandedId === insight.id ? null : insight.id)}
+          onActionClick={onActionClick}
         />
       ))}
     </div>
   );
 }
 
-function AgendaPanel({ onNavigate }: { onNavigate?: (nav: NavItem) => void }) {
+function AgendaPanel({ onNavigate, onInsightActionClick }: { onNavigate?: (nav: NavItem) => void; onInsightActionClick?: (insight: Insight) => void }) {
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [currentDate, setCurrentDate] = useState(new Date());
   const [loading, setLoading] = useState(true);
@@ -564,7 +590,8 @@ function AgendaPanel({ onNavigate }: { onNavigate?: (nav: NavItem) => void }) {
       setInsightsLoading(true);
       setInsightsError(null);
       try {
-        const result = await window.wovly.insights.getToday(insightsLimit);
+        const result = await window.wovly.insights?.getToday(insightsLimit);
+        if (!result) return;
         if (result.ok) {
           setInsights(result.insights || []);
           setLastInsightsUpdate(new Date());
@@ -585,7 +612,7 @@ function AgendaPanel({ onNavigate }: { onNavigate?: (nav: NavItem) => void }) {
     const interval = setInterval(fetchInsights, 5 * 60 * 1000);
 
     // Subscribe to insights updates
-    const unsubscribe = window.wovly?.insights.onUpdated((data: { insights: Insight[] }) => {
+    const unsubscribe = window.wovly?.insights?.onUpdated?.((data: { insights: Insight[] }) => {
       setInsights(data.insights || []);
       setLastInsightsUpdate(new Date());
     });
@@ -624,7 +651,8 @@ function AgendaPanel({ onNavigate }: { onNavigate?: (nav: NavItem) => void }) {
     setIsRefreshingInsights(true);
     setInsightsError(null);
     try {
-      const result = await window.wovly.insights.refresh(insightsLimit);
+      const result = await window.wovly.insights?.refresh(insightsLimit);
+      if (!result) return;
       if (result.ok) {
         setInsights(result.insights || []);
         setLastInsightsUpdate(new Date());
@@ -788,6 +816,7 @@ function AgendaPanel({ onNavigate }: { onNavigate?: (nav: NavItem) => void }) {
             loading={insightsLoading}
             error={insightsError}
             onNavigate={onNavigate}
+            onActionClick={onInsightActionClick}
           />
         ) : !googleConnected ? (
           <div className="agenda-empty-state">
@@ -970,13 +999,17 @@ function ChatPanel({
   setMessages,
   initialized,
   setInitialized,
-  onNavigate
+  onNavigate,
+  pendingMessage,
+  onPendingMessageUsed
 }: {
   messages: ChatMessage[];
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
   initialized: boolean;
   setInitialized: React.Dispatch<React.SetStateAction<boolean>>;
   onNavigate: (nav: NavItem) => void;
+  pendingMessage?: string | null;
+  onPendingMessageUsed?: () => void;
 }) {
   const [message, setMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -985,7 +1018,8 @@ function ChatPanel({
   // Always use streaming mode
   const [isStreaming, setIsStreaming] = useState(false);
   const chatBodyRef = useRef<HTMLDivElement>(null);
-  
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
   // Query decomposition state
   const [pendingDecomposition, setPendingDecomposition] = useState<DecompositionResult | null>(null);
   const [isCreatingTask, setIsCreatingTask] = useState(false);
@@ -1002,12 +1036,46 @@ function ChatPanel({
   const [onboardingStage, setOnboardingStage] = useState<OnboardingStage | null>(null);
   const [needsApiSetup, setNeedsApiSetup] = useState(false);
 
+  // Auto-resize textarea based on content
+  const autoResizeTextarea = () => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    // Reset height to auto to get the correct scrollHeight
+    textarea.style.height = 'auto';
+
+    // Set height based on content, with max of 200px (about 8-10 lines)
+    const newHeight = Math.min(textarea.scrollHeight, 200);
+    textarea.style.height = `${newHeight}px`;
+  };
+
   // Auto-scroll
   useEffect(() => {
     if (chatBodyRef.current) {
       chatBodyRef.current.scrollTop = chatBodyRef.current.scrollHeight;
     }
   }, [messages, isLoading]);
+
+  // Handle pending message from insight action
+  useEffect(() => {
+    if (pendingMessage) {
+      setMessage(pendingMessage);
+      // Clear the pending message
+      onPendingMessageUsed?.();
+      // Focus the input and resize after a short delay
+      setTimeout(() => {
+        if (textareaRef.current) {
+          textareaRef.current.focus();
+          autoResizeTextarea();
+        }
+      }, 100);
+    }
+  }, [pendingMessage, onPendingMessageUsed]);
+
+  // Auto-resize textarea when message changes
+  useEffect(() => {
+    autoResizeTextarea();
+  }, [message]);
 
   // Listen for incoming WhatsApp messages
   useEffect(() => {
@@ -1073,6 +1141,36 @@ function ChatPanel({
       unsubscribe();
       statusUnsubscribe();
       screenshotUnsubscribe?.();
+    };
+  }, [setMessages]);
+
+  // Listen for system notifications (2FA auth needed, etc.)
+  useEffect(() => {
+    if (!window.wovly?.chat?.onSystemNotification) return;
+
+    const unsubscribe = window.wovly.chat.onSystemNotification((data: { type: string; message: string; timestamp: string }) => {
+      if (data.type === 'auth_needed') {
+        // Add system message to chat
+        setMessages(prev => [...prev, {
+          id: crypto.randomUUID(),
+          role: 'assistant' as const,
+          content: `🔐 ${data.message}`,
+          source: 'system' as const,
+          timestamp: data.timestamp
+        }]);
+
+        // Auto-scroll to bottom
+        setTimeout(() => {
+          const chatContainer = document.querySelector('.chat-messages');
+          if (chatContainer) {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+          }
+        }, 100);
+      }
+    });
+
+    return () => {
+      unsubscribe();
     };
   }, [setMessages]);
 
@@ -1159,13 +1257,35 @@ function ChatPanel({
 
   // Generate LLM-powered welcome message
   useEffect(() => {
+    if (initialized) return;
+
+    let retryCount = 0;
+    const maxRetries = 20; // Try for up to 2 seconds (20 * 100ms)
+
     const generateWelcome = async () => {
-      if (initialized || !window.wovly) return;
+      if (!window.wovly) {
+        // Retry after a short delay
+        retryCount++;
+        if (retryCount < maxRetries) {
+          console.log(`[ChatPanel] Waiting for window.wovly (attempt ${retryCount}/${maxRetries})...`);
+          setTimeout(generateWelcome, 100);
+        } else {
+          console.error('[ChatPanel] window.wovly not available after max retries');
+          setInitialized(true);
+          setMessages([{
+            id: "welcome",
+            role: "assistant",
+            content: "Hello! I'm Wovly, your AI assistant. How can I help you today?"
+          }]);
+        }
+        return;
+      }
+
       setInitialized(true);
-      
+
       try {
         const result = await window.wovly.welcome.generate();
-        
+
         // Track onboarding state
         if (result.needsApiSetup) {
           setNeedsApiSetup(true);
@@ -1177,13 +1297,14 @@ function ChatPanel({
           setOnboardingStage("completed");
           setNeedsApiSetup(false);
         }
-        
+
         setMessages([{
           id: "welcome",
           role: "assistant",
           content: result.message
         }]);
-      } catch {
+      } catch (err) {
+        console.error('[ChatPanel] Welcome generation failed:', err);
         setMessages([{
           id: "welcome",
           role: "assistant",
@@ -1191,6 +1312,7 @@ function ChatPanel({
         }]);
       }
     };
+
     generateWelcome();
   }, [initialized, setInitialized, setMessages]);
 
@@ -1208,6 +1330,13 @@ function ChatPanel({
     setMessage("");
     setIsLoading(true);
     setError(null);
+
+    // Reset textarea height after sending
+    setTimeout(() => {
+      if (textareaRef.current) {
+        textareaRef.current.style.height = 'auto';
+      }
+    }, 0);
 
     // Sync user message to WhatsApp if connected
     if (whatsappSyncReady) {
@@ -1233,7 +1362,7 @@ function ChatPanel({
       setIsStreaming(true);
 
       try {
-        await window.wovly.chat.sendStream(chatHistory, workflowContext);
+        await window.wovly.chat.sendStream?.(chatHistory, workflowContext);
         // Streaming handlers will update messages automatically
         // onStreamDelta adds content progressively
         // onStreamComplete marks streaming as finished
@@ -1305,19 +1434,19 @@ function ChatPanel({
       }
 
       if (result.ok && result.response) {
-        const responseText = result.response;
-        
+        const responseText = result.response as string;
+
         // Check if this is an informational statement that needs confirmation
         // Only show fact confirmation if NOT in an active workflow (to avoid interruption)
-        if (result.informationType && result.facts && result.facts.length > 0 && !activeWorkflow.type) {
+        if (result.informationType && result.facts && (result.facts?.length ?? 0) > 0 && !activeWorkflow.type) {
           // Initialize conflict resolutions - default to keeping new facts
           const initialResolutions: { [key: number]: boolean } = {};
-          (result.conflicts || []).forEach((conflict) => {
+          (result.conflicts || []).forEach((conflict: any) => {
             initialResolutions[conflict.newFactIndex] = true; // Default to keeping new
           });
           
           setPendingFactConfirmation({
-            facts: result.facts,
+            facts: result.facts!,
             conflicts: result.conflicts || [],
             originalInput: result.originalInput || "",
             conflictResolutions: initialResolutions
@@ -1331,7 +1460,7 @@ function ChatPanel({
           // Clear clarification workflow since we now have a task suggestion
           if (activeWorkflow.type === 'clarifying_for_task') {
             // If facts were detected during clarification, store them for later
-            const detectedFacts = result.detectedFacts || activeWorkflow.context?.detected_facts;
+            const detectedFacts = result.detectedFacts || activeWorkflow.context?.detected_facts || [];
             if (detectedFacts && detectedFacts.length > 0) {
               // Store facts in decomposition context for prompting after task creation
               setActiveWorkflow({ 
@@ -1356,12 +1485,13 @@ function ChatPanel({
         }
         
         // If facts were silently detected during workflow, store them for later
-        if (result.detectedFacts && result.detectedFacts.length > 0 && activeWorkflow.type) {
+        if (result.detectedFacts && (result.detectedFacts?.length ?? 0) > 0 && activeWorkflow.type) {
+          const detectedFacts = result.detectedFacts!;
           setActiveWorkflow(prev => ({
             ...prev,
             context: {
               ...prev.context,
-              detected_facts: [...(prev.context?.detected_facts || []), ...result.detectedFacts!]
+              detected_facts: [...(prev.context?.detected_facts || []), ...detectedFacts]
             }
           }));
         }
@@ -1616,7 +1746,7 @@ function ChatPanel({
       </div>
       <div className="chat-messages" ref={chatBodyRef}>
         {messages.map(msg => (
-          <div key={msg.id} className={`message ${msg.role}`}>
+          <div key={msg.id} className={`message ${msg.role}`} data-source={msg.source}>
             <div className="message-avatar">
               {msg.role === 'assistant' ? 'W' : (msg.content.charAt(0).toUpperCase() || 'U')}
             </div>
@@ -1642,6 +1772,7 @@ function ChatPanel({
                   {msg.source === "whatsapp" && <span className="message-source">📱 WhatsApp</span>}
                   {msg.source === "task" && <span className="message-source">📋 Task</span>}
                   {msg.source === "clarification" && <span className="message-source">❓ Clarification</span>}
+                  {msg.source === "system" && <span className="message-source">🔔 System</span>}
                   {msg.streaming && <span className="message-streaming">Typing</span>}
                 </div>
               )}
@@ -1854,9 +1985,13 @@ function ChatPanel({
       <div className="chat-input-container">
         <div className="chat-input-wrapper">
           <textarea
+            ref={textareaRef}
             className="chat-input"
             value={message}
-            onChange={e => setMessage(e.target.value)}
+            onChange={e => {
+              setMessage(e.target.value);
+              autoResizeTextarea();
+            }}
             onKeyDown={handleKeyDown}
             placeholder="Type a message..."
             rows={1}
@@ -1875,6 +2010,7 @@ function ChatPanel({
 // ─────────────────────────────────────────────────────────────────────────────
 
 function GoogleSetupModal({ onClose, onComplete }: { onClose: () => void; onComplete: () => void }) {
+  const [mode, setMode] = useState<"simple" | "advanced">("simple");
   const [step, setStep] = useState(1);
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
@@ -1899,9 +2035,33 @@ function GoogleSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
     }
   };
 
+  const handleSimpleConnect = async () => {
+    setAuthStatus("authorizing");
+    setAuthError("");
+
+    try {
+      // Check if already connected
+      const checkResult = await window.wovly.integrations.checkGoogleAuth();
+      if (checkResult.authorized) {
+        setAuthStatus("success");
+        setTimeout(() => {
+          onComplete();
+        }, 500);
+        return;
+      }
+
+      // Need to start OAuth flow - this will be implemented
+      setAuthStatus("error");
+      setAuthError("Google OAuth not yet configured. Please use Settings > Integrations.");
+    } catch (err) {
+      setAuthStatus("error");
+      setAuthError(err instanceof Error ? err.message : "Connection failed");
+    }
+  };
+
   const handleAuthorize = async () => {
     if (!clientId || !clientSecret) return;
-    
+
     setAuthStatus("authorizing");
     setAuthError("");
 
@@ -1930,13 +2090,88 @@ function GoogleSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={e => e.stopPropagation()}>
+      <div className="modal google-connect-modal" onClick={e => e.stopPropagation()}>
         <div className="modal-header">
-          <h2>Connect Google Workspace</h2>
+          <h2>{mode === "simple" ? "Connect Google" : "Connect Google Workspace"}</h2>
           <button className="close-btn" onClick={onClose}>×</button>
         </div>
         <div className="modal-body">
-          {step === 1 && (
+          {mode === "simple" ? (
+            <>
+              <div className="connect-hero">
+                <div className="google-logo">
+                  <svg width="48" height="48" viewBox="0 0 48 48">
+                    <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+                    <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+                    <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+                    <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+                  </svg>
+                </div>
+                <h3>Access Gmail, Calendar & Drive</h3>
+                <p>Connect your Google account to enable:</p>
+                <ul className="features-list">
+                  <li><span className="check">✓</span> Read emails for insights</li>
+                  <li><span className="check">✓</span> Manage calendar events</li>
+                  <li><span className="check">✓</span> Detect conflicts & follow-ups</li>
+                </ul>
+              </div>
+
+              {authStatus === "idle" && (
+                <>
+                  <button className="btn btn-google" onClick={handleSimpleConnect}>
+                    <svg width="18" height="18" viewBox="0 0 18 18" style={{ marginRight: '8px' }}>
+                      <path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.875 2.684-6.615z"/>
+                      <path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332C2.438 15.983 5.482 18 9 18z"/>
+                      <path fill="#FBBC05" d="M3.964 10.71c-.18-.54-.282-1.117-.282-1.71s.102-1.17.282-1.71V4.958H.957C.347 6.173 0 7.548 0 9s.348 2.827.957 4.042l3.007-2.332z"/>
+                      <path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0 5.482 0 2.438 2.017.957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z"/>
+                    </svg>
+                    Sign in with Google
+                  </button>
+                  <div className="advanced-toggle">
+                    <button className="link-btn" onClick={() => setMode("advanced")}>
+                      Advanced: Use my own OAuth app
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {authStatus === "authorizing" && (
+                <div className="auth-progress">
+                  <div className="spinner"></div>
+                  <p>Opening browser...</p>
+                  <small>Please approve permissions in the browser window</small>
+                </div>
+              )}
+
+              {authStatus === "success" && (
+                <div className="auth-success">
+                  <div className="checkmark">✓</div>
+                  <h4>Connected successfully!</h4>
+                  <p>Your Google account is now connected</p>
+                </div>
+              )}
+
+              {authStatus === "error" && (
+                <div className="auth-error">
+                  <div className="error-icon">⚠️</div>
+                  <h4>Connection failed</h4>
+                  <p>{authError}</p>
+                  <button className="btn btn-secondary" onClick={handleSimpleConnect}>
+                    Try Again
+                  </button>
+                </div>
+              )}
+
+              <div className="privacy-note">
+                <small>🔒 Your credentials are stored locally and never sent to our servers</small>
+              </div>
+            </>
+          ) : (
+            <>
+              <button className="back-to-simple" onClick={() => setMode("simple")}>
+                ← Back to simple setup
+              </button>
+              {step === 1 && (
             <>
               <h3>Step 1: Create a Google Cloud Project</h3>
               <ol>
@@ -2050,6 +2285,8 @@ function GoogleSetupModal({ onClose, onComplete }: { onClose: () => void; onComp
               )}
 
               <button className="btn btn-secondary" onClick={() => setStep(4)}>Back</button>
+            </>
+          )}
             </>
           )}
         </div>
@@ -2371,53 +2608,207 @@ function SlackSetupModal({ onClose, onComplete }: { onClose: () => void; onCompl
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// iMessage Setup Modal
+// iMessage Setup Modal - Wizard Style
 // ─────────────────────────────────────────────────────────────────────────────
 
-function IMessageSetupModal({ onClose }: { onClose: () => void }) {
-  const [testStatus, setTestStatus] = useState<"idle" | "testing" | "success" | "error">("idle");
-  const [testMessage, setTestMessage] = useState("");
+type PermissionStatus = 'checking' | 'granted' | 'denied' | 'unknown';
 
-  const handleTest = async () => {
-    setTestStatus("testing");
+function IMessageSetupModal({ onClose }: { onClose: () => void }) {
+  const [currentStep, setCurrentStep] = useState(1);
+  const [permissionStatus, setPermissionStatus] = useState<PermissionStatus>('checking');
+  const [testMessage, setTestMessage] = useState("");
+  const [isChecking, setIsChecking] = useState(false);
+
+  // Check permission status on mount and periodically
+  useEffect(() => {
+    checkPermissionStatus();
+    const interval = setInterval(checkPermissionStatus, 2000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const checkPermissionStatus = async () => {
     try {
       const result = await window.wovly.integrations.testIMessage();
       if (result.ok) {
-        setTestStatus("success");
-        setTestMessage(result.message || "Connection successful");
+        setPermissionStatus('granted');
+        setTestMessage("iMessage access is enabled!");
       } else {
-        setTestStatus("error");
-        setTestMessage(result.error || "Connection failed");
+        setPermissionStatus('denied');
+        setTestMessage(result.error || "Full Disk Access not granted");
       }
     } catch (err) {
-      setTestStatus("error");
-      setTestMessage(err instanceof Error ? err.message : "Test failed");
+      setPermissionStatus('unknown');
+      setTestMessage("Unable to check permission status");
+    }
+  };
+
+  const handleOpenSystemPreferences = async () => {
+    // Open System Preferences to Privacy & Security
+    // Note: This functionality needs to be implemented in the backend
+    console.log('Open System Preferences - Full Disk Access');
+  };
+
+  const handleTestAndContinue = async () => {
+    setIsChecking(true);
+    await checkPermissionStatus();
+    setIsChecking(false);
+
+    if (permissionStatus === 'granted') {
+      // Enable iMessage integration
+      await window.wovly.integrations.enableIMessage?.();
+      setTimeout(() => onClose(), 1500);
+    }
+  };
+
+  const getStatusIcon = () => {
+    switch (permissionStatus) {
+      case 'checking': return '⏳';
+      case 'granted': return '✅';
+      case 'denied': return '❌';
+      case 'unknown': return '❓';
+    }
+  };
+
+  const getStatusText = () => {
+    switch (permissionStatus) {
+      case 'checking': return 'Checking permissions...';
+      case 'granted': return 'Full Disk Access granted';
+      case 'denied': return 'Full Disk Access required';
+      case 'unknown': return 'Permission status unknown';
     }
   };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={e => e.stopPropagation()}>
+      <div className="modal modal-large" onClick={e => e.stopPropagation()}>
         <div className="modal-header">
-          <h2>iMessage Integration</h2>
+          <div className="modal-header-content">
+            <IMessageIcon size={32} />
+            <h2>iMessage Integration Setup</h2>
+          </div>
           <button className="close-btn" onClick={onClose}>×</button>
         </div>
-        <div className="modal-body">
-          <h3>Grant Full Disk Access</h3>
-          <p>To access your messages, this app needs Full Disk Access:</p>
-          <ol>
-            <li>Open System Settings → Privacy & Security → Full Disk Access</li>
-            <li>Click the + button</li>
-            <li>Add Electron (or your terminal app if running in dev mode)</li>
-            <li>Restart the app</li>
-          </ol>
-          
-          <button className="btn btn-primary" onClick={handleTest} disabled={testStatus === "testing"}>
-            {testStatus === "testing" ? "Testing..." : "Test iMessage Access"}
-          </button>
-          
-          {testStatus === "success" && <p className="success-text">✓ {testMessage}</p>}
-          {testStatus === "error" && <p className="error-text">✗ {testMessage}</p>}
+
+        <div className="modal-body imessage-wizard">
+          {/* Progress Steps */}
+          <div className="wizard-steps">
+            <div className={`wizard-step ${currentStep >= 1 ? 'active' : ''} ${permissionStatus === 'granted' ? 'completed' : ''}`}>
+              <div className="step-number">{permissionStatus === 'granted' ? '✓' : '1'}</div>
+              <div className="step-label">Grant Permission</div>
+            </div>
+            <div className="wizard-step-connector"></div>
+            <div className={`wizard-step ${currentStep >= 2 ? 'active' : ''} ${permissionStatus === 'granted' ? 'completed' : ''}`}>
+              <div className="step-number">{permissionStatus === 'granted' ? '✓' : '2'}</div>
+              <div className="step-label">Test Access</div>
+            </div>
+            <div className="wizard-step-connector"></div>
+            <div className={`wizard-step ${currentStep >= 3 ? 'active' : ''} ${permissionStatus === 'granted' ? 'completed' : ''}`}>
+              <div className="step-number">{permissionStatus === 'granted' ? '✓' : '3'}</div>
+              <div className="step-label">Complete</div>
+            </div>
+          </div>
+
+          {/* Permission Status Card */}
+          <div className={`permission-status-card ${permissionStatus}`}>
+            <div className="status-icon">{getStatusIcon()}</div>
+            <div className="status-content">
+              <h3>{getStatusText()}</h3>
+              <p className="status-message">{testMessage}</p>
+            </div>
+          </div>
+
+          {/* Instructions */}
+          {permissionStatus !== 'granted' && (
+            <div className="wizard-instructions">
+              <h3>📋 Setup Instructions</h3>
+              <div className="instruction-steps">
+                <div className="instruction-step">
+                  <div className="instruction-number">1</div>
+                  <div className="instruction-content">
+                    <h4>Open System Settings</h4>
+                    <p>Click the button below to open Privacy & Security settings</p>
+                    <button
+                      className="btn btn-primary instruction-button"
+                      onClick={handleOpenSystemPreferences}
+                    >
+                      🔓 Open System Settings
+                    </button>
+                  </div>
+                </div>
+
+                <div className="instruction-step">
+                  <div className="instruction-number">2</div>
+                  <div className="instruction-content">
+                    <h4>Navigate to Full Disk Access</h4>
+                    <p>In System Settings, go to:</p>
+                    <div className="path-highlight">
+                      Privacy & Security → Full Disk Access
+                    </div>
+                  </div>
+                </div>
+
+                <div className="instruction-step">
+                  <div className="instruction-number">3</div>
+                  <div className="instruction-content">
+                    <h4>Add Wovly to the list</h4>
+                    <p>Click the <strong>+</strong> button and select:</p>
+                    <ul className="app-list">
+                      <li>✅ <strong>Wovly</strong> (if running packaged app)</li>
+                      <li>✅ <strong>Electron</strong> (if running in development)</li>
+                      <li>✅ <strong>Terminal</strong> or <strong>iTerm</strong> (if running from terminal)</li>
+                    </ul>
+                  </div>
+                </div>
+
+                <div className="instruction-step">
+                  <div className="instruction-number">4</div>
+                  <div className="instruction-content">
+                    <h4>Toggle the switch ON</h4>
+                    <p>Enable the toggle next to the app you added</p>
+                  </div>
+                </div>
+
+                <div className="instruction-step">
+                  <div className="instruction-number">5</div>
+                  <div className="instruction-content">
+                    <h4>Verify Access</h4>
+                    <p>Come back here and click "Test Access" below</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Success Message */}
+          {permissionStatus === 'granted' && (
+            <div className="wizard-success">
+              <div className="success-icon">🎉</div>
+              <h3>You're all set!</h3>
+              <p>Wovly can now access your iMessages and SMS. You can start chatting with your messages integrated into your workflow.</p>
+            </div>
+          )}
+        </div>
+
+        <div className="modal-footer">
+          {permissionStatus !== 'granted' ? (
+            <>
+              <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+              <button
+                className="btn btn-primary"
+                onClick={handleTestAndContinue}
+                disabled={isChecking}
+              >
+                {isChecking ? '⏳ Checking...' : '🔍 Test Access'}
+              </button>
+            </>
+          ) : (
+            <button
+              className="btn btn-primary"
+              onClick={handleTestAndContinue}
+            >
+              ✓ Complete Setup
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -4900,7 +5291,7 @@ function IntegrationsPage() {
 
       // Load custom web integrations
       const webIntegrationsResult = await window.wovly.webscraper?.listIntegrations();
-      if (webIntegrationsResult?.ok) {
+      if (webIntegrationsResult?.success) {
         setCustomWebIntegrations(webIntegrationsResult.integrations || []);
       }
     };
@@ -4989,16 +5380,8 @@ function IntegrationsPage() {
     setIMessageTestResult(null);
 
     if (newValue) {
-      // Enabling - check accessibility first
-      const result = await window.wovly.integrations.enableIMessage?.();
-      if (result?.ok) {
-        setIMessageEnabled(true);
-        setIMessageAccessible(true);
-        setIMessageTestResult({ ok: true, message: "iMessage integration enabled successfully" });
-      } else {
-        // Backend provides detailed error message including correct app name (Terminal vs Wovly)
-        setIMessageTestResult({ ok: false, message: result?.error || "Failed to enable iMessage" });
-      }
+      // Enabling - open wizard modal
+      setShowIMessageSetup(true);
     } else {
       // Disabling
       const result = await window.wovly.integrations.disableIMessage?.();
@@ -5142,7 +5525,18 @@ function IntegrationsPage() {
       </div>
 
       <div className="page-content">
-        <div className="integrations-grid">
+        {/* Primary Integrations Section */}
+        <div style={{ marginBottom: 'var(--space-8)' }}>
+          <h2 style={{
+            fontSize: 'var(--text-lg)',
+            fontWeight: 600,
+            marginBottom: 'var(--space-4)',
+            color: 'var(--text-primary)'
+          }}>
+            Primary Integrations
+          </h2>
+          <div className="integrations-grid">
+          {/* Google */}
           <div className={`integration-card ${googleConnected ? "connected" : ""}`}>
             <div className="integration-header">
               <GoogleIcon className="integration-icon" size={40} />
@@ -5170,40 +5564,6 @@ function IntegrationsPage() {
             {googleTestResult && (
               <div className={`badge ${googleTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
                 {googleTestResult.ok ? `✓ ${googleTestResult.message}` : `✗ ${googleTestResult.message}`}
-              </div>
-            )}
-          </div>
-
-          {/* Weather */}
-          <div className={`integration-card ${weatherEnabled ? "connected" : ""}`}>
-            <div className="integration-header">
-              <WeatherIcon className="integration-icon" size={40} />
-              <h3 className="integration-name">Weather</h3>
-              <span className={`connection-status ${weatherEnabled ? "connected" : "disconnected"}`}>
-                {weatherEnabled ? "Enabled" : "Disabled"}
-              </span>
-            </div>
-            <p className="integration-description">
-              Forecasts, current conditions, alerts
-              <span style={{ display: 'block', fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-1)' }}>
-                No API key required (Open-Meteo)
-              </span>
-            </p>
-            <div className="integration-actions">
-              {weatherEnabled ? (
-                <>
-                  <button className="btn btn-ghost" onClick={handleTestWeather} disabled={testingWeather}>
-                    {testingWeather ? "Testing..." : "Test"}
-                  </button>
-                  <button className="btn btn-secondary" onClick={handleToggleWeather}>Disable</button>
-                </>
-              ) : (
-                <button className="btn btn-primary" onClick={handleToggleWeather}>Enable</button>
-              )}
-            </div>
-            {weatherTestResult && (
-              <div className={`badge ${weatherTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
-                {weatherTestResult.ok ? `✓ ${weatherTestResult.message}` : `✗ ${weatherTestResult.message}`}
               </div>
             )}
           </div>
@@ -5317,6 +5677,176 @@ function IntegrationsPage() {
               </div>
             )}
           </div>
+
+          {/* Custom Websites - Connected ones first */}
+          {customWebIntegrations.filter((i: any) => i.enabled).map((integration: any) => (
+            <div key={integration.id} className={`integration-card ${integration.enabled ? "connected" : ""}`}>
+              <div className="integration-header">
+                <div className="integration-icon" style={{ fontSize: "32px", display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  🌐
+                </div>
+                <h3 className="integration-name">{integration.name}</h3>
+                <span className={`connection-status ${integration.enabled ? "connected" : "disconnected"}`}>
+                  {integration.enabled ? "Connected" : "Disabled"}
+                </span>
+              </div>
+              <p className="integration-description">
+                {integration.url}
+                <span style={{ display: 'block', fontSize: 'var(--text-xs)', marginTop: 'var(--space-1)', color: 'var(--text-tertiary)' }}>
+                  {integration.siteType ? `${integration.siteType} portal` : 'Custom website'}
+                </span>
+              </p>
+              <div className="integration-actions">
+                <button
+                  className="btn btn-ghost"
+                  onClick={async () => {
+                    try {
+                      await (window as any).wovly.webscraper.updateIntegration(integration.id, { enabled: false });
+                      await loadCustomIntegrations();
+                    } catch (err) {
+                      console.error('Failed to disable integration:', err);
+                    }
+                  }}
+                >
+                  Disconnect
+                </button>
+                <button className="btn btn-ghost" onClick={() => {
+                  setShowManageIntegrations(true);
+                }}>
+                  Settings
+                </button>
+              </div>
+            </div>
+          ))}
+
+          {/* Add New Custom Website */}
+          <div className="integration-card">
+            <div className="integration-header">
+              <div className="integration-icon" style={{ fontSize: "32px", display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                ➕
+              </div>
+              <h3 className="integration-name">Add Custom Website</h3>
+              <span className="connection-status disconnected">
+                {customWebIntegrations.length > 0 ? `${customWebIntegrations.length} configured` : 'Not configured'}
+              </span>
+            </div>
+            <p className="integration-description">
+              Scrape messages from websites without APIs
+              <span style={{ display: 'block', fontSize: 'var(--text-xs)', marginTop: 'var(--space-1)', color: 'var(--text-tertiary)' }}>
+                Daycare portals, tax sites, school systems, etc.
+              </span>
+            </p>
+            <div className="integration-actions">
+              <button className="btn btn-primary" onClick={() => setShowAddWebIntegration(true)}>
+                Add Website
+              </button>
+              {customWebIntegrations.length > 0 && (
+                <button className="btn btn-ghost" onClick={() => setShowManageIntegrations(true)}>
+                  Manage ({customWebIntegrations.length})
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Custom Websites - Disabled ones */}
+          {customWebIntegrations.filter((i: any) => !i.enabled).map((integration: any) => (
+            <div key={integration.id} className="integration-card">
+              <div className="integration-header">
+                <div className="integration-icon" style={{ fontSize: "32px", display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  🌐
+                </div>
+                <h3 className="integration-name">{integration.name}</h3>
+                <span className="connection-status disconnected">
+                  Disabled
+                </span>
+              </div>
+              <p className="integration-description">
+                {integration.url}
+                <span style={{ display: 'block', fontSize: 'var(--text-xs)', marginTop: 'var(--space-1)', color: 'var(--text-tertiary)' }}>
+                  {integration.siteType ? `${integration.siteType} portal` : 'Custom website'}
+                </span>
+              </p>
+              <div className="integration-actions">
+                <button
+                  className="btn btn-primary"
+                  onClick={async () => {
+                    try {
+                      await (window as any).wovly.webscraper.updateIntegration(integration.id, { enabled: true });
+                      await loadCustomIntegrations();
+                    } catch (err) {
+                      console.error('Failed to enable integration:', err);
+                    }
+                  }}
+                >
+                  Enable
+                </button>
+                <button className="btn btn-ghost" onClick={() => setShowManageIntegrations(true)}>
+                  Settings
+                </button>
+              </div>
+            </div>
+          ))}
+
+          {/* Weather */}
+          <div className={`integration-card ${weatherEnabled ? "connected" : ""}`}>
+            <div className="integration-header">
+              <WeatherIcon className="integration-icon" size={40} />
+              <h3 className="integration-name">Weather</h3>
+              <span className={`connection-status ${weatherEnabled ? "connected" : "disconnected"}`}>
+                {weatherEnabled ? "Enabled" : "Disabled"}
+              </span>
+            </div>
+            <p className="integration-description">
+              Forecasts, current conditions, alerts
+              <span style={{ display: 'block', fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-1)' }}>
+                No API key required (Open-Meteo)
+              </span>
+            </p>
+            <div className="integration-actions">
+              {weatherEnabled ? (
+                <>
+                  <button className="btn btn-ghost" onClick={handleTestWeather} disabled={testingWeather}>
+                    {testingWeather ? "Testing..." : "Test"}
+                  </button>
+                  <button className="btn btn-secondary" onClick={handleToggleWeather}>Disable</button>
+                </>
+              ) : (
+                <button className="btn btn-primary" onClick={handleToggleWeather}>Enable</button>
+              )}
+            </div>
+            {weatherTestResult && (
+              <div className={`badge ${weatherTestResult.ok ? "badge-success" : "badge-error"}`} style={{ marginTop: 'var(--space-3)' }}>
+                {weatherTestResult.ok ? `✓ ${weatherTestResult.message}` : `✗ ${weatherTestResult.message}`}
+              </div>
+            )}
+          </div>
+        </div>
+        </div>
+
+        {/* Beta Integrations Section */}
+        <div>
+          <h2 style={{
+            fontSize: 'var(--text-lg)',
+            fontWeight: 600,
+            marginBottom: 'var(--space-4)',
+            color: 'var(--text-primary)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--space-2)'
+          }}>
+            Beta Integrations
+            <span style={{
+              fontSize: 'var(--text-xs)',
+              fontWeight: 500,
+              padding: '2px 8px',
+              background: 'var(--warning-bg, #fef3c7)',
+              color: 'var(--warning, #f59e0b)',
+              borderRadius: '4px'
+            }}>
+              Experimental
+            </span>
+          </h2>
+          <div className="integrations-grid">
 
           {/* Telegram */}
           <div className={`integration-card ${telegramConnected ? "connected" : ""}`}>
@@ -5567,118 +6097,8 @@ function IntegrationsPage() {
               </div>
             )}
           </div>
-
-          {/* Custom Websites - Connected ones first */}
-          {customWebIntegrations.filter((i: any) => i.enabled).map((integration: any) => (
-            <div key={integration.id} className={`integration-card ${integration.enabled ? "connected" : ""}`}>
-              <div className="integration-header">
-                <div className="integration-icon" style={{ fontSize: "32px", display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  🌐
-                </div>
-                <h3 className="integration-name">{integration.name}</h3>
-                <span className={`connection-status ${integration.enabled ? "connected" : "disconnected"}`}>
-                  {integration.enabled ? "Connected" : "Disabled"}
-                </span>
-              </div>
-              <p className="integration-description">
-                {integration.url}
-                <span style={{ display: 'block', fontSize: 'var(--text-xs)', marginTop: 'var(--space-1)', color: 'var(--text-tertiary)' }}>
-                  {integration.siteType ? `${integration.siteType} portal` : 'Custom website'}
-                </span>
-              </p>
-              <div className="integration-actions">
-                <button
-                  className="btn btn-ghost"
-                  onClick={async () => {
-                    try {
-                      await (window as any).wovly.webscraper.updateIntegration(integration.id, { enabled: false });
-                      await loadCustomIntegrations();
-                    } catch (err) {
-                      console.error('Failed to disable integration:', err);
-                    }
-                  }}
-                >
-                  Disconnect
-                </button>
-                <button className="btn btn-ghost" onClick={() => {
-                  setShowManageIntegrations(true);
-                }}>
-                  Settings
-                </button>
-              </div>
-            </div>
-          ))}
-
-          {/* Add New Custom Website - Show first after connected integrations */}
-          <div className="integration-card">
-            <div className="integration-header">
-              <div className="integration-icon" style={{ fontSize: "32px", display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                ➕
-              </div>
-              <h3 className="integration-name">Add Custom Website</h3>
-              <span className="connection-status disconnected">
-                {customWebIntegrations.length > 0 ? `${customWebIntegrations.length} configured` : 'Not configured'}
-              </span>
-            </div>
-            <p className="integration-description">
-              Scrape messages from websites without APIs
-              <span style={{ display: 'block', fontSize: 'var(--text-xs)', marginTop: 'var(--space-1)', color: 'var(--text-tertiary)' }}>
-                Daycare portals, tax sites, school systems, etc.
-              </span>
-            </p>
-            <div className="integration-actions">
-              <button className="btn btn-primary" onClick={() => setShowAddWebIntegration(true)}>
-                Add Website
-              </button>
-              {customWebIntegrations.length > 0 && (
-                <button className="btn btn-ghost" onClick={() => setShowManageIntegrations(true)}>
-                  Manage ({customWebIntegrations.length})
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* Custom Websites - Disabled ones at the end */}
-          {customWebIntegrations.filter((i: any) => !i.enabled).map((integration: any) => (
-            <div key={integration.id} className="integration-card">
-              <div className="integration-header">
-                <div className="integration-icon" style={{ fontSize: "32px", display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  🌐
-                </div>
-                <h3 className="integration-name">{integration.name}</h3>
-                <span className="connection-status disconnected">
-                  Disabled
-                </span>
-              </div>
-              <p className="integration-description">
-                {integration.url}
-                <span style={{ display: 'block', fontSize: 'var(--text-xs)', marginTop: 'var(--space-1)', color: 'var(--text-tertiary)' }}>
-                  {integration.siteType ? `${integration.siteType} portal` : 'Custom website'}
-                </span>
-              </p>
-              <div className="integration-actions">
-                <button
-                  className="btn btn-primary"
-                  onClick={async () => {
-                    try {
-                      await (window as any).wovly.webscraper.updateIntegration(integration.id, { enabled: true });
-                      await loadCustomIntegrations();
-                    } catch (err) {
-                      console.error('Failed to enable integration:', err);
-                    }
-                  }}
-                >
-                  Connect
-                </button>
-                <button className="btn btn-ghost" onClick={() => {
-                  setShowManageIntegrations(true);
-                }}>
-                  Settings
-                </button>
-              </div>
-            </div>
-          ))}
         </div>
+      </div>
 
         {showGoogleSetup && (
           <GoogleSetupModal
@@ -5843,10 +6263,11 @@ function IntegrationsPage() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ANTHROPIC_MODELS = [
-  { id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4 (Latest)" },
-  { id: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet" },
-  { id: "claude-3-5-haiku-20241022", name: "Claude 3.5 Haiku (Fast)" },
-  { id: "claude-3-opus-20240229", name: "Claude 3 Opus" },
+  { id: "claude-opus-4-6", name: "Claude Opus 4.6 (Most Capable)" },
+  { id: "claude-sonnet-4-5-20250929", name: "Claude Sonnet 4.5 (Recommended)" },
+  { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5 (Fastest)" },
+  { id: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet (Legacy)" },
+  { id: "claude-3-opus-20240229", name: "Claude 3 Opus (Legacy)" },
 ];
 
 const OPENAI_MODELS = [
@@ -6232,7 +6653,7 @@ function AboutMePage() {
       setGoalsLoading(true);
       try {
         const result = await window.wovly.profile.get();
-        if (result.ok && result.profile.goals) {
+        if (result.ok && result.profile && result.profile.goals) {
           setGoals(result.profile.goals);
         }
       } catch (err) {
@@ -6304,7 +6725,7 @@ function AboutMePage() {
     // Reload goals from profile
     try {
       const result = await window.wovly.profile.get();
-      if (result.ok && result.profile.goals) {
+      if (result.ok && result.profile && result.profile.goals) {
         setGoals(result.profile.goals);
       }
     } catch (err) {
@@ -6398,14 +6819,17 @@ function AboutMePage() {
             <div className="loading-spinner"></div>
           ) : editingGoals ? (
             <div className="goals-editor">
-              <div className="goals-list">
+              <div className="goals-grid">
                 {goals.map((goal, index) => (
-                  <div key={index} className="goal-item">
-                    <span>{goal}</span>
+                  <div key={index} className="goal-card editing">
+                    <div className="goal-card-content">
+                      <span className="goal-text">{goal}</span>
+                    </div>
                     <button
-                      className="btn-ghost goal-remove-btn"
+                      className="goal-remove-btn"
                       onClick={() => handleRemoveGoal(index)}
                       aria-label="Remove goal"
+                      title="Remove goal"
                     >
                       ×
                     </button>
@@ -6429,11 +6853,16 @@ function AboutMePage() {
               {goals.length === 0 ? (
                 <p className="empty-goals">No goals set. Click Edit Goals to add your priorities.</p>
               ) : (
-                <ul className="goals-list">
+                <div className="goals-grid">
                   {goals.map((goal, index) => (
-                    <li key={index}>{goal}</li>
+                    <div key={index} className="goal-card">
+                      <div className="goal-card-icon">🎯</div>
+                      <div className="goal-card-content">
+                        <span className="goal-text">{goal}</span>
+                      </div>
+                    </div>
                   ))}
-                </ul>
+                </div>
               )}
             </div>
           )}
@@ -6487,6 +6916,12 @@ function SettingsPage() {
   const [activeProvider, setActiveProvider] = useState<LLMProvider>("anthropic");
   const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(true);
+
+  // Integration settings state
+  const [weatherEnabled, setWeatherEnabled] = useState(true);
+  const [browserEnabled, setBrowserEnabled] = useState(false);
+  const [iMessageEnabled, setIMessageEnabled] = useState(false);
+  const [iMessageAccessible, setIMessageAccessible] = useState(false);
 
   useEffect(() => {
     const loadSettings = async () => {
@@ -7215,6 +7650,19 @@ export default function App() {
     setTheme(prev => prev === 'light' ? 'dark' : 'light');
   };
 
+  // Handle insight action click - set message and navigate to chat
+  const handleInsightAction = (insight: Insight) => {
+    if (!insight.actionData?.prompt) return;
+
+    // Set the pending message that will be picked up by ChatPanel
+    setPendingChatMessage(insight.actionData.prompt);
+
+    // Navigate to chat tab if not already there
+    if (navItem !== 'chat') {
+      setNavItem('chat');
+    }
+  };
+
   // Authentication state
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
@@ -7235,6 +7683,9 @@ export default function App() {
   // Onboarding resume banner state
   const [showOnboardingBanner, setShowOnboardingBanner] = useState(false);
   const [onboardingStatus, setOnboardingStatus] = useState<OnboardingStatus | null>(null);
+
+  // Pending chat message from insights action
+  const [pendingChatMessage, setPendingChatMessage] = useState<string | null>(null);
 
   // Check auth session on mount
   useEffect(() => {
@@ -7551,13 +8002,18 @@ export default function App() {
         
         {navItem === "chat" && (
           <div className="content-grid">
-            <AgendaPanel onNavigate={setNavItem} />
+            <AgendaPanel
+              onNavigate={setNavItem}
+              onInsightActionClick={handleInsightAction}
+            />
             <ChatPanel
               messages={chatMessages}
               setMessages={setChatMessages}
               initialized={chatInitialized}
               setInitialized={setChatInitialized}
               onNavigate={setNavItem}
+              pendingMessage={pendingChatMessage}
+              onPendingMessageUsed={() => setPendingChatMessage(null)}
             />
           </div>
         )}

@@ -18,5 +18,8 @@
   "devDependencies": {
     "concurrently": "^9.0.0",
     "puppeteer-core": "^24.37.3"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.6.2"
   }
 }

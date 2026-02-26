@@ -36,6 +36,7 @@ type WovlyFullProfile = {
   onboardingStage: OnboardingStage;
   onboardingSkippedAt: string | null;
   notes: string[]; // Custom facts and notes
+  goals?: string[]; // User's goals and priorities
 };
 
 type OnboardingStatus = {
@@ -67,10 +68,13 @@ type WhatsAppStatusData = {
 };
 
 type ChatMessage = {
+  id?: string;
   role: "user" | "assistant";
   content: string;
-  source?: "app" | "whatsapp" | "task" | "decomposed" | "clarification";
-  timestamp?: number;
+  source?: "app" | "whatsapp" | "task" | "decomposed" | "clarification" | "system";
+  timestamp?: number | string;
+  streaming?: boolean;
+  images?: string[];
 };
 
 type ClarificationQuestion = {
@@ -281,6 +285,10 @@ type WovlyIpcApi = {
         success: boolean;
       }>;
     }>;
+    sendStream?: (
+      messages: Array<{ role: string; content: string }>,
+      workflowContext?: { type: string; original_query?: string } | null
+    ) => Promise<void>;
     executeInline: (decomposition: {
       title: string;
       task_type?: "discrete" | "continuous";
@@ -304,6 +312,11 @@ type WovlyIpcApi = {
     }>;
     onNewMessage: (callback: (message: ChatMessage) => void) => () => void;
     onScreenshot?: (callback: (data: { dataUrl: string }) => void) => () => void;
+    onSystemNotification?: (callback: (data: { type: string; message: string; timestamp: string }) => void) => () => void;
+    onStreamDelta?: (callback: (data: { delta: string; fullText: string }) => void) => () => void;
+    onStreamTool?: (callback: (data: { toolUse: any }) => void) => () => void;
+    onStreamComplete?: (callback: (data: { result: any }) => void) => () => void;
+    onStreamError?: (callback: (data: { error: string }) => void) => () => void;
   };
   messageConfirmation: {
     approve: (confirmationId: string) => Promise<{ ok: boolean; error?: string }>;
@@ -320,6 +333,14 @@ type WovlyIpcApi = {
         cc?: string;
       };
     }) => void) => () => void;
+  };
+  insights?: {
+    getToday: (limit?: number) => Promise<{ ok: boolean; insights?: any[]; error?: string }>;
+    refresh: (limit?: number) => Promise<{ ok: boolean; insights?: any[]; error?: string }>;
+    setLimit: (limit: number) => Promise<{ ok: boolean; error?: string }>;
+    getLimit: () => Promise<{ ok: boolean; limit?: number; error?: string }>;
+    onUpdate: (callback: (data: any) => void) => () => void;
+    onUpdated?: (callback: (data: any) => void) => () => void;
   };
   calendar: {
     getEvents: (date: string) => Promise<{
@@ -347,14 +368,18 @@ type WovlyIpcApi = {
       error?: string;
       team?: { id: string; name: string };
     }>;
-    checkSlackAuth: () => Promise<{ 
-      ok: boolean; 
+    checkSlackAuth: () => Promise<{
+      ok: boolean;
       authorized: boolean;
       team?: { id: string; name: string };
     }>;
     disconnectSlack: () => Promise<{ ok: boolean; error?: string }>;
     setWeatherEnabled: (enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
     getWeatherEnabled: () => Promise<{ ok: boolean; enabled: boolean }>;
+    // iMessage
+    enableIMessage?: () => Promise<{ ok: boolean; message?: string; error?: string }>;
+    disableIMessage?: () => Promise<{ ok: boolean; message?: string; error?: string }>;
+    getIMessageStatus?: () => Promise<{ ok: boolean; enabled: boolean; accessible: boolean; error?: string }>;
     // Browser Automation (CDP-based)
     getBrowserEnabled: () => Promise<{ ok: boolean; enabled: boolean }>;
     setBrowserEnabled: (enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
@@ -574,25 +599,33 @@ type WovlyIpcApi = {
   };
   // Credentials - secure local storage for website logins
   credentials: {
-    list: () => Promise<{ 
-      ok: boolean; 
+    list: () => Promise<{
+      ok: boolean;
       credentials?: CredentialListItem[];
       error?: string;
     }>;
-    get: (domain: string, includePassword?: boolean) => Promise<{ 
-      ok: boolean; 
+    get: (domain: string, includePassword?: boolean) => Promise<{
+      ok: boolean;
       credential?: WovlyCredential;
       error?: string;
     }>;
-    save: (credential: CredentialInput) => Promise<{ 
+    save: (credential: CredentialInput) => Promise<{
       ok: boolean;
       domain?: string;
       error?: string;
     }>;
-    delete: (domain: string) => Promise<{ 
+    delete: (domain: string) => Promise<{
       ok: boolean;
       error?: string;
     }>;
+  };
+  // Web Scraper - custom website integrations
+  webscraper?: {
+    listIntegrations: () => Promise<{ success: boolean; integrations?: any[]; error?: string }>;
+    updateIntegration: (siteId: string, updates: any) => Promise<{ success: boolean; error?: string }>;
+    testIntegration: (siteId: string) => Promise<{ success: boolean; messageCount?: number; error?: string }>;
+    deleteIntegration: (siteId: string) => Promise<{ success: boolean; error?: string }>;
+    launchOAuthLogin: (params: any) => Promise<{ success: boolean; error?: string }>;
   };
   // Shell utilities
   shell: {

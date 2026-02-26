@@ -16,6 +16,14 @@ const { callLLMWithRetry } = require("./dist/utils/retry");
 const { responseCache, entityCache } = require("./dist/utils/cache");
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Import integration registry (NEW - modular integrations)
+// ─────────────────────────────────────────────────────────────────────────────
+const {
+  getAllTools: getIntegrationTools,
+  executeTool: executeIntegrationTool
+} = require("./dist/integrations");
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Import modular components from src/
 // ─────────────────────────────────────────────────────────────────────────────
 const {
@@ -113,6 +121,8 @@ const {
   checkForNewIMessages,
   checkForNewSlackMessages,
   checkForNewEmails,
+  getConversationStyleContext,
+  generateStyleGuide,
   // Tools
   timeTools,
   executeTimeTool,
@@ -145,8 +155,12 @@ const {
   CredentialsService,
   AuthService,
   OnboardingService,
+  TutorialService,
   SkillsService,
   TasksService,
+  TaskMessagingService,
+  TaskExecutionEngine,
+  TaskSchedulerService,
   IntegrationsService,
   CalendarService,
   InsightsService,
@@ -164,59 +178,7 @@ const {
   WelcomeService,
 } = require("./src");
 
-// Tutorial / Onboarding
-const {
-  ONBOARDING_STAGES,
-  isInOnboarding,
-  getNextStage,
-  isProfileComplete,
-  processProfileStageMessage,
-  getStageWelcomeMessage,
-  checkStageAdvancement,
-  shouldUseTutorialMode,
-  generateTutorialResponse
-} = require("./src/tutorial");
-
 // Note: BrowserController is now imported from ./src/browser/controller.js
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Shared Onboarding Helper - Check if skill demo is completed (Marco -> Polo)
-// This is shared between chat:send and chat:executeInline handlers
-// ─────────────────────────────────────────────────────────────────────────────
-async function checkSkillDemoCompletionShared(userMsg, assistantResp, username, winRef) {
-  if (!username) return;
-  
-  try {
-    const profilePath = await getUserProfilePath(username);
-    const markdown = await fs.readFile(profilePath, "utf8");
-    const profile = parseUserProfile(markdown);
-    
-    if (profile.onboardingStage === "skill_demo") {
-      // Check if user said "marco" (case insensitive) and got "polo" in response
-      const userSaidMarco = userMsg.toLowerCase().includes("marco");
-      const responseSaidPolo = assistantResp.toLowerCase().includes("polo");
-      
-      if (userSaidMarco && responseSaidPolo) {
-        console.log("[Onboarding] Skill test passed (Marco/Polo), advancing to integrations stage");
-        profile.onboardingStage = "integrations";
-        await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
-        
-        // Send the integrations message after a brief delay
-        setTimeout(() => {
-          if (winRef && winRef.webContents) {
-            winRef.webContents.send("chat:newMessage", {
-              role: "assistant",
-              content: `You're almost done! To unlock Wovly's full potential, connect some integrations:\n\n**Recommended:**\n- **Google Workspace** - Email and calendar management\n- **iMessage** (macOS) - Send and receive texts\n- **Slack** - Team messaging\n- **Browser Automation** - Web research and form filling\n\nHead to the **Integrations** page to connect these, or say "skip" to finish onboarding.\n\nBy the way, you can continue to tell me important facts about yourself. Just share them and I'll ask if you want me to save them to your profile. Things like your spouse's name, your pet's name, allergies, important dates, or preferences.`,
-              source: "app"
-            });
-          }
-        }, 1000);
-      }
-    }
-  } catch (err) {
-    console.error("[Onboarding] Error checking skill demo completion:", err.message);
-  }
-}
 
 // Global browser controller instance (module-level for reference)
 let browserController = null;
@@ -229,6 +191,9 @@ async function _getBrowserController(username) {
 
 // Currently logged in user (module-level for cross-function access)
 let currentUser = null;
+
+// Last welcome response (for profile question tracking)
+let lastWelcomeResponse = null;
 
 let win;
 
@@ -519,337 +484,6 @@ let whatsappSaveCreds = null;
 // Note: Session, auth, and utility functions are now imported from ./src
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Wait-for-Reply Workflow Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Use LLM to evaluate if a reply satisfies the success criteria
- * @param {Object} params - Evaluation parameters
- * @param {string} params.replyContent - The content of the reply
- * @param {string} params.originalRequest - What was originally requested
- * @param {string} params.successCriteria - What constitutes a satisfactory reply
- * @param {string} params.contact - Who the reply is from
- * @param {Object} apiKeys - API keys for LLM
- * @returns {Object} { satisfies: boolean, reason: string, extractedInfo: string }
- */
-async function evaluateReplyWithLLM(params, apiKeys) {
-  const { replyContent, originalRequest, successCriteria, contact } = params;
-  
-  if (!apiKeys?.anthropic) {
-    console.log("[WaitForReply] No API key for LLM evaluation, assuming reply satisfies criteria");
-    return { satisfies: true, reason: "No API key available for evaluation", extractedInfo: replyContent };
-  }
-  
-  console.log(`[WaitForReply] Evaluating reply from ${contact}`);
-  console.log(`[WaitForReply] Original request: ${originalRequest}`);
-  console.log(`[WaitForReply] Success criteria: ${successCriteria}`);
-  console.log(`[WaitForReply] Reply content: ${replyContent?.substring(0, 200)}...`);
-  
-  const prompt = `You are evaluating if a reply to a message satisfies the original request.
-
-ORIGINAL REQUEST:
-${originalRequest}
-
-SUCCESS CRITERIA:
-${successCriteria}
-
-REPLY FROM ${contact}:
-${replyContent}
-
-TASK:
-Determine if this reply satisfies the success criteria. Be reasonable - if the person has provided the requested information, even if not perfectly formatted, it should be considered satisfactory.
-
-Respond with ONLY a JSON object (no markdown, no explanation):
-{
-  "satisfies": true or false,
-  "reason": "Brief explanation of why the reply does or doesn't satisfy the criteria",
-  "extractedInfo": "If satisfies=true, extract the key information from the reply. If satisfies=false, leave empty."
-}`;
-
-  try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKeys.anthropic,
-        "anthropic-version": "2023-06-01"
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 500,
-        messages: [{ role: "user", content: prompt }]
-      })
-    });
-    
-    if (!response.ok) {
-      console.error("[WaitForReply] LLM API error:", response.status);
-      return { satisfies: false, reason: "LLM evaluation failed", extractedInfo: "" };
-    }
-    
-    const data = await response.json();
-    const content = data.content?.[0]?.text || "";
-    
-    // Parse JSON from response
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const result = JSON.parse(jsonMatch[0]);
-      console.log(`[WaitForReply] Evaluation result: satisfies=${result.satisfies}, reason=${result.reason}`);
-      return {
-        satisfies: result.satisfies === true,
-        reason: result.reason || "",
-        extractedInfo: result.extractedInfo || ""
-      };
-    }
-    
-    console.log("[WaitForReply] Could not parse LLM response, assuming not satisfied");
-    return { satisfies: false, reason: "Could not parse evaluation response", extractedInfo: "" };
-    
-  } catch (err) {
-    console.error("[WaitForReply] Evaluation error:", err.message);
-    return { satisfies: false, reason: `Evaluation error: ${err.message}`, extractedInfo: "" };
-  }
-}
-
-/**
- * Generate a follow-up message using LLM based on the original request and any unsatisfactory reply
- * @param {Object} params - Generation parameters
- * @param {string} params.originalRequest - What was originally requested
- * @param {string} params.previousReply - The unsatisfactory reply (if any)
- * @param {string} params.reason - Why the previous reply was unsatisfactory
- * @param {number} params.followupCount - How many follow-ups have been sent
- * @param {boolean} params.isTimeout - Whether this is a timeout follow-up (no reply received)
- * @param {Object} apiKeys - API keys for LLM
- * @returns {string} The follow-up message to send
- */
-async function generateFollowupMessage(params, apiKeys) {
-  const { originalRequest, previousReply, reason, followupCount, isTimeout } = params;
-  
-  if (!apiKeys?.anthropic) {
-    // Fallback message if no API key
-    if (isTimeout) {
-      return `Hi, I wanted to follow up on my previous message. ${originalRequest} Please let me know when you have a chance.`;
-    }
-    return `Thanks for your response. Could you please provide more details? ${originalRequest}`;
-  }
-  
-  const prompt = `You need to write a polite follow-up message.
-
-ORIGINAL REQUEST:
-${originalRequest}
-
-${isTimeout ? `This is follow-up #${followupCount + 1} because the recipient hasn't responded yet.` : `
-THEIR PREVIOUS REPLY:
-${previousReply}
-
-WHY IT'S NOT SATISFACTORY:
-${reason}
-`}
-
-TASK:
-Write a brief, friendly follow-up message that:
-1. Is polite and professional
-2. ${isTimeout ? "Gently reminds them about the original request" : "Thanks them for their response and asks for the specific missing information"}
-3. Is concise (2-3 sentences max)
-4. Doesn't sound pushy or demanding
-
-Respond with ONLY the message text, no quotes or explanations.`;
-
-  try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKeys.anthropic,
-        "anthropic-version": "2023-06-01"
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 300,
-        messages: [{ role: "user", content: prompt }]
-      })
-    });
-    
-    if (!response.ok) {
-      console.error("[WaitForReply] Follow-up generation API error:", response.status);
-      return isTimeout 
-        ? `Hi, just following up on my previous message. ${originalRequest}`
-        : `Thanks for your response. Could you please provide: ${originalRequest}`;
-    }
-    
-    const data = await response.json();
-    return data.content?.[0]?.text?.trim() || `Following up: ${originalRequest}`;
-    
-  } catch (err) {
-    console.error("[WaitForReply] Follow-up generation error:", err.message);
-    return isTimeout 
-      ? `Hi, just following up on my previous message. ${originalRequest}`
-      : `Thanks for your response. Could you please provide: ${originalRequest}`;
-  }
-}
-
-/**
- * Send a follow-up message via the appropriate platform
- * @param {Object} params - Follow-up parameters
- * @param {string} params.platform - Platform to send via (email, imessage, slack, telegram, discord)
- * @param {string} params.contact - Recipient contact info
- * @param {string} params.message - The follow-up message to send
- * @param {string} params.conversationId - Thread/conversation ID to reply to
- * @param {Object} params.task - The task object for context
- * @param {string} username - Username for credential access
- * @returns {Object} Result with success status and details
- */
-async function sendFollowupMessage(params, username) {
-  const { platform, contact, message, conversationId, task } = params;
-  
-  console.log(`[WaitForReply] Sending follow-up via ${platform} to ${contact}`);
-  
-  try {
-    let result;
-    
-    switch (platform) {
-      case "email": {
-        // Get Gmail access token using the correct function
-        const googleAccessToken = await getGoogleAccessToken(username);
-        if (!googleAccessToken) {
-          return { success: false, error: "Google credentials not available for email follow-up" };
-        }
-        
-        // To properly reply in the same thread, we need to fetch the latest message
-        // in the thread to get its Message-ID header and original subject
-        let replyToMessageId = task?.contextMemory?.last_message_id;
-        let originalSubject = task?.contextMemory?.original_subject;
-        
-        // If we have a threadId, fetch the latest message to get proper threading info
-        if (conversationId) {
-          try {
-            // Get all messages in the thread
-            const threadResponse = await fetch(
-              `https://gmail.googleapis.com/gmail/v1/users/me/threads/${conversationId}?format=metadata&metadataHeaders=Message-ID&metadataHeaders=Subject`,
-              { headers: { "Authorization": `Bearer ${googleAccessToken}` } }
-            );
-            
-            if (threadResponse.ok) {
-              const threadData = await threadResponse.json();
-              const messages = threadData.messages || [];
-              
-              if (messages.length > 0) {
-                // Get the latest message in the thread
-                const latestMessage = messages[messages.length - 1];
-                const headers = latestMessage.payload?.headers || [];
-                
-                // Extract Message-ID for In-Reply-To header
-                const messageIdHeader = headers.find(h => h.name.toLowerCase() === 'message-id');
-                if (messageIdHeader) {
-                  replyToMessageId = messageIdHeader.value;
-                }
-                
-                // Extract Subject (use first message for original subject)
-                if (!originalSubject) {
-                  const firstMessage = messages[0];
-                  const firstHeaders = firstMessage.payload?.headers || [];
-                  const subjectHeader = firstHeaders.find(h => h.name.toLowerCase() === 'subject');
-                  if (subjectHeader) {
-                    originalSubject = subjectHeader.value.replace(/^Re:\s*/i, ''); // Remove existing Re: prefix
-                  }
-                }
-              }
-            }
-          } catch (err) {
-            console.log(`[WaitForReply] Warning: Could not fetch thread info: ${err.message}`);
-          }
-        }
-        
-        // Build subject - ensure it starts with "Re: " for proper threading
-        const subject = originalSubject 
-          ? `Re: ${originalSubject}`
-          : `Re: ${task?.contextMemory?.original_request?.substring(0, 50) || "Follow-up"}`;
-        
-        // Build email content with proper headers for threading
-        let emailContent = `To: ${contact}\r\n`;
-        
-        // Add In-Reply-To and References headers for proper threading
-        if (replyToMessageId) {
-          emailContent += `In-Reply-To: ${replyToMessageId}\r\n`;
-          emailContent += `References: ${replyToMessageId}\r\n`;
-        }
-        
-        emailContent += `Subject: ${subject}\r\n`;
-        emailContent += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
-        emailContent += message;
-        
-        const encodedEmail = Buffer.from(emailContent).toString("base64")
-          .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-        
-        // Build request body - include threadId for replies
-        const requestBody = { raw: encodedEmail };
-        if (conversationId) {
-          requestBody.threadId = conversationId;
-        }
-        
-        console.log(`[WaitForReply] Sending reply in thread ${conversationId}, subject: "${subject}", replyTo: ${replyToMessageId?.substring(0, 30)}...`);
-        
-        const response = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${googleAccessToken}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify(requestBody)
-        });
-        
-        if (!response.ok) {
-          const errData = await response.text();
-          throw new Error(`Failed to send email: ${errData}`);
-        }
-        
-        const apiResult = await response.json();
-        result = { 
-          success: true, 
-          message: `Follow-up email sent to ${contact} (thread: ${apiResult.threadId})`,
-          messageId: apiResult.id,
-          threadId: apiResult.threadId
-        };
-        break;
-      }
-      
-      case "imessage": {
-        const { sendMessage } = require("./src/integrations/imessage-integration");
-        result = await sendMessage(contact, message);
-        break;
-      }
-      
-      case "slack":
-      case "telegram":
-      case "discord": {
-        // Use platform dispatch table
-        const handler = followupPlatformHandlers[platform];
-        if (!handler) {
-          return { success: false, error: `Unknown platform: ${platform}` };
-        }
-        result = await handler(contact, message, conversationId, username);
-        if (!result.success) {
-          return result;
-        }
-        break;
-      }
-
-      default:
-        return { success: false, error: `Unknown platform: ${platform}` };
-    }
-    
-    return { 
-      success: true, 
-      result,
-      message: `Follow-up sent to ${contact} via ${platform}` 
-    };
-    
-  } catch (err) {
-    console.error(`[WaitForReply] Error sending follow-up via ${platform}:`, err.message);
-    return { success: false, error: err.message };
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Web Scraper Scheduler
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -993,399 +627,34 @@ const stopWebScraperScheduler = () => {
 // Task Scheduler
 // ─────────────────────────────────────────────────────────────────────────────
 
-let taskSchedulerInterval = null;
+// Set up TaskSchedulerService dependencies
+// This will be called after all dependencies are available
+const initializeTaskScheduler = () => {
+  TaskSchedulerService.setDependencies({
+    listActiveTasks,
+    getTask,
+    updateTask,
+    executeTaskStep: (taskId, username) => executeTaskStep(taskId, username),
+    getGoogleAccessToken,
+    getSlackAccessToken,
+    getMessagingIntegration,
+    getIMessageChatId,
+    getMainWindow: () => win,
+    getCurrentUser: () => currentUser,
+    getSettingsPath,
+    readFile: (path, encoding) => fs.readFile(path, encoding),
+    checkForNewEmails,
+  });
+};
 
-// Forward declaration - will be defined later after executeTaskStep
+// Wrapper functions to match existing API
 const startTaskScheduler = () => {
-  if (taskSchedulerInterval) {
-    clearInterval(taskSchedulerInterval);
-  }
-
-  // Poll every 60 seconds - lightweight checks are cheap, only run LLM when needed
-  console.log("[Tasks] Starting task scheduler (checking every 60 seconds)");
-  
-  taskSchedulerInterval = setInterval(async () => {
-    try {
-      // Skip scheduler tick if no user is logged in
-      if (!currentUser?.username) {
-        return;
-      }
-      const tasks = await listActiveTasks(currentUser.username);
-      const googleAccessToken = await getGoogleAccessToken(currentUser.username);
-      const slackAccessToken = await getSlackAccessToken(currentUser.username);
-      
-      const waitingTasks = tasks.filter(t => t.status === "waiting");
-      if (waitingTasks.length > 0) {
-        console.log(`[Tasks] Scheduler tick: ${waitingTasks.length} waiting tasks`);
-      }
-      
-      for (let task of tasks) {
-        // Skip event-based tasks - they only run on specific events like login
-        if (task.pollFrequency?.type === "event") {
-          continue;
-        }
-        
-        // Check if task needs execution
-        if (task.status === "waiting" && task.nextCheck && Date.now() >= task.nextCheck) {
-          console.log(`[Tasks] Processing task ${task.id}: nextCheck was ${new Date(task.nextCheck).toISOString()}`);
-          
-          // Check for unified messaging context (new system)
-          const waitingVia = task.contextMemory?.waiting_via;
-          const waitingForContact = task.contextMemory?.waiting_for_contact;
-          const lastMessageTime = task.contextMemory?.last_message_time;
-          
-          console.log(`[Tasks] Task context: via=${waitingVia}, contact=${waitingForContact}, lastMsg=${lastMessageTime}`);
-          
-          // Also support legacy email context for backward compatibility
-          const legacyWaitingForEmail = task.contextMemory?.waiting_for_email || task.contextMemory?.email;
-          const legacyLastCheckTime = task.contextMemory?.last_email_check || task.contextMemory?.email_sent_time;
-          
-          // Try unified messaging first
-          if (waitingVia && waitingForContact && lastMessageTime) {
-            const integration = getMessagingIntegration(waitingVia);
-            
-            if (integration && integration.checkForNewMessages) {
-              // Get the appropriate access token for this integration
-              const accessToken = waitingVia === "email" ? googleAccessToken :
-                                  waitingVia === "slack" ? slackAccessToken : null;
-              
-              // Get conversation/thread ID if available (for filtering to specific conversation)
-              // This ensures we only see replies in the SAME thread, not from group chats or other conversations
-              let conversationId = task.contextMemory?.conversation_id || task.contextMemory?.chat_id || null;
-              
-              // For iMessage tasks without a conversation_id, try to capture it now
-              // This handles tasks created before the conversation tracking fix
-              if (!conversationId && waitingVia === 'imessage') {
-                const phoneNumber = task.contextMemory?.adaira_phone || 
-                                   task.contextMemory?.[`${waitingForContact.toLowerCase()}_phone`] ||
-                                   waitingForContact;
-                console.log(`[Tasks] No conversation_id for iMessage task, attempting to capture for ${phoneNumber}`);
-                try {
-                  conversationId = await getIMessageChatId(phoneNumber);
-                  if (conversationId) {
-                    console.log(`[Tasks] Captured missing conversation_id: ${conversationId}`);
-                    // Store it for future checks
-                    await updateTask(task.id, {
-                      contextMemory: { ...task.contextMemory, conversation_id: conversationId }
-                    }, currentUser.username);
-                  }
-                } catch (err) {
-                  console.error(`[Tasks] Failed to capture conversation_id: ${err.message}`);
-                }
-              }
-              
-              // Check if we have a valid conversation ID (not null, string "null", or unresolved template)
-              const isUnresolvedTemplate = typeof conversationId === 'string' && 
-                conversationId.startsWith('{{') && conversationId.endsWith('}}');
-              const hasValidConversationId = conversationId && 
-                conversationId !== "null" && 
-                conversationId !== "undefined" && 
-                !isUnresolvedTemplate;
-              
-              if (isUnresolvedTemplate) {
-                console.log(`[Tasks] WARNING: conversation_id is unresolved template "${conversationId}" - will match any thread`);
-              }
-              console.log(`[Tasks] Checking ${integration.name} for reply from ${waitingForContact}${hasValidConversationId ? ` (thread: ${conversationId})` : ' (any thread)'}`);
-              
-              // Normalize: pass null if conversationId is invalid string
-              const threadIdToPass = hasValidConversationId ? conversationId : null;
-              const check = await integration.checkForNewMessages(
-                waitingForContact, 
-                new Date(lastMessageTime).getTime(),
-                accessToken,
-                threadIdToPass  // Pass null if no valid thread ID, so it matches ANY email from contact
-              );
-              
-              if (!check.hasNew) {
-                // No new messages - check if this is a wait_for_reply workflow with timeout
-                if (task.contextMemory?.wait_for_reply_active) {
-                  const waitStartTime = task.contextMemory.wait_started_at;
-                  const followupAfterMs = (task.contextMemory.followup_after_hours || 24) * 60 * 60 * 1000;
-                  const lastFollowupTime = task.contextMemory.last_followup_time;
-                  const timeSinceStart = Date.now() - new Date(waitStartTime).getTime();
-                  const timeSinceLastFollowup = lastFollowupTime 
-                    ? Date.now() - new Date(lastFollowupTime).getTime() 
-                    : timeSinceStart;
-                  
-                  // Check if we've waited long enough since last followup/start
-                  if (timeSinceLastFollowup >= followupAfterMs) {
-                    const currentFollowupCount = task.contextMemory.followup_count || 0;
-                    const maxFollowups = task.contextMemory.max_followups || 3;
-                    
-                    if (currentFollowupCount >= maxFollowups) {
-                      // Max follow-ups reached with no reply - notify user
-                      console.log(`[Tasks] wait_for_reply timeout: max follow-ups (${maxFollowups}) reached for task ${task.id}`);
-                      
-                      await updateTask(task.id, {
-                        status: "waiting_for_input",
-                        contextMemory: {
-                          ...task.contextMemory,
-                          wait_for_reply_active: false,
-                          max_followups_reached: true,
-                          timeout_reached: true,
-                          pendingClarification: `I've sent ${maxFollowups} follow-ups to ${waitingForContact} over the past ${Math.round(timeSinceStart / (1000 * 60 * 60))} hours but haven't received a reply. What would you like me to do?`
-                        },
-                        logEntry: `Timeout: No reply after ${maxFollowups} follow-ups - asking user for guidance`
-                      }, currentUser.username);
-                      
-                      if (win) {
-                        win.webContents.send("chat:newMessage", {
-                          role: "assistant",
-                          content: `⚠️ **Task: ${task.title}**\n\nI've sent ${maxFollowups} follow-up messages to ${waitingForContact} over the past ${Math.round(timeSinceStart / (1000 * 60 * 60))} hours, but haven't received a reply.\n\nOriginal request: "${task.contextMemory.original_request}"\n\nWhat would you like me to do?\n1. Keep trying\n2. Try a different approach\n3. Cancel this task`,
-                          source: "task_question",
-                          expectsResponse: true
-                        });
-                      }
-                      
-                      continue;
-                    }
-                    
-                    // Send timeout follow-up
-                    console.log(`[Tasks] wait_for_reply timeout - sending follow-up #${currentFollowupCount + 1} to ${waitingForContact}`);
-                    
-                    // Mark that we need to send a follow-up due to timeout
-                    await updateTask(task.id, {
-                      contextMemory: {
-                        ...task.contextMemory,
-                        needs_followup: true,
-                        followup_is_timeout: true,
-                        followup_reason: `No reply received after ${Math.round(timeSinceLastFollowup / (1000 * 60 * 60))} hours`
-                      },
-                      logEntry: `No reply in ${Math.round(timeSinceLastFollowup / (1000 * 60 * 60))} hours - preparing timeout follow-up #${currentFollowupCount + 1}`
-                    }, currentUser.username);
-                    
-                    // Refresh task and fall through to executeTaskStep to handle the follow-up
-                    task = await getTask(task.id, currentUser.username);
-                    // Don't continue - let it fall through to executeTaskStep
-                  } else {
-                    // Not yet time for follow-up - reschedule
-                    const pollInterval = task.pollFrequency?.type === "event" ? null : (task.pollFrequency?.value || 60000);
-                    console.log(`[Tasks] No new ${integration.name} from ${waitingForContact}, rescheduling in ${pollInterval ? pollInterval/1000 + 's' : 'event-based'}`);
-                    if (pollInterval) {
-                      await updateTask(task.id, {
-                        nextCheck: Date.now() + pollInterval,
-                        contextMemory: { ...task.contextMemory, last_check_time: new Date().toISOString() }
-                      }, currentUser.username);
-                    }
-                    continue;
-                  }
-                } else {
-                  // Not a wait_for_reply workflow - standard reschedule
-                  const pollInterval = task.pollFrequency?.type === "event" ? null : (task.pollFrequency?.value || 60000);
-                  console.log(`[Tasks] No new ${integration.name} from ${waitingForContact}, rescheduling in ${pollInterval ? pollInterval/1000 + 's' : 'event-based'}`);
-                  if (pollInterval) {
-                    await updateTask(task.id, {
-                      nextCheck: Date.now() + pollInterval,
-                      contextMemory: { ...task.contextMemory, last_check_time: new Date().toISOString() }
-                    }, currentUser.username);
-                  }
-                  continue; // Skip to next task
-                }
-              }
-              
-              console.log(`[Tasks] New ${integration.name} from ${waitingForContact}! Running executor.`);
-              
-              // Extract message preview from check result if available
-              let messagePreview = '';
-              let messages = [];
-              if (check.messages && Array.isArray(check.messages)) {
-                messages = check.messages;
-                // Get preview of first/latest message
-                const latestMsg = messages[0];
-                if (latestMsg) {
-                  messagePreview = latestMsg.snippet || latestMsg.text || latestMsg.body || '';
-                  if (messagePreview.length > 200) {
-                    messagePreview = messagePreview.substring(0, 200) + '...';
-                  }
-                }
-              } else if (check.snippet) {
-                messagePreview = check.snippet;
-              } else if (check.text) {
-                messagePreview = check.text;
-              }
-              
-              // Log the received message in execution log
-              const logMessage = messagePreview 
-                ? `Received reply from ${waitingForContact} via ${integration.name}: "${messagePreview}"`
-                : `Received reply from ${waitingForContact} via ${integration.name}`;
-              
-              // Update task context with info about new messages so executor knows a reply was received
-              await updateTask(task.id, {
-                contextMemory: { 
-                  ...task.contextMemory, 
-                  new_reply_detected: true,
-                  new_reply_count: check.count || 1,
-                  last_check_time: new Date().toISOString(),
-                  last_reply_preview: messagePreview,
-                  recent_messages: messages.slice(0, 5) // Store up to 5 recent messages
-                },
-                logEntry: logMessage
-              }, currentUser.username);
-              
-              // Proactively notify user that a reply was received
-              if (win) {
-                const displayMessage = messagePreview 
-                  ? `📬 **Task: ${task.title}**\n\nReceived a reply from ${waitingForContact} via ${integration.name}:\n\n> ${messagePreview}\n\nProcessing now...`
-                  : `📬 **Task: ${task.title}**\n\nReceived a reply from ${waitingForContact} via ${integration.name}! Processing now...`;
-                  
-                win.webContents.send("chat:newMessage", {
-                  role: "assistant",
-                  content: displayMessage,
-                  source: "task"
-                });
-              }
-              
-              // If this is a wait_for_reply workflow, evaluate the reply with LLM
-              if (task.contextMemory?.wait_for_reply_active) {
-                console.log(`[Tasks] wait_for_reply active - evaluating reply for task ${task.id}`);
-                
-                // Get API keys from settings
-                const settingsPath = await getSettingsPath(currentUser?.username);
-                let apiKeys = {};
-                try {
-                  const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-                  apiKeys = settings.apiKeys || {};
-                } catch {
-                  console.error("[Tasks] Could not load API keys for reply evaluation");
-                }
-                
-                // Get full reply content (prefer full content over snippet)
-                let fullReplyContent = messagePreview;
-                if (messages[0]) {
-                  fullReplyContent = messages[0].body || messages[0].text || messages[0].snippet || messagePreview;
-                }
-                
-                const evaluation = await evaluateReplyWithLLM({
-                  replyContent: fullReplyContent,
-                  originalRequest: task.contextMemory.original_request,
-                  successCriteria: task.contextMemory.success_criteria,
-                  contact: waitingForContact
-                }, apiKeys);
-                
-                if (evaluation.satisfies) {
-                  // Reply satisfies criteria - complete the task!
-                  console.log(`[Tasks] Reply satisfies criteria - completing task ${task.id}`);
-                  
-                  await updateTask(task.id, {
-                    status: "completed",
-                    contextMemory: {
-                      ...task.contextMemory,
-                      wait_for_reply_active: false,
-                      reply_satisfied: true,
-                      extracted_info: evaluation.extractedInfo,
-                      completed_at: new Date().toISOString()
-                    },
-                    logEntry: `Reply from ${waitingForContact} satisfied criteria: ${evaluation.reason}`
-                  }, currentUser.username);
-                  
-                  // Notify user of completion
-                  if (win && !task.notificationsDisabled) {
-                    const completionMsg = evaluation.extractedInfo 
-                      ? `✅ **Task Completed: ${task.title}**\n\nReceived satisfactory reply from ${waitingForContact}.\n\n**Extracted Information:**\n${evaluation.extractedInfo}`
-                      : `✅ **Task Completed: ${task.title}**\n\nReceived satisfactory reply from ${waitingForContact}.`;
-                    
-                    win.webContents.send("chat:newMessage", {
-                      role: "assistant",
-                      content: completionMsg,
-                      source: "task"
-                    });
-                  }
-                  
-                  continue; // Task complete, move to next task
-                } else {
-                  // Reply doesn't satisfy criteria - handle follow-up
-                  console.log(`[Tasks] Reply doesn't satisfy criteria: ${evaluation.reason}`);
-                  const currentFollowupCount = task.contextMemory.followup_count || 0;
-                  const maxFollowups = task.contextMemory.max_followups || 3;
-                  
-                  if (currentFollowupCount >= maxFollowups) {
-                    // Max follow-ups reached - notify user and pause
-                    console.log(`[Tasks] Max follow-ups (${maxFollowups}) reached - notifying user`);
-                    
-                    await updateTask(task.id, {
-                      status: "waiting_for_input",
-                      contextMemory: {
-                        ...task.contextMemory,
-                        wait_for_reply_active: false,
-                        max_followups_reached: true,
-                        last_evaluation_reason: evaluation.reason,
-                        pendingClarification: `I've sent ${maxFollowups} follow-ups to ${waitingForContact} but haven't received a satisfactory reply. What would you like me to do?`
-                      },
-                      logEntry: `Max follow-ups (${maxFollowups}) reached - asking user for guidance`
-                    }, currentUser.username);
-                    
-                    if (win) {
-                      win.webContents.send("chat:newMessage", {
-                        role: "assistant",
-                        content: `⚠️ **Task: ${task.title}**\n\nI've sent ${maxFollowups} follow-up messages to ${waitingForContact}, but their responses haven't contained the requested information (${task.contextMemory.original_request}).\n\nLast response: "${messagePreview}"\n\nWhat would you like me to do?\n1. Keep trying\n2. Try a different approach\n3. Cancel this task`,
-                        source: "task_question",
-                        expectsResponse: true
-                      });
-                    }
-                    
-                    continue; // Waiting for user input, move to next task
-                  }
-                  
-                  // Send a follow-up message asking for the missing info
-                  console.log(`[Tasks] Sending follow-up #${currentFollowupCount + 1} to ${waitingForContact}`);
-                  
-                  // Store that we need to send a follow-up - the actual sending will happen in executeTaskStep
-                  // or we can directly send it here using the integration
-                  await updateTask(task.id, {
-                    contextMemory: {
-                      ...task.contextMemory,
-                      followup_count: currentFollowupCount + 1,
-                      last_followup_time: new Date().toISOString(),
-                      needs_followup: true,
-                      followup_reason: evaluation.reason,
-                      last_reply_content: fullReplyContent
-                    },
-                    logEntry: `Reply from ${waitingForContact} didn't satisfy criteria - preparing follow-up #${currentFollowupCount + 1}: ${evaluation.reason}`
-                  }, currentUser.username);
-                  
-                  // Refresh task and fall through to executeTaskStep which will handle the follow-up
-                  task = await getTask(task.id, currentUser.username);
-                }
-              }
-            }
-          }
-          // Fall back to legacy email check
-          else if (legacyWaitingForEmail && googleAccessToken && legacyLastCheckTime) {
-            console.log(`[Tasks] Legacy email check for task ${task.id}: waiting for ${legacyWaitingForEmail}`);
-            const emailCheck = await checkForNewEmails(googleAccessToken, legacyWaitingForEmail, new Date(legacyLastCheckTime).getTime());
-            
-            if (!emailCheck.hasNew) {
-              // Reschedule using task's poll frequency
-              const pollInterval = task.pollFrequency?.type === "event" ? null : (task.pollFrequency?.value || 60000);
-              console.log(`[Tasks] No new emails from ${legacyWaitingForEmail}, rescheduling in ${pollInterval ? pollInterval/1000 + 's' : 'event-based'}`);
-              if (pollInterval) {
-                await updateTask(task.id, {
-                  nextCheck: Date.now() + pollInterval,
-                  contextMemory: { ...task.contextMemory, last_email_check: new Date().toISOString() }
-                }, currentUser.username);
-              }
-              continue;
-            }
-            
-            console.log(`[Tasks] New email found from ${legacyWaitingForEmail}! Running task executor.`);
-          }
-          
-          console.log(`[Tasks] Executing scheduled check for task: ${task.id}`);
-          await executeTaskStep(task.id, currentUser.username);
-        }
-      }
-    } catch (err) {
-      console.error("[Tasks] Scheduler error:", err.message);
-    }
-  }, 60000); // Check every 60 seconds
+  initializeTaskScheduler();
+  TaskSchedulerService.startScheduler();
 };
 
 const stopTaskScheduler = () => {
-  if (taskSchedulerInterval) {
-    clearInterval(taskSchedulerInterval);
-    taskSchedulerInterval = null;
-    console.log("[Tasks] Stopped task scheduler");
-  }
+  TaskSchedulerService.stopScheduler();
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1669,334 +938,14 @@ const setTaskExecutor = (executor) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Conversation Style Context - Retrieve user's sent messages to mimic their voice
 // ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Get the user's previously sent messages to a specific recipient
- * Used to analyze communication style and mimic the user's voice when drafting
- * @param {string} recipient - Email address, phone number, or Slack user/channel
- * @param {string} platform - 'email', 'slack', or 'imessage'
- * @param {object} options - { limit: number, accessToken: string, slackUserId: string }
- * @returns {{ messages: string[], hasHistory: boolean, recipient: string }}
- */
-const getConversationStyleContext = async (recipient, platform, options = {}) => {
-  const { limit = 10, accessToken, slackUserId } = options;
-  const messages = [];
-  
-  console.log(`[StyleContext] Retrieving sent messages to ${recipient} via ${platform}`);
-  
-  try {
-    switch (platform) {
-      case 'email': {
-        if (!accessToken) {
-          console.log('[StyleContext] No Google access token, skipping email history');
-          return { messages: [], hasHistory: false, recipient };
-        }
-        
-        // Search for emails sent TO this recipient
-        const query = `to:${recipient} in:sent`;
-        const url = new URL("https://www.googleapis.com/gmail/v1/users/me/messages");
-        url.searchParams.set("q", query);
-        url.searchParams.set("maxResults", String(limit));
-        
-        const response = await fetch(url.toString(), {
-          headers: { "Authorization": `Bearer ${accessToken}` }
-        });
-        
-        if (!response.ok) {
-          console.error(`[StyleContext] Gmail API error: ${response.status}`);
-          return { messages: [], hasHistory: false, recipient };
-        }
-        
-        const data = await response.json();
-        const messageIds = data.messages || [];
-        
-        // Fetch message bodies
-        for (const msg of messageIds.slice(0, limit)) {
-          try {
-            const msgUrl = `https://www.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`;
-            const msgResponse = await fetch(msgUrl, {
-              headers: { "Authorization": `Bearer ${accessToken}` }
-            });
-            
-            if (msgResponse.ok) {
-              const msgData = await msgResponse.json();
-              // Extract body from payload
-              let body = '';
-              const payload = msgData.payload;
-              
-              if (payload.body?.data) {
-                body = Buffer.from(payload.body.data, 'base64').toString('utf8');
-              } else if (payload.parts) {
-                // Look for text/plain part
-                const textPart = payload.parts.find(p => p.mimeType === 'text/plain');
-                if (textPart?.body?.data) {
-                  body = Buffer.from(textPart.body.data, 'base64').toString('utf8');
-                }
-              }
-              
-              if (body && body.trim()) {
-                // Clean up the body - remove quoted replies, signatures
-                const cleanBody = body.split(/\n>|\nOn .* wrote:|\n--\s*\n/)[0].trim();
-                if (cleanBody.length > 20) { // Only include substantial messages
-                  messages.push(cleanBody.substring(0, 1000)); // Limit length
-                }
-              }
-            }
-          } catch (msgErr) {
-            console.error(`[StyleContext] Error fetching email ${msg.id}:`, msgErr.message);
-          }
-        }
-        break;
-      }
-      
-      case 'slack': {
-        if (!accessToken) {
-          console.log('[StyleContext] No Slack access token, skipping Slack history');
-          return { messages: [], hasHistory: false, recipient };
-        }
-        
-        // First, resolve the recipient to a channel ID
-        let channelId = recipient;
-        let targetUserId = null;
-        
-        // If it's a user ID (starts with U), open DM channel
-        if (/^U[A-Z0-9]+$/i.test(recipient)) {
-          targetUserId = recipient;
-          const dmResponse = await fetch("https://slack.com/api/conversations.open", {
-            method: "POST",
-            headers: { 
-              "Authorization": `Bearer ${accessToken}`,
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({ users: recipient })
-          });
-          const dmData = await dmResponse.json();
-          if (dmData.ok && dmData.channel) {
-            channelId = dmData.channel.id;
-          }
-        }
-        // If it doesn't look like a channel ID, search for user by name
-        else if (!/^[CDG][A-Z0-9]+$/i.test(recipient)) {
-          const usersResponse = await fetch(`https://slack.com/api/users.list?limit=200`, {
-            headers: { "Authorization": `Bearer ${accessToken}` }
-          });
-          const usersData = await usersResponse.json();
-          
-          if (usersData.ok && usersData.members) {
-            const user = usersData.members.find(m => 
-              m.name?.toLowerCase().includes(recipient.toLowerCase()) ||
-              m.real_name?.toLowerCase().includes(recipient.toLowerCase())
-            );
-            
-            if (user) {
-              targetUserId = user.id;
-              const dmResponse = await fetch("https://slack.com/api/conversations.open", {
-                method: "POST",
-                headers: { 
-                  "Authorization": `Bearer ${accessToken}`,
-                  "Content-Type": "application/json"
-                },
-                body: JSON.stringify({ users: user.id })
-              });
-              const dmData = await dmResponse.json();
-              if (dmData.ok && dmData.channel) {
-                channelId = dmData.channel.id;
-              }
-            }
-          }
-        }
-        
-        // Fetch conversation history
-        const historyResponse = await fetch(
-          `https://slack.com/api/conversations.history?channel=${channelId}&limit=${limit * 3}`,
-          { headers: { "Authorization": `Bearer ${accessToken}` } }
-        );
-        const historyData = await historyResponse.json();
-        
-        if (historyData.ok && historyData.messages) {
-          // Filter for messages FROM the current user (sent by user)
-          const currentUserId = slackUserId;
-          
-          for (const msg of historyData.messages) {
-            // Only include messages from the current user (sent messages)
-            if (msg.user === currentUserId && msg.text && !msg.subtype) {
-              const cleanText = msg.text.replace(/<@[A-Z0-9]+>/g, '').trim(); // Remove mentions
-              if (cleanText.length > 10) {
-                messages.push(cleanText.substring(0, 500));
-                if (messages.length >= limit) break;
-              }
-            }
-          }
-        }
-        break;
-      }
-      
-      case 'imessage': {
-        const dbPath = path.join(os.homedir(), "Library", "Messages", "chat.db");
-        
-        try {
-          await fs.access(dbPath);
-        } catch {
-          console.log('[StyleContext] Cannot access Messages database');
-          return { messages: [], hasHistory: false, recipient };
-        }
-        
-        // Resolve contact name to phone if it contains letters
-        let phoneFilter = recipient;
-        if (/[a-zA-Z]/.test(recipient) && !/@/.test(recipient)) {
-          // This is a name - we'll match against handle.id loosely
-          phoneFilter = recipient.replace(/'/g, "''");
-        }
-        
-        const digits = phoneFilter.replace(/\D/g, "");
-        const lastDigits = digits.slice(-10);
-        
-        // Query for messages FROM ME to this contact (is_from_me = 1)
-        const query = lastDigits 
-          ? `SELECT m.text, datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date FROM message m JOIN handle h ON m.handle_id = h.ROWID WHERE h.id LIKE '%${lastDigits}%' AND m.is_from_me = 1 AND m.text IS NOT NULL AND m.text != '' ORDER BY m.date DESC LIMIT ${limit}`
-          : `SELECT m.text, datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date FROM message m JOIN handle h ON m.handle_id = h.ROWID WHERE (h.id LIKE '%${phoneFilter}%') AND m.is_from_me = 1 AND m.text IS NOT NULL AND m.text != '' ORDER BY m.date DESC LIMIT ${limit}`;
-        
-        const { exec } = require("child_process");
-        const result = await new Promise((resolve) => {
-          exec(`sqlite3 -json "${dbPath}" "${query.replace(/"/g, '\\"')}"`, { maxBuffer: 5 * 1024 * 1024 }, (error, stdout) => {
-            if (error) {
-              console.error(`[StyleContext] iMessage query error: ${error.message}`);
-              resolve([]);
-              return;
-            }
-            try {
-              const rows = stdout.trim() ? JSON.parse(stdout) : [];
-              resolve(rows.map(r => r.text).filter(t => t && t.length > 10));
-            } catch {
-              resolve([]);
-            }
-          });
-        });
-        
-        messages.push(...result.slice(0, limit));
-        break;
-      }
-    }
-    
-    console.log(`[StyleContext] Found ${messages.length} sent messages to ${recipient} via ${platform}`);
-    return { 
-      messages, 
-      hasHistory: messages.length > 0, 
-      recipient,
-      platform 
-    };
-    
-  } catch (err) {
-    console.error(`[StyleContext] Error retrieving messages: ${err.message}`);
-    return { messages: [], hasHistory: false, recipient };
-  }
-};
-
-/**
- * Generate a style guide by analyzing the user's previous messages
- * Uses a fast LLM call to summarize communication patterns
- * @param {string[]} messages - Array of user's sent messages
- * @param {string} recipient - Who the messages were sent to
- * @param {object} apiKeys - API keys for LLM providers
- * @param {string} activeProvider - Which LLM provider to use
- * @returns {{ styleGuide: string, formality: string }}
- */
-const generateStyleGuide = async (messages, recipient, apiKeys, activeProvider) => {
-  if (!messages || messages.length === 0) {
-    return { styleGuide: null, formality: 'professional' };
-  }
-  
-  console.log(`[StyleGuide] Analyzing ${messages.length} messages to generate style guide`);
-  
-  // Prepare sample messages for analysis (limit to avoid token overflow)
-  const sampleMessages = messages.slice(0, 7).map((m, i) => `Message ${i + 1}: "${m.substring(0, 300)}${m.length > 300 ? '...' : ''}"`).join('\n\n');
-  
-  const analysisPrompt = `Analyze these messages I've sent to "${recipient}" and describe my communication style in 2-3 concise sentences. Focus on:
-- Tone (casual, formal, friendly, direct, professional)
-- Greeting and sign-off patterns (if any)
-- Writing style (short/long sentences, emojis, exclamation points, bullet points)
-- Any notable patterns or phrases I use
-
-Messages:
-${sampleMessages}
-
-Respond with ONLY a brief style description (2-3 sentences max) that I can use as a guide for writing similar messages. Also indicate the formality level at the end as one word: casual, professional, or mixed.
-
-Example format:
-"Uses friendly, casual tone with short sentences. Often starts with 'Hey' and uses emojis. Tends to be direct and action-oriented. Formality: casual"`;
-
-  try {
-    let styleGuide = '';
-    let formality = 'professional';
-    
-    // Use a fast model for style analysis
-    if (apiKeys.anthropic) {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKeys.anthropic,
-          "anthropic-version": "2023-06-01"
-        },
-        body: JSON.stringify({
-          model: "claude-3-haiku-20240307", // Fast model for analysis
-          max_tokens: 200,
-          messages: [{ role: "user", content: analysisPrompt }]
-        })
-      });
-      
-      if (response.ok) {
-        const result = await response.json();
-        styleGuide = result.content?.[0]?.text || '';
-      }
-    } else if (apiKeys.openai) {
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKeys.openai}`
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini", // Fast model for analysis
-          max_tokens: 200,
-          messages: [{ role: "user", content: analysisPrompt }]
-        })
-      });
-      
-      if (response.ok) {
-        const result = await response.json();
-        styleGuide = result.choices?.[0]?.message?.content || '';
-      }
-    } else if (apiKeys.google) {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKeys.google}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: analysisPrompt }] }],
-          generationConfig: { maxOutputTokens: 200 }
-        })
-      });
-      
-      if (response.ok) {
-        const result = await response.json();
-        styleGuide = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      }
-    }
-    
-    // Extract formality from the response
-    const formalityMatch = styleGuide.toLowerCase().match(/formality:\s*(casual|professional|mixed)/);
-    if (formalityMatch) {
-      formality = formalityMatch[1];
-    }
-    
-    console.log(`[StyleGuide] Generated style guide (formality: ${formality})`);
-    return { styleGuide: styleGuide.trim(), formality };
-    
-  } catch (err) {
-    console.error(`[StyleGuide] Error generating style guide: ${err.message}`);
-    return { styleGuide: null, formality: 'professional' };
-  }
-};
+// Conversation Style Context & Style Guide Generation
+// ─────────────────────────────────────────────────────────────────────────────
+// These functions have been moved to src/services/utils/conversationStyle.ts
+// and are now imported at the top of this file via src/index.js
+//
+// - getConversationStyleContext()
+// - generateStyleGuide()
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Fetch calendar events for a date range
 const fetchCalendarEvents = async (accessToken, startDate, endDate) => {
@@ -2512,10 +1461,19 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
-  createWindow();
-  
-  // Set main window reference for task notifications
-  setMainWindow(win);
+  // Note: createWindow() moved to end of callback to ensure all IPC handlers
+  // are registered before the UI loads and tries to use them
+
+  // Set main window reference will be called after createWindow at the end
+
+  // Set up TaskMessagingService callbacks
+  TaskMessagingService.setExecuteTaskStepCallback(async (taskId, username) => {
+    await executeTaskStep(taskId, username);
+  });
+  TaskMessagingService.setLoadIntegrationsCallback(async () => {
+    return await loadIntegrationsAndBuildTools();
+  });
+  TaskMessagingService.setToolsRequiringConfirmation(TOOLS_REQUIRING_CONFIRMATION);
 
   // Process old memory files (summarize and move to longterm) - deferred until user logs in
   // This will be triggered after login via auth:login handler
@@ -2766,6 +1724,8 @@ app.whenReady().then(async () => {
     });
   }, 1000);
 
+  console.log("[DEBUG] Checkpoint 1: After integration refresh setup");
+
   // Settings handlers
   // ─────────────────────────────────────────────────────────────────────────────
   // Settings Service Handlers
@@ -2776,6 +1736,34 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("settings:set", async (_event, { settings }) => {
     return await SettingsService.updateSettings(currentUser?.username, settings);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // System Utilities (macOS)
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle("system:openSystemPreferences", async (_event, pane) => {
+    const { exec } = require("child_process");
+
+    let command = "open 'x-apple.systempreferences:com.apple.preference.security?Privacy'";
+
+    if (pane === "security") {
+      command = "open 'x-apple.systempreferences:com.apple.preference.security?Privacy'";
+    } else if (pane === "accessibility") {
+      command = "open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'";
+    }
+
+    return new Promise((resolve) => {
+      exec(command, (error) => {
+        if (error) {
+          console.error("[System] Failed to open System Preferences:", error);
+          resolve({ ok: false, error: error.message });
+        } else {
+          console.log("[System] Opened System Preferences");
+          resolve({ ok: true });
+        }
+      });
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -2875,8 +1863,34 @@ app.whenReady().then(async () => {
         // No settings file
       }
 
+      // Check if user needs to advance from api_setup to profile stage
+      if (currentUser?.username) {
+        try {
+          const profilePath = await getUserProfilePath(currentUser.username);
+          const markdown = await fs.readFile(profilePath, "utf8");
+          const profile = parseUserProfile(markdown);
+
+          // If user is in api_setup stage and has API keys, advance to profile stage
+          if (profile.onboardingStage === "api_setup") {
+            const hasApiKeys = !!(
+              (apiKeys.anthropic && apiKeys.anthropic.trim()) ||
+              (apiKeys.openai && apiKeys.openai.trim()) ||
+              (apiKeys.google && apiKeys.google.trim())
+            );
+
+            if (hasApiKeys) {
+              console.log("[Welcome] User has API keys, advancing from api_setup to profile stage");
+              profile.onboardingStage = "profile";
+              await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
+            }
+          }
+        } catch (err) {
+          console.error("[Welcome] Error checking onboarding stage:", err);
+        }
+      }
+
       // Call WelcomeService to generate personalized welcome message
-      return await WelcomeService.generate(
+      const welcomeResponse = await WelcomeService.generate(
         currentUser?.username,
         apiKeys,
         models,
@@ -2885,9 +1899,15 @@ app.whenReady().then(async () => {
           getUserProfilePath,
           parseUserProfile,
           getGoogleAccessToken,
-          getSettingsPath
+          getSettingsPath,
+          getUserDataDir
         }
       );
+
+      // Store for profile question tracking
+      lastWelcomeResponse = welcomeResponse;
+
+      return welcomeResponse;
     } catch (err) {
       console.error("[Welcome] Error:", err);
       return {
@@ -3089,14 +2109,22 @@ app.whenReady().then(async () => {
   
   // Login
   ipcMain.handle("auth:login", async (_event, { username, password }) => {
-    return await AuthService.login(username, password, (user) => { currentUser = user; });
+    return await AuthService.login(username, password, (user) => {
+      currentUser = user;
+      // Update TaskExecutionEngine with the logged-in user
+      TaskExecutionEngine.setCurrentUser(user);
+    });
   });
   
   // Logout
   ipcMain.handle("auth:logout", async () => {
     return await AuthService.logout(
       currentUser,
-      (user) => { currentUser = user; },
+      (user) => {
+        currentUser = user;
+        // Clear TaskExecutionEngine user on logout
+        TaskExecutionEngine.setCurrentUser(null);
+      },
       [
         () => { if (currentUser?.username) credentialsCache.delete(currentUser.username); },
         () => { contactNameCache.clear(); }
@@ -3106,7 +2134,11 @@ app.whenReady().then(async () => {
   
   // Check current session - restores from file if not in memory
   ipcMain.handle("auth:checkSession", async () => {
-    return await AuthService.checkSession(currentUser, (user) => { currentUser = user; });
+    return await AuthService.checkSession(currentUser, (user) => {
+      currentUser = user;
+      // Update TaskExecutionEngine when session is restored
+      TaskExecutionEngine.setCurrentUser(user);
+    });
   });
   
   // Get current user
@@ -3122,6 +2154,46 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("integrations:checkGoogleAuth", async () => {
     return await GoogleOAuthService.checkAuth(currentUser?.username, getGoogleAccessToken);
+  });
+
+  // One-click Google OAuth (simplified flow)
+  ipcMain.handle("integrations:connectGoogle", async () => {
+    try {
+      const { GoogleOAuthService: SimpleOAuthService } = require("./dist/services/GoogleOAuthService");
+      const service = new SimpleOAuthService();
+      const result = await service.connectGoogle();
+
+      if (result.ok && result.tokens) {
+        // Save tokens to storage
+        if (!currentUser?.username) {
+          return { ok: false, error: "Not logged in" };
+        }
+
+        const googleTokensPath = path.join(
+          await getUserDataDir(currentUser.username),
+          "google-tokens.json"
+        );
+
+        await fs.writeFile(
+          googleTokensPath,
+          JSON.stringify({
+            access_token: result.tokens.access_token,
+            refresh_token: result.tokens.refresh_token,
+            expires_in: result.tokens.expires_in,
+            obtained_at: Date.now(),
+          }, null, 2),
+          "utf8"
+        );
+
+        console.log("[GoogleOAuth] Tokens saved successfully");
+        return { ok: true };
+      }
+
+      return result;
+    } catch (error) {
+      console.error("[GoogleOAuth] Error in connectGoogle handler:", error);
+      return { ok: false, error: error.message };
+    }
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -3475,28 +2547,16 @@ app.whenReady().then(async () => {
       const task = await createTask(taskData, currentUser.username);
       
       // Check if we should advance onboarding from task_demo to skill_demo
-      try {
-        const profilePath = await getUserProfilePath(currentUser.username);
-        const markdown = await fs.readFile(profilePath, "utf8");
-        const profile = parseUserProfile(markdown);
-        if (profile.onboardingStage === "task_demo") {
-          console.log("[Onboarding] First task created, advancing to skill_demo stage");
-          profile.onboardingStage = "skill_demo";
-          await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
-          
-          // Send the skill demo prompt after task notification
-          setTimeout(() => {
-            if (win && win.webContents) {
-              win.webContents.send("chat:newMessage", {
-                role: "assistant",
-                content: `Excellent! Now let's create a skill. Skills teach me custom procedures.\n\nTry: **"Create a skill where if I say marco you say polo"**`,
-                source: "app"
-              });
-            }
-          }, 2000);
-        }
-      } catch (err) {
-        console.error("[Onboarding] Error checking task_demo stage:", err.message);
+      const taskAdvanced = await TutorialService.checkTaskCreationAdvancement(currentUser.username);
+      if (taskAdvanced && win && win.webContents) {
+        // Send the skill demo prompt after task notification
+        setTimeout(() => {
+          win.webContents.send("chat:newMessage", {
+            role: "assistant",
+            content: TutorialService.getSkillDemoPromptMessage(),
+            source: "app"
+          });
+        }, 2000);
       }
       
       // Send initial notification that task is starting
@@ -3785,6 +2845,30 @@ app.whenReady().then(async () => {
 
       const savedConfig = await configManager.createIntegration(currentUser.username, config);
 
+      // Check if 2FA automation is possible
+      if (savedConfig.twoFactorAuth?.enabled) {
+        const requiredIntegration = savedConfig.twoFactorAuth.requiredIntegration;
+        let canAutomate = false;
+
+        if (requiredIntegration === 'gmail') {
+          const googleToken = await getGoogleAccessToken(currentUser.username).catch(() => null);
+          canAutomate = !!googleToken;
+        } else if (requiredIntegration === 'imessage') {
+          const { SettingsService } = require('./dist/services/settings');
+          const iMessageEnabled = await SettingsService.getIMessageEnabled(currentUser.username);
+          canAutomate = iMessageEnabled && process.platform === 'darwin';
+        }
+
+        // Update status to indicate automation capability
+        await configManager.updateStatus(currentUser.username, savedConfig.id, {
+          twoFactorMode: canAutomate ? 'automated' : 'manual',
+        });
+
+        // Refresh config to get updated status
+        const updatedConfig = await configManager.getIntegration(currentUser.username, savedConfig.id);
+        return { success: true, config: updatedConfig };
+      }
+
       return { success: true, config: savedConfig };
     } catch (err) {
       console.error("[WebScraper] Error saving configuration:", err);
@@ -3921,6 +3005,63 @@ app.whenReady().then(async () => {
     }
   });
 
+  ipcMain.handle("webscraper:startRecording", async (_event, { url, credentialDomain, siteName }) => {
+    try {
+      if (!currentUser?.username) {
+        return { success: false, error: "Not logged in" };
+      }
+
+      // Resolve credentials from secure storage
+      // NOTE: getCredentialForDomain expects (domain, username) not (username, domain)
+      const credential = await getCredentialForDomain(credentialDomain, currentUser.username);
+      if (!credential) {
+        console.log(`[Recording] No credential found for domain: ${credentialDomain}`);
+        console.log(`[Recording] Available credentials:`, await getAvailableCredentialDomains());
+        return {
+          success: false,
+          error: `No credentials found for domain: ${credentialDomain}. Please add credentials in the Credential Manager.`
+        };
+      }
+
+      console.log(`[Recording] Found credential for domain: ${credentialDomain}`);
+
+      // Load API keys for AI analysis
+      let apiKeys = {};
+      try {
+        const settingsPath = await getSettingsPath(currentUser.username);
+        const settingsData = await fs.readFile(settingsPath, "utf8");
+        const settings = JSON.parse(settingsData);
+        apiKeys = settings.apiKeys || {};
+      } catch (err) {
+        console.log("[Recording] No settings found, using empty API keys");
+      }
+
+      const { RecordingWizard } = require("./dist/webscraper/recording-wizard");
+      const { getBrowserController } = require("./dist/browser");
+
+      const browserController = await getBrowserController(currentUser.username);
+      const recordingWizard = new RecordingWizard(browserController, currentUser.username);
+
+      // Pass resolved credentials and API key to recording wizard
+      const result = await recordingWizard.startRecording(
+        url,
+        credential.username,
+        credential.password,
+        siteName,
+        apiKeys.anthropic || '' // Pass API key for AI analysis
+      );
+
+      return result;
+
+    } catch (error) {
+      console.error("[IPC] Recording wizard error:", error);
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  });
+
   ipcMain.handle("webscraper:testConfiguration", async (_event, { config }) => {
     try {
       if (!currentUser?.username) {
@@ -3958,425 +3099,31 @@ app.whenReady().then(async () => {
   // ─────────────────────────────────────────────────────────────────────────────
 
   // Approve and send a pending message from a task
+  // Approve a pending message and send it
   ipcMain.handle("tasks:approvePendingMessage", async (_event, { taskId, messageId, editedMessage }) => {
-    try {
-      const task = await getTask(taskId, currentUser?.username);
-      if (!task) {
-        return { ok: false, error: "Task not found" };
-      }
-
-      // Find the pending message
-      const messageIndex = task.pendingMessages?.findIndex(m => m.id === messageId);
-      if (messageIndex === undefined || messageIndex < 0) {
-        return { ok: false, error: "Pending message not found" };
-      }
-
-      const pendingMsg = task.pendingMessages[messageIndex];
-      let toolInput;
-      
-      try {
-        toolInput = JSON.parse(pendingMsg.toolInput || '{}');
-      } catch {
-        // If toolInput is missing or invalid, try to reconstruct from message content
-        console.log(`[Tasks] toolInput parse failed, reconstructing from message content`);
-        toolInput = {};
-      }
-      
-      // If toolInput is empty, reconstruct from pending message fields
-      if (!toolInput || Object.keys(toolInput).length === 0) {
-        console.log(`[Tasks] Reconstructing toolInput for ${pendingMsg.toolName}`);
-        switch (pendingMsg.toolName) {
-          case 'send_email':
-            toolInput = {
-              to: pendingMsg.recipient,
-              subject: pendingMsg.subject || '',
-              body: pendingMsg.message
-            };
-            break;
-          case 'send_imessage':
-            toolInput = {
-              recipient: pendingMsg.recipient,
-              message: pendingMsg.message
-            };
-            break;
-          case 'send_slack_message':
-            toolInput = {
-              channel: pendingMsg.recipient,
-              message: pendingMsg.message
-            };
-            break;
-          default:
-            return { ok: false, error: `Unknown tool type: ${pendingMsg.toolName}` };
-        }
-      }
-
-      // If message was edited, update the content
-      if (editedMessage) {
-        switch (pendingMsg.toolName) {
-          case 'send_email':
-            toolInput.body = editedMessage;
-            break;
-          case 'send_imessage':
-            toolInput.message = editedMessage;
-            break;
-          case 'send_slack_message':
-            toolInput.message = editedMessage;
-            break;
-        }
-      }
-
-      // Execute the actual send (bypass confirmation since user just approved)
-      console.log(`[Tasks] Sending approved message: ${pendingMsg.toolName} to ${pendingMsg.recipient}`);
-      
-      const { executeTool, slackAccessToken } = await loadIntegrationsAndBuildTools();
-      
-      // For Slack: resolve recipient name to user ID if needed
-      if (pendingMsg.toolName === 'send_slack_message' && toolInput.channel) {
-        const channel = toolInput.channel;
-        // Check if it's already a user/channel ID (starts with U, C, D, or G)
-        if (!/^[UCDG][A-Z0-9]+$/i.test(channel)) {
-          console.log(`[Tasks] Resolving Slack user name "${channel}" to user ID...`);
-          
-          // Check if we have the resolved ID stored in task context
-          // Also check waiting_for_contact context which may have the user ID from initial send
-          let storedUserId = task.contextMemory?.slack_user_id || 
-                             task.contextMemory?.[`slack_user_${channel.toLowerCase()}`];
-          
-          // If waiting_for_contact matches this recipient, check if we have their ID stored
-          const waitingFor = task.contextMemory?.waiting_for_contact;
-          if (!storedUserId && waitingFor) {
-            const waitingForLower = waitingFor.toLowerCase();
-            if (waitingForLower.includes(channel.toLowerCase()) || channel.toLowerCase().includes(waitingForLower.split(' ')[0])) {
-              // Might be the same person - check for stored ID
-              storedUserId = task.contextMemory?.waiting_for_user_id;
-            }
-          }
-          
-          if (storedUserId && /^[UCDG][A-Z0-9]+$/i.test(storedUserId)) {
-            console.log(`[Tasks] Using stored Slack user ID: ${storedUserId}`);
-            toolInput.channel = storedUserId;
-          } else if (slackAccessToken) {
-            // Need to resolve by searching users
-            try {
-              const usersResponse = await fetch(`https://slack.com/api/users.list?limit=200`, {
-                headers: { "Authorization": `Bearer ${slackAccessToken}` }
-              });
-              const usersData = await usersResponse.json();
-              
-              if (usersData.ok && usersData.members) {
-                const searchTerm = channel.toLowerCase();
-                const user = usersData.members.find(m => 
-                  m.name?.toLowerCase() === searchTerm ||
-                  m.real_name?.toLowerCase() === searchTerm ||
-                  m.name?.toLowerCase().includes(searchTerm) ||
-                  m.real_name?.toLowerCase().includes(searchTerm) ||
-                  m.profile?.display_name?.toLowerCase() === searchTerm ||
-                  m.profile?.display_name?.toLowerCase().includes(searchTerm)
-                );
-                
-                if (user) {
-                  console.log(`[Tasks] Resolved "${channel}" to Slack user: ${user.real_name} (${user.id})`);
-                  toolInput.channel = user.id;
-                  
-                  // Store for future use
-                  await updateTask(taskId, {
-                    contextMemory: {
-                      ...task.contextMemory,
-                      slack_user_id: user.id,
-                      [`slack_user_${channel.toLowerCase()}`]: user.id
-                    }
-                  }, currentUser?.username);
-                } else {
-                  console.error(`[Tasks] Could not find Slack user matching "${channel}"`);
-                  return { ok: false, error: `Could not find Slack user "${channel}". Please use their exact Slack username or display name.` };
-                }
-              }
-            } catch (resolveErr) {
-              console.error(`[Tasks] Failed to resolve Slack user:`, resolveErr.message);
-            }
-          }
-        }
-      }
-      
-      // Temporarily remove the tool from confirmation list to bypass the check
-      const toolIndex = TOOLS_REQUIRING_CONFIRMATION.indexOf(pendingMsg.toolName);
-      if (toolIndex > -1) {
-        TOOLS_REQUIRING_CONFIRMATION.splice(toolIndex, 1);
-      }
-      
-      let sendResult;
-      let sendSuccess = false;
-      let sendError = null;
-      
-      try {
-        sendResult = await executeTool(pendingMsg.toolName, toolInput);
-        
-        // Check if the send was actually successful
-        // Different tools return success differently
-        if (sendResult) {
-          if (typeof sendResult === 'object') {
-            // Check various success indicators
-            if (sendResult.ok === true || sendResult.success === true) {
-              sendSuccess = true;
-            } else if (sendResult.error || sendResult.ok === false) {
-              sendError = sendResult.error || sendResult.message || 'Send failed';
-            } else if (sendResult.messageId || sendResult.id || sendResult.ts) {
-              // Slack returns ts, email might return messageId
-              sendSuccess = true;
-            } else {
-              // If no clear error, assume success
-              sendSuccess = true;
-            }
-          } else if (typeof sendResult === 'string') {
-            // String result - check if it contains error indicators
-            if (sendResult.toLowerCase().includes('error') || sendResult.toLowerCase().includes('failed')) {
-              sendError = sendResult;
-            } else {
-              sendSuccess = true;
-            }
-          } else {
-            sendSuccess = true;
-          }
-        }
-        
-        console.log(`[Tasks] Send result: success=${sendSuccess}, error=${sendError}`, sendResult);
-        
-      } catch (err) {
-        sendError = err.message;
-        console.error(`[Tasks] Send failed with exception:`, err.message);
-      } finally {
-        // Re-add the tool to confirmation list
-        if (toolIndex > -1 && !TOOLS_REQUIRING_CONFIRMATION.includes(pendingMsg.toolName)) {
-          TOOLS_REQUIRING_CONFIRMATION.push(pendingMsg.toolName);
-        }
-      }
-
-      // If send failed, keep the message for retry and notify user
-      if (!sendSuccess) {
-        task.lastUpdated = new Date().toISOString();
-        task.executionLog.push({
-          timestamp: new Date().toISOString(),
-          message: `FAILED to send ${pendingMsg.platform} message to ${pendingMsg.recipient}: ${sendError || 'Unknown error'}`
-        });
-        
-        // Save task with the failure logged (but keep pending message for retry)
-        const tasksDir = await getTasksDir(currentUser?.username);
-        const taskPath = path.join(tasksDir, `${taskId}.md`);
-        await fs.writeFile(taskPath, serializeTask(task), "utf8");
-        
-        addTaskUpdate(taskId, `Failed to send message to ${pendingMsg.recipient}: ${sendError}`, {
-          toChat: true,
-          emoji: "❌",
-          taskTitle: task.title
-        });
-        
-        return { ok: false, error: sendError || 'Failed to send message. Please try again.' };
-      }
-
-      // Send succeeded - remove the pending message
-      task.pendingMessages.splice(messageIndex, 1);
-      
-      // Log the successful send
-      task.lastUpdated = new Date().toISOString();
-      task.executionLog.push({
-        timestamp: new Date().toISOString(),
-        message: `Sent ${pendingMsg.platform} message to ${pendingMsg.recipient}`
-      });
-      
-      // CRITICAL: Do NOT auto-advance to next step just because message was sent
-      // The current step may require waiting for a response
-      // Check if the current step involves waiting for a response
-      const currentStepDesc = task.plan[task.currentStep.step - 1]?.toLowerCase() || '';
-      const isWaitingStep = currentStepDesc.includes('wait') || 
-                           currentStepDesc.includes('response') ||
-                           currentStepDesc.includes('reply') ||
-                           currentStepDesc.includes('follow up') ||
-                           currentStepDesc.includes('until');
-      
-      console.log(`[Tasks] DEBUG approvePendingMessage: currentStepDesc = "${currentStepDesc}", isWaitingStep = ${isWaitingStep}`);
-      
-      // Capture conversation/thread ID from send result BEFORE the branching logic
-      // This ensures it's available for both waiting and non-waiting steps
-      const conversationId = sendResult?.chatId ||     // iMessage chat_id
-                             sendResult?.channel ||    // Slack channel
-                             sendResult?.threadId ||   // Email thread
-                             null;
-      
-      console.log(`[Tasks] DEBUG approvePendingMessage: sendResult =`, JSON.stringify(sendResult).slice(0, 300));
-      console.log(`[Tasks] DEBUG approvePendingMessage: captured conversationId = ${conversationId}`);
-      
-      if (task.pendingMessages.length === 0) {
-        if (isWaitingStep) {
-          // This step requires waiting for a response - don't advance
-          task.status = "waiting";
-          task.currentStep.state = "waiting";
-          
-          // CRITICAL: Set nextCheck to prevent immediate re-execution by scheduler
-          // Use the task's poll frequency or default to 5 minutes
-          const pollInterval = task.pollFrequency?.value || 300000; // Default 5 minutes
-          task.nextCheck = Date.now() + pollInterval;
-          
-          // Store context about what we're waiting for
-          task.contextMemory = {
-            ...task.contextMemory,
-            waiting_via: pendingMsg.platform,
-            waiting_for_contact: pendingMsg.recipient,
-            last_message_time: new Date().toISOString(),
-            new_reply_detected: false,
-            // Store conversation ID for thread-specific reply checking
-            ...(conversationId ? { conversation_id: conversationId } : {}),
-            // Store original subject for email threading (strip "Re: " prefix if present)
-            ...(pendingMsg.platform === 'email' && pendingMsg.subject ? { 
-              original_subject: pendingMsg.subject.replace(/^Re:\s*/i, '') 
-            } : {}),
-            // Store message ID from send result for reply threading
-            ...(sendResult?.messageId ? { last_message_id: sendResult.messageId } : {})
-          };
-          
-          console.log(`[Tasks] DEBUG approvePendingMessage: contextMemory.conversation_id = ${task.contextMemory.conversation_id}`);
-          
-          console.log(`[Tasks] Message sent for waiting step "${currentStepDesc}" - staying on step ${task.currentStep.step}, waiting for response${conversationId ? ` (conversation: ${conversationId})` : ''}, next check in ${pollInterval/1000}s`);
-          
-          task.executionLog.push({
-            timestamp: new Date().toISOString(),
-            message: `Waiting for response from ${pendingMsg.recipient} via ${pendingMsg.platform}`
-          });
-        } else {
-          // Non-waiting step - can advance (e.g., simple notification)
-          task.status = "active";
-          
-          // IMPORTANT: Still capture the conversation_id for any subsequent wait_for_reply steps
-          // This ensures the next step has access to the threadId even if current step doesn't wait
-          if (conversationId || pendingMsg.platform === 'email') {
-            task.contextMemory = {
-              ...task.contextMemory,
-              ...(conversationId ? { conversation_id: conversationId } : {}),
-              last_message_time: new Date().toISOString(),
-              // Store original subject for email threading
-              ...(pendingMsg.platform === 'email' && pendingMsg.subject ? { 
-                original_subject: pendingMsg.subject.replace(/^Re:\s*/i, '') 
-              } : {}),
-              // Store message ID from send result for reply threading
-              ...(sendResult?.messageId ? { last_message_id: sendResult.messageId } : {})
-            };
-            console.log(`[Tasks] Captured conversation_id ${conversationId} for next step`);
-          }
-          
-          const currentStep = task.currentStep.step;
-          const nextStep = currentStep + 1;
-          
-          if (nextStep <= task.plan.length) {
-            task.currentStep.step = nextStep;
-            task.currentStep.state = "executing";
-            console.log(`[Tasks] Message sent on non-waiting step, advancing from step ${currentStep} to step ${nextStep}`);
-          } else {
-            task.status = "completed";
-            task.currentStep.state = "completed";
-            console.log(`[Tasks] Message sent on final step, marking task as completed`);
-          }
-        }
-      }
-
-      // Save task
-      const tasksDir = await getTasksDir(currentUser?.username);
-      const taskPath = path.join(tasksDir, `${taskId}.md`);
-      await fs.writeFile(taskPath, serializeTask(task), "utf8");
-
-      // Notify UI - always send to chat for visibility
-      const updateMessage = task.status === "completed"
-        ? `Task completed! Final message sent to ${pendingMsg.recipient}.`
-        : isWaitingStep
-          ? `Message sent to ${pendingMsg.recipient}. Waiting for their response...`
-          : `Message sent to ${pendingMsg.recipient}.`;
-      
-      const updateEmoji = task.status === "completed" ? "✅" : "📤";
-      
-      addTaskUpdate(taskId, updateMessage, { 
-        toChat: true, 
-        emoji: updateEmoji, 
-        taskTitle: task.title 
-      });
-      
-      // Only continue execution if task is active (not waiting)
-      if (task.status === "active") {
-        setTimeout(() => executeTaskStep(taskId, currentUser?.username), 100);
-      }
-
-      return { ok: true, sendResult, waiting: task.status === "waiting" };
-    } catch (err) {
-      console.error(`[Tasks] Error approving message:`, err.message);
-      return { ok: false, error: err.message };
-    }
+    return await TaskMessagingService.approvePendingMessage(
+      taskId,
+      messageId,
+      editedMessage,
+      currentUser?.username
+    );
   });
 
   // Reject/discard a pending message
   ipcMain.handle("tasks:rejectPendingMessage", async (_event, { taskId, messageId }) => {
-    try {
-      const task = await getTask(taskId, currentUser?.username);
-      if (!task) {
-        return { ok: false, error: "Task not found" };
-      }
-
-      // Find and remove the pending message
-      const messageIndex = task.pendingMessages?.findIndex(m => m.id === messageId);
-      if (messageIndex === undefined || messageIndex < 0) {
-        return { ok: false, error: "Pending message not found" };
-      }
-
-      const pendingMsg = task.pendingMessages[messageIndex];
-      task.pendingMessages.splice(messageIndex, 1);
-      
-      // Update task status - advance to next step even when discarded (otherwise it will retry the same message)
-      if (task.pendingMessages.length === 0) {
-        task.status = "active"; // Resume but message was skipped
-        
-        // Advance to the next step since the user chose to skip this message
-        const currentStep = task.currentStep.step;
-        const nextStep = currentStep + 1;
-        
-        if (nextStep <= task.plan.length) {
-          task.currentStep.step = nextStep;
-          task.currentStep.state = "executing";
-          console.log(`[Tasks] Message discarded, advancing from step ${currentStep} to step ${nextStep}`);
-        } else {
-          // This was the last step - mark task as completed (with skipped message)
-          task.status = "completed";
-          task.currentStep.state = "completed";
-          console.log(`[Tasks] Message discarded on final step, marking task as completed`);
-        }
-      }
-      task.lastUpdated = new Date().toISOString();
-      task.executionLog.push({
-        timestamp: new Date().toISOString(),
-        message: `Discarded ${pendingMsg.platform} message to ${pendingMsg.recipient} (user rejected)`
-      });
-
-      // Save task
-      const tasksDir = await getTasksDir(currentUser?.username);
-      const taskPath = path.join(tasksDir, `${taskId}.md`);
-      await fs.writeFile(taskPath, serializeTask(task), "utf8");
-
-      // Notify UI - send to chat
-      const discardMessage = task.status === "completed"
-        ? `Task completed (message was skipped).`
-        : `Message to ${pendingMsg.recipient} was discarded. Continuing to next step...`;
-      
-      addTaskUpdate(taskId, discardMessage, {
-        toChat: true,
-        emoji: "⏭️",
-        taskTitle: task.title
-      });
-      
-      // Continue task execution on the next step
-      if (task.status === "active") {
-        setTimeout(() => executeTaskStep(taskId, currentUser?.username), 100);
-      }
-
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+    return await TaskMessagingService.rejectPendingMessage(
+      taskId,
+      messageId,
+      currentUser?.username
+    );
   });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // REMOVED: Old inline implementations moved to TaskMessagingService
+  // - approvePendingMessage: ~350 lines (lines 3620-3955 in old version)
+  // - rejectPendingMessage: ~70 lines (lines 3958-4024 in old version)
+  // Total: ~420 lines removed from main.js
+  // ─────────────────────────────────────────────────────────────────────────────
 
   // Set auto-send preference for a task
   ipcMain.handle("tasks:setAutoSend", async (_event, { taskId, autoSend }) => {
@@ -4412,7261 +3159,6 @@ app.whenReady().then(async () => {
     return TasksService.getPollFrequencyPresets();
   });
 
-  // Slack API helpers for tools
-  const fetchSlackChannels = async (accessToken) => {
-    const response = await fetch("https://slack.com/api/conversations.list?types=public_channel,private_channel,im,mpim&limit=100", {
-      headers: { "Authorization": `Bearer ${accessToken}` }
-    });
-    const data = await response.json();
-    if (!data.ok) throw new Error(data.error);
-    return data.channels || [];
-  };
-
-  const fetchSlackMessages = async (accessToken, channelId, limit = 20) => {
-    const response = await fetch(`https://slack.com/api/conversations.history?channel=${channelId}&limit=${limit}`, {
-      headers: { "Authorization": `Bearer ${accessToken}` }
-    });
-    const data = await response.json();
-    if (!data.ok) throw new Error(data.error);
-    return data.messages || [];
-  };
-
-  const sendSlackMessage = async (accessToken, channelId, text) => {
-    const response = await fetch("https://slack.com/api/chat.postMessage", {
-      method: "POST",
-      headers: { 
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ channel: channelId, text })
-    });
-    const data = await response.json();
-    if (!data.ok) throw new Error(data.error);
-    return data;
-  };
-
-  const fetchSlackUsers = async (accessToken) => {
-    const response = await fetch("https://slack.com/api/users.list?limit=200", {
-      headers: { "Authorization": `Bearer ${accessToken}` }
-    });
-    const data = await response.json();
-    if (!data.ok) throw new Error(data.error);
-    return data.members || [];
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // WhatsApp Interface Handlers
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  ipcMain.handle("whatsapp:connect", async () => {
-    return await WhatsAppService.connect(whatsappConnector);
-  });
-
-  ipcMain.handle("whatsapp:disconnect", async () => {
-    return await WhatsAppService.disconnect(whatsappConnector);
-  });
-
-  ipcMain.handle("whatsapp:getStatus", async () => {
-    return await WhatsAppService.getStatus(whatsappConnector);
-  });
-
-  ipcMain.handle("whatsapp:checkAuth", async () => {
-    return await WhatsAppService.checkAuth(whatsappConnector, fs);
-  });
-
-  ipcMain.handle("whatsapp:sendMessage", async (_event, { recipient, message }) => {
-    return await WhatsAppService.sendMessage(whatsappConnector, recipient, message);
-  });
-
-  ipcMain.handle("whatsapp:syncToSelfChat", async (_event, { message, isFromUser }) => {
-    return await WhatsAppService.syncToSelfChat(whatsappConnector, message, isFromUser);
-  });
-
-  ipcMain.handle("whatsapp:isSyncReady", async () => {
-    return await WhatsAppService.isSyncReady(whatsappConnector);
-  });
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Telegram Interface Handlers (Chat via Telegram, similar to WhatsApp)
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  ipcMain.handle("telegramInterface:connect", async () => {
-    try {
-      await connectTelegramInterface();
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
-  });
-
-  ipcMain.handle("telegramInterface:disconnect", async () => {
-    try {
-      await disconnectTelegramInterface();
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
-  });
-
-  ipcMain.handle("telegramInterface:getStatus", async () => {
-    return {
-      ok: true,
-      status: telegramInterfaceStatus
-    };
-  });
-
-  ipcMain.handle("telegramInterface:checkAuth", async () => {
-    // Check if bot token is configured
-    const botToken = await getTelegramToken();
-    return {
-      ok: true,
-      hasBot: !!botToken,
-      connected: telegramInterfaceStatus === "connected"
-    };
-  });
-
-  // Clear Google authorization (to force re-auth with new scopes)
-  ipcMain.handle("integrations:disconnectGoogle", async () => {
-    return await GoogleOAuthService.disconnect(currentUser?.username);
-  });
-
-  // Google Workspace Tools
-  const googleWorkspaceTools = [
-    {
-      name: "get_calendar_events",
-      description: "Get calendar events for a specific date or date range.",
-      input_schema: {
-        type: "object",
-        properties: {
-          date: { type: "string", description: "Date in YYYY-MM-DD format" },
-          days: { type: "number", description: "Number of days to fetch (default 1)" }
-        },
-        required: []
-      }
-    },
-    {
-      name: "create_calendar_event",
-      description: "Create a new calendar event with optional attendees. Attendees will receive email invitations.",
-      input_schema: {
-        type: "object",
-        properties: {
-          title: { type: "string", description: "Event title" },
-          start: { type: "string", description: "Start datetime in ISO format" },
-          end: { type: "string", description: "End datetime in ISO format" },
-          description: { type: "string", description: "Event description" },
-          location: { type: "string", description: "Event location" },
-          attendees: { 
-            type: "array", 
-            items: { type: "string" },
-            description: "Array of email addresses to invite to the event. They will receive calendar invitations."
-          },
-          sendNotifications: {
-            type: "boolean",
-            description: "Whether to send email notifications to attendees (default: true)"
-          }
-        },
-        required: ["title", "start", "end"]
-      }
-    },
-    {
-      name: "delete_calendar_event",
-      description: "Delete a calendar event by ID.",
-      input_schema: {
-        type: "object",
-        properties: {
-          eventId: { type: "string", description: "The event ID to delete" }
-        },
-        required: ["eventId"]
-      }
-    },
-    {
-      name: "search_emails",
-      description: "Search for emails.",
-      input_schema: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search query" },
-          maxResults: { type: "number", description: "Max results (default 10)" }
-        },
-        required: ["query"]
-      }
-    },
-    {
-      name: "get_email_content",
-      description: "Get the content of a specific email.",
-      input_schema: {
-        type: "object",
-        properties: {
-          messageId: { type: "string", description: "The email message ID" }
-        },
-        required: ["messageId"]
-      }
-    },
-    {
-      name: "get_email_contents_batch",
-      description: "Get the contents of multiple emails in batch. More efficient than calling get_email_content multiple times. Use this when you need to fetch content for multiple emails (e.g., to summarize a list of emails).",
-      input_schema: {
-        type: "object",
-        properties: {
-          messageIds: {
-            type: "array",
-            items: { type: "string" },
-            description: "Array of email message IDs to fetch"
-          },
-          maxEmails: {
-            type: "number",
-            description: "Maximum number of emails to fetch (default: 50)",
-            default: 50
-          }
-        },
-        required: ["messageIds"]
-      }
-    },
-    {
-      name: "analyze_with_llm",
-      description: "Use the LLM to analyze, summarize, or extract information from text content. Useful for generating summaries, answering questions about content, or performing analysis that requires understanding and reasoning.",
-      input_schema: {
-        type: "object",
-        properties: {
-          content: {
-            type: "string",
-            description: "The text content to analyze (can be a single text or JSON stringified array of items)"
-          },
-          instruction: {
-            type: "string",
-            description: "What you want the LLM to do with the content (e.g., 'Summarize these emails', 'Extract key action items', 'List the main senders and topics')"
-          },
-          format: {
-            type: "string",
-            description: "Desired output format: 'text' (plain text), 'markdown' (formatted markdown), or 'json' (structured data)",
-            enum: ["text", "markdown", "json"],
-            default: "markdown"
-          }
-        },
-        required: ["content", "instruction"]
-      }
-    },
-    {
-      name: "send_email",
-      description: "Send an email or reply to an existing email thread. Always confirm with user before sending. When replying to an email, use threadId and replyToMessageId to keep the conversation in the same thread.",
-      input_schema: {
-        type: "object",
-        properties: {
-          to: { type: "string", description: "Recipient email" },
-          subject: { type: "string", description: "Email subject. For replies, keep the original subject (optionally with 'Re: ' prefix) to maintain the thread." },
-          body: { type: "string", description: "Email body" },
-          cc: { type: "string", description: "CC recipients" },
-          bcc: { type: "string", description: "BCC recipients" },
-          threadId: { type: "string", description: "Gmail thread ID to reply to. Use this when replying to an existing email conversation." },
-          replyToMessageId: { type: "string", description: "Message-ID header of the email being replied to. Required for proper threading." }
-        },
-        required: ["to", "subject", "body"]
-      }
-    },
-    {
-      name: "list_drive_files",
-      description: "List files in Google Drive.",
-      input_schema: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search query" },
-          maxResults: { type: "number", description: "Max results (default 10)" }
-        },
-        required: []
-      }
-    }
-  ];
-
-  // Profile tools
-  const profileTools = [
-    {
-      name: "get_user_profile",
-      description: "Get the user's profile information.",
-      input_schema: { type: "object", properties: {}, required: [] }
-    },
-    {
-      name: "update_user_profile",
-      description: "Update the user's profile with new information. Use this when the user shares ANY personal information - their job, family details, important dates (birthdays, anniversaries), preferences, goals, or any facts they want you to remember. Always confirm with user before updating. Use 'addNote' for custom facts. Use 'addGoal' when the user mentions a goal or priority (e.g., 'new goal: save more money', 'I want to learn Spanish', 'my goal is to buy a house').",
-      input_schema: {
-        type: "object",
-        properties: {
-          occupation: { type: "string", description: "User's job or profession" },
-          city: { type: "string", description: "City where user lives" },
-          homeLife: { type: "string", description: "Family situation - spouse, kids, pets" },
-          dateOfBirth: { type: "string", description: "User's birthday in any format" },
-          onboardingCompleted: { type: "boolean", description: "Set true when basic info is collected" },
-          addNote: { type: "string", description: "Add a custom fact or note to remember. Use for ANY information the user wants saved: family birthdays, anniversaries, preferences, important dates, etc. Example: 'Wife\\'s birthday: November 29, 1985'" },
-          removeNote: { type: "string", description: "Remove a note that contains this text" },
-          addGoal: { type: "string", description: "Add a new goal or priority. Use when user says things like 'new goal: ...', 'I want to...', 'my goal is...'. Example: 'Save more money', 'Learn Spanish', 'Buy a house by end of year'. Goals help prioritize insights from messages." },
-          removeGoal: { type: "string", description: "Remove a goal that contains this text" }
-        },
-        required: []
-      }
-    }
-  ];
-
-  // Memory tools - for accessing historical conversations
-  const memoryTools = [
-    {
-      name: "search_memory",
-      description: "Search through historical conversations by keyword. Use when user asks about past conversations with specific topics. Examples: 'did we ever discuss Italy?', 'what did I say about the project?'",
-      input_schema: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search terms to look for in past conversations" },
-          date_range: { 
-            type: "string", 
-            enum: ["last_week", "last_month", "last_3_months", "all"],
-            description: "How far back to search. Default is 'all' for comprehensive search."
-          }
-        },
-        required: ["query"]
-      }
-    },
-    {
-      name: "get_conversations_for_date",
-      description: "Get all conversations from a specific date. Use when user asks about what was discussed on a particular day. Examples: 'what did we talk about yesterday?', 'what did we discuss on Monday?', 'show me our conversation from January 15th'",
-      input_schema: {
-        type: "object",
-        properties: {
-          date: { 
-            type: "string", 
-            description: "The date to retrieve. Can be: 'today', 'yesterday', a relative day like 'last Monday', or a specific date like '2024-01-15' or 'January 15, 2024'"
-          }
-        },
-        required: ["date"]
-      }
-    },
-    {
-      name: "search_memory_between_dates",
-      description: "Search conversations within a specific date range. Use when user asks about discussions during a time period. Examples: 'what did we discuss last week?', 'find mentions of the project between Christmas and New Year'",
-      input_schema: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Optional search terms. If empty, returns all conversations in range." },
-          start_date: { type: "string", description: "Start date (inclusive). Format: 'YYYY-MM-DD' or relative like 'last Monday', '2 weeks ago'" },
-          end_date: { type: "string", description: "End date (inclusive). Format: 'YYYY-MM-DD' or relative like 'yesterday', 'today'" }
-        },
-        required: ["start_date", "end_date"]
-      }
-    },
-    {
-      name: "list_memory_dates",
-      description: "List all dates that have conversation records. Use to see conversation history availability or find when conversations started. Examples: 'when did we first chat?', 'how many days have we talked?', 'list all our conversation dates'",
-      input_schema: {
-        type: "object",
-        properties: {
-          limit: { type: "number", description: "Maximum number of dates to return. Default 30." }
-        },
-        required: []
-      }
-    },
-    {
-      name: "get_conversation_summary",
-      description: "Get the AI-generated summary for a specific date's conversations. Faster than retrieving full conversations when user just wants highlights. Examples: 'give me a summary of yesterday's chat', 'what were the key points from last Monday?'",
-      input_schema: {
-        type: "object",
-        properties: {
-          date: { type: "string", description: "The date to get summary for. Format: 'YYYY-MM-DD' or relative like 'yesterday', 'last Monday'" }
-        },
-        required: ["date"]
-      }
-    }
-  ];
-
-  // Memory search execution function
-  const executeMemorySearch = async (query, dateRange = "all") => {
-    if (!currentUser?.username) {
-      return { error: "Not logged in" };
-    }
-    const dailyDir = await getMemoryDailyDir(currentUser.username);
-    const longtermDir = await getMemoryLongtermDir(currentUser.username);
-    const results = [];
-    const queryLower = query.toLowerCase();
-
-    // Calculate date cutoff based on range
-    const now = new Date();
-    let cutoffDate = null;
-    if (dateRange === "last_week") {
-      cutoffDate = new Date(now);
-      cutoffDate.setDate(cutoffDate.getDate() - 7);
-    } else if (dateRange === "last_month") {
-      cutoffDate = new Date(now);
-      cutoffDate.setMonth(cutoffDate.getMonth() - 1);
-    } else if (dateRange === "last_3_months") {
-      cutoffDate = new Date(now);
-      cutoffDate.setMonth(cutoffDate.getMonth() - 3);
-    }
-    // 'all' means no cutoff
-
-    // Search helper function
-    const searchFile = async (filePath, dateStr) => {
-      try {
-        const content = await fs.readFile(filePath, "utf8");
-        if (content.toLowerCase().includes(queryLower)) {
-          // Extract matching lines for context
-          const lines = content.split('\n');
-          const matchingLines = lines.filter(line => 
-            line.toLowerCase().includes(queryLower)
-          ).slice(0, 5); // Limit to 5 matches per file
-
-          if (matchingLines.length > 0) {
-            results.push({
-              date: dateStr,
-              matches: matchingLines
-            });
-          }
-        }
-      } catch {
-        // Skip unreadable files
-      }
-    };
-
-    // Search daily files
-    try {
-      const dailyFiles = await fs.readdir(dailyDir);
-      for (const file of dailyFiles) {
-        if (!file.endsWith('.md')) continue;
-        const dateStr = file.replace('.md', '');
-        
-        // Check date cutoff
-        if (cutoffDate) {
-          const fileDate = new Date(dateStr + 'T00:00:00');
-          if (fileDate < cutoffDate) continue;
-        }
-
-        await searchFile(path.join(dailyDir, file), dateStr);
-      }
-    } catch {
-      // No daily directory
-    }
-
-    // Search longterm files
-    try {
-      const longtermFiles = await fs.readdir(longtermDir);
-      for (const file of longtermFiles) {
-        if (!file.endsWith('.md')) continue;
-        const dateStr = file.replace('.md', '');
-        
-        // Check date cutoff
-        if (cutoffDate) {
-          const fileDate = new Date(dateStr + 'T00:00:00');
-          if (fileDate < cutoffDate) continue;
-        }
-
-        await searchFile(path.join(longtermDir, file), dateStr);
-      }
-    } catch {
-      // No longterm directory
-    }
-
-    // Sort results by date (most recent first)
-    results.sort((a, b) => b.date.localeCompare(a.date));
-
-    if (results.length === 0) {
-      return { found: false, message: `No conversations found matching "${query}" in the specified time range.` };
-    }
-
-    return {
-      found: true,
-      totalMatches: results.length,
-      results: results.slice(0, 10) // Limit to 10 most recent matching days
-    };
-  };
-
-  // Helper: Parse natural language date to YYYY-MM-DD format
-  const parseDateString = (dateStr) => {
-    const now = new Date();
-    const lower = dateStr.toLowerCase().trim();
-    
-    // Handle relative dates
-    if (lower === "today") {
-      return now.toISOString().split('T')[0];
-    }
-    if (lower === "yesterday") {
-      const d = new Date(now);
-      d.setDate(d.getDate() - 1);
-      return d.toISOString().split('T')[0];
-    }
-    
-    // Handle "X days ago"
-    const daysAgoMatch = lower.match(/^(\d+)\s*days?\s*ago$/);
-    if (daysAgoMatch) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - parseInt(daysAgoMatch[1]));
-      return d.toISOString().split('T')[0];
-    }
-    
-    // Handle "X weeks ago"
-    const weeksAgoMatch = lower.match(/^(\d+)\s*weeks?\s*ago$/);
-    if (weeksAgoMatch) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - parseInt(weeksAgoMatch[1]) * 7);
-      return d.toISOString().split('T')[0];
-    }
-    
-    // Handle "last Monday", "last Tuesday", etc.
-    const dayNames = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
-    const lastDayMatch = lower.match(/^last\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
-    if (lastDayMatch) {
-      const targetDay = dayNames.indexOf(lastDayMatch[1]);
-      const d = new Date(now);
-      const currentDay = d.getDay();
-      let daysBack = currentDay - targetDay;
-      if (daysBack <= 0) daysBack += 7;
-      d.setDate(d.getDate() - daysBack);
-      return d.toISOString().split('T')[0];
-    }
-    
-    // Handle "this Monday", "this Tuesday", etc. (current week)
-    const thisDayMatch = lower.match(/^this\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
-    if (thisDayMatch) {
-      const targetDay = dayNames.indexOf(thisDayMatch[1]);
-      const d = new Date(now);
-      const currentDay = d.getDay();
-      let daysDiff = targetDay - currentDay;
-      d.setDate(d.getDate() + daysDiff);
-      return d.toISOString().split('T')[0];
-    }
-    
-    // Try parsing as a date string (handles "January 15, 2024", "2024-01-15", etc.)
-    const parsed = new Date(dateStr);
-    if (!isNaN(parsed.getTime())) {
-      return parsed.toISOString().split('T')[0];
-    }
-    
-    // Return as-is if already in YYYY-MM-DD format
-    if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-      return dateStr;
-    }
-    
-    return null; // Could not parse
-  };
-
-  // Get conversations for a specific date
-  const executeGetConversationsForDate = async (dateInput) => {
-    if (!currentUser?.username) {
-      return { error: "Not logged in" };
-    }
-    
-    const dateStr = parseDateString(dateInput);
-    if (!dateStr) {
-      return { error: `Could not parse date: "${dateInput}". Try formats like "yesterday", "last Monday", "2024-01-15", or "January 15, 2024"` };
-    }
-    
-    const dailyDir = await getMemoryDailyDir(currentUser.username);
-    const longtermDir = await getMemoryLongtermDir(currentUser.username);
-    
-    // Try daily first, then longterm
-    let content = null;
-    let source = null;
-    
-    try {
-      const dailyPath = path.join(dailyDir, `${dateStr}.md`);
-      content = await fs.readFile(dailyPath, "utf8");
-      source = "daily";
-    } catch {
-      try {
-        const longtermPath = path.join(longtermDir, `${dateStr}.md`);
-        content = await fs.readFile(longtermPath, "utf8");
-        source = "longterm";
-      } catch {
-        // No file found
-      }
-    }
-    
-    if (!content) {
-      return { 
-        found: false, 
-        date: dateStr,
-        message: `No conversations found for ${dateStr}.` 
-      };
-    }
-    
-    // Parse conversations from content
-    const entries = content.split(/\n---\n/).filter(e => e.trim());
-    const conversations = [];
-    
-    for (const entry of entries) {
-      // Skip summary section
-      if (entry.startsWith('## Summary')) continue;
-      
-      const timestampMatch = entry.match(/\*\*\[([^\]]+)\]\*\*/);
-      const userMatch = entry.match(/\*\*User:\*\*\s*([\s\S]*?)(?=\*\*Assistant:\*\*|$)/);
-      const assistantMatch = entry.match(/\*\*Assistant:\*\*\s*([\s\S]*?)$/);
-      
-      if (userMatch || assistantMatch) {
-        conversations.push({
-          timestamp: timestampMatch ? timestampMatch[1] : null,
-          user: userMatch ? userMatch[1].trim() : null,
-          assistant: assistantMatch ? assistantMatch[1].trim() : null
-        });
-      }
-    }
-    
-    return {
-      found: true,
-      date: dateStr,
-      source,
-      conversationCount: conversations.length,
-      conversations: conversations.slice(0, 20) // Limit to 20 most recent
-    };
-  };
-
-  // Search memory between specific dates
-  const executeSearchMemoryBetweenDates = async (query, startDateInput, endDateInput) => {
-    if (!currentUser?.username) {
-      return { error: "Not logged in" };
-    }
-    
-    const startDate = parseDateString(startDateInput);
-    const endDate = parseDateString(endDateInput);
-    
-    if (!startDate) {
-      return { error: `Could not parse start date: "${startDateInput}"` };
-    }
-    if (!endDate) {
-      return { error: `Could not parse end date: "${endDateInput}"` };
-    }
-    
-    const dailyDir = await getMemoryDailyDir(currentUser.username);
-    const longtermDir = await getMemoryLongtermDir(currentUser.username);
-    const results = [];
-    const queryLower = query ? query.toLowerCase() : null;
-    
-    // Helper to check if date is in range
-    const isInRange = (dateStr) => {
-      return dateStr >= startDate && dateStr <= endDate;
-    };
-    
-    // Helper to search a file
-    const searchFile = async (filePath, dateStr) => {
-      try {
-        const content = await fs.readFile(filePath, "utf8");
-        
-        // If no query, just return that we found content for this date
-        if (!queryLower) {
-          const preview = content.slice(0, 200).replace(/\n/g, ' ').trim();
-          results.push({
-            date: dateStr,
-            preview: preview + (content.length > 200 ? '...' : '')
-          });
-          return;
-        }
-        
-        // Search for query matches
-        if (content.toLowerCase().includes(queryLower)) {
-          const lines = content.split('\n');
-          const matchingLines = lines.filter(line => 
-            line.toLowerCase().includes(queryLower)
-          ).slice(0, 3);
-          
-          if (matchingLines.length > 0) {
-            results.push({
-              date: dateStr,
-              matches: matchingLines
-            });
-          }
-        }
-      } catch {
-        // Skip unreadable files
-      }
-    };
-    
-    // Search daily files
-    try {
-      const dailyFiles = await fs.readdir(dailyDir);
-      for (const file of dailyFiles) {
-        if (!file.endsWith('.md')) continue;
-        const dateStr = file.replace('.md', '');
-        if (isInRange(dateStr)) {
-          await searchFile(path.join(dailyDir, file), dateStr);
-        }
-      }
-    } catch {
-      // No daily directory
-    }
-    
-    // Search longterm files
-    try {
-      const longtermFiles = await fs.readdir(longtermDir);
-      for (const file of longtermFiles) {
-        if (!file.endsWith('.md')) continue;
-        const dateStr = file.replace('.md', '');
-        if (isInRange(dateStr)) {
-          await searchFile(path.join(longtermDir, file), dateStr);
-        }
-      }
-    } catch {
-      // No longterm directory
-    }
-    
-    // Sort by date (most recent first)
-    results.sort((a, b) => b.date.localeCompare(a.date));
-    
-    if (results.length === 0) {
-      const msg = queryLower 
-        ? `No conversations matching "${query}" found between ${startDate} and ${endDate}.`
-        : `No conversations found between ${startDate} and ${endDate}.`;
-      return { found: false, message: msg };
-    }
-    
-    return {
-      found: true,
-      dateRange: { start: startDate, end: endDate },
-      query: query || null,
-      totalDays: results.length,
-      results: results.slice(0, 15)
-    };
-  };
-
-  // List all memory dates
-  const executeListMemoryDates = async (limit = 30) => {
-    if (!currentUser?.username) {
-      return { error: "Not logged in" };
-    }
-    
-    const dailyDir = await getMemoryDailyDir(currentUser.username);
-    const longtermDir = await getMemoryLongtermDir(currentUser.username);
-    const allDates = new Set();
-    
-    // Get dates from daily
-    try {
-      const dailyFiles = await fs.readdir(dailyDir);
-      for (const file of dailyFiles) {
-        if (file.endsWith('.md')) {
-          allDates.add(file.replace('.md', ''));
-        }
-      }
-    } catch {
-      // No daily directory
-    }
-    
-    // Get dates from longterm
-    try {
-      const longtermFiles = await fs.readdir(longtermDir);
-      for (const file of longtermFiles) {
-        if (file.endsWith('.md')) {
-          allDates.add(file.replace('.md', ''));
-        }
-      }
-    } catch {
-      // No longterm directory
-    }
-    
-    // Sort dates (most recent first)
-    const sortedDates = Array.from(allDates).sort().reverse();
-    
-    if (sortedDates.length === 0) {
-      return { found: false, message: "No conversation history found." };
-    }
-    
-    const oldestDate = sortedDates[sortedDates.length - 1];
-    const newestDate = sortedDates[0];
-    
-    return {
-      found: true,
-      totalDays: sortedDates.length,
-      oldestDate,
-      newestDate,
-      dates: sortedDates.slice(0, limit)
-    };
-  };
-
-  // Get conversation summary for a date
-  const executeGetConversationSummary = async (dateInput) => {
-    if (!currentUser?.username) {
-      return { error: "Not logged in" };
-    }
-    
-    const dateStr = parseDateString(dateInput);
-    if (!dateStr) {
-      return { error: `Could not parse date: "${dateInput}"` };
-    }
-    
-    const dailyDir = await getMemoryDailyDir(currentUser.username);
-    const longtermDir = await getMemoryLongtermDir(currentUser.username);
-    
-    // Try longterm first (summaries are there), then daily
-    let content = null;
-    let source = null;
-    
-    try {
-      const longtermPath = path.join(longtermDir, `${dateStr}.md`);
-      content = await fs.readFile(longtermPath, "utf8");
-      source = "longterm";
-    } catch {
-      try {
-        const dailyPath = path.join(dailyDir, `${dateStr}.md`);
-        content = await fs.readFile(dailyPath, "utf8");
-        source = "daily";
-      } catch {
-        // No file found
-      }
-    }
-    
-    if (!content) {
-      return { 
-        found: false, 
-        date: dateStr,
-        message: `No conversations found for ${dateStr}.` 
-      };
-    }
-    
-    // Extract summary if it exists
-    const summaryMatch = content.match(/## Summary\n([\s\S]*?)\n---/);
-    
-    if (summaryMatch) {
-      return {
-        found: true,
-        date: dateStr,
-        hasSummary: true,
-        summary: summaryMatch[1].trim()
-      };
-    }
-    
-    // No summary - this is likely a recent file
-    // Return a brief preview instead
-    const preview = content.slice(0, 500).replace(/\n+/g, '\n').trim();
-    return {
-      found: true,
-      date: dateStr,
-      hasSummary: false,
-      message: "No summary available yet (summaries are generated for older conversations).",
-      preview: preview + (content.length > 500 ? '...' : '')
-    };
-  };
-
-  // Documentation tools - for answering user questions about how to use Wovly
-  const documentationTools = [
-    {
-      name: "fetch_documentation",
-      description: "Fetch Wovly documentation to answer user questions about how to use features. Use when user asks detailed questions about skills, tasks, integrations, settings, troubleshooting, or how to do something specific in Wovly. Examples: 'how do I create a custom skill?', 'explain how tasks work', 'how do I connect Slack?'",
-      input_schema: {
-        type: "object",
-        properties: {
-          topic: { 
-            type: "string", 
-            description: "The topic to look up. Common topics: skills, tasks, integrations, chat, memory, settings, installation, troubleshooting, google-workspace, slack, imessage, whatsapp, browser-automation, credentials, security, faq" 
-          }
-        },
-        required: ["topic"]
-      }
-    }
-  ];
-
-  // Documentation fetch execution function
-  const executeDocumentationFetch = async (topic) => {
-    try {
-      // Fetch the llms.txt index to find the right page
-      const indexRes = await fetch("https://wovly.mintlify.app/llms.txt");
-      if (!indexRes.ok) {
-        return { error: "Could not fetch documentation index" };
-      }
-      const index = await indexRes.text();
-      
-      // Normalize topic for matching
-      const topicLower = topic.toLowerCase().trim();
-      const lines = index.split('\n');
-      
-      // Find matching doc URLs based on topic
-      const matches = [];
-      for (const line of lines) {
-        const lineLower = line.toLowerCase();
-        // Check if the line contains the topic and has a URL
-        if (lineLower.includes(topicLower) && line.includes('https://')) {
-          const urlMatch = line.match(/https:\/\/[^\s\)]+/);
-          if (urlMatch) {
-            matches.push(urlMatch[0]);
-          }
-        }
-      }
-      
-      // If no direct match, try partial matches
-      if (matches.length === 0) {
-        // Map common search terms to doc pages
-        const topicMap = {
-          'skill': 'skills',
-          'task': 'tasks',
-          'integration': 'overview',
-          'google': 'google-workspace',
-          'gmail': 'google-workspace',
-          'calendar': 'google-workspace',
-          'slack': 'slack',
-          'imessage': 'imessage',
-          'text': 'imessage',
-          'sms': 'imessage',
-          'whatsapp': 'whatsapp',
-          'browser': 'browser-automation',
-          'credential': 'credentials',
-          'login': 'credentials',
-          'memory': 'memory',
-          'profile': 'memory',
-          'setting': 'settings',
-          'security': 'security',
-          'privacy': 'security',
-          'faq': 'faq',
-          'help': 'faq',
-          'troubleshoot': 'troubleshooting',
-          'error': 'troubleshooting',
-          'install': 'installation',
-          'setup': 'quickstart',
-          'start': 'quickstart',
-          'voice': 'voice-mimic',
-          'mimic': 'voice-mimic',
-          'style': 'voice-mimic'
-        };
-        
-        // Find the mapped topic
-        for (const [key, value] of Object.entries(topicMap)) {
-          if (topicLower.includes(key)) {
-            // Find the URL containing this value
-            for (const line of lines) {
-              if (line.toLowerCase().includes(value) && line.includes('https://')) {
-                const urlMatch = line.match(/https:\/\/[^\s\)]+/);
-                if (urlMatch) {
-                  matches.push(urlMatch[0]);
-                  break;
-                }
-              }
-            }
-            break;
-          }
-        }
-      }
-      
-      if (matches.length === 0) {
-        // Return the full index so the LLM can help the user
-        return { 
-          found: false, 
-          message: `No specific documentation found for "${topic}". Available topics in the documentation:`,
-          index: index
-        };
-      }
-      
-      // Fetch the first matching doc page
-      const docUrl = matches[0];
-      const docRes = await fetch(docUrl);
-      if (!docRes.ok) {
-        return { error: `Could not fetch documentation page: ${docUrl}` };
-      }
-      const docContent = await docRes.text();
-      
-      return {
-        found: true,
-        topic: topic,
-        url: docUrl,
-        content: docContent
-      };
-    } catch (err) {
-      console.error("[Documentation] Fetch error:", err.message);
-      return { error: `Failed to fetch documentation: ${err.message}` };
-    }
-  };
-
-  // iMessage tools
-  // Contact name cache to avoid repeated lookups
-  const contactNameCache = new Map();
-
-  // Look up contact name from phone number or email using AppleScript
-  const lookupContactName = (identifier) => {
-    return new Promise((resolve) => {
-      if (!identifier) {
-        resolve(null);
-        return;
-      }
-
-      // Check cache first
-      if (contactNameCache.has(identifier)) {
-        resolve(contactNameCache.get(identifier));
-        return;
-      }
-
-      const { exec } = require("child_process");
-      
-      // Clean the identifier (remove non-numeric chars for phone matching)
-      const cleanPhone = identifier.replace(/\D/g, "");
-      const lastDigits = cleanPhone.slice(-10); // Last 10 digits for matching
-      
-      // AppleScript to search contacts
-      const appleScript = `
-        tell application "Contacts"
-          set matchedName to ""
-          repeat with aPerson in people
-            repeat with aPhone in phones of aPerson
-              set phoneDigits to do shell script "echo " & quoted form of (value of aPhone) & " | tr -cd '0-9'"
-              if phoneDigits ends with "${lastDigits}" then
-                set matchedName to (first name of aPerson & " " & last name of aPerson)
-                exit repeat
-              end if
-            end repeat
-            if matchedName is not "" then exit repeat
-            repeat with anEmail in emails of aPerson
-              if value of anEmail is "${identifier}" then
-                set matchedName to (first name of aPerson & " " & last name of aPerson)
-                exit repeat
-              end if
-            end repeat
-            if matchedName is not "" then exit repeat
-          end repeat
-          return matchedName
-        end tell
-      `;
-
-      exec(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, { timeout: 5000 }, (error, stdout) => {
-        const name = stdout?.trim() || null;
-        if (name && name !== " " && name.length > 1) {
-          contactNameCache.set(identifier, name);
-          resolve(name);
-        } else {
-          contactNameCache.set(identifier, null);
-          resolve(null);
-        }
-      });
-    });
-  };
-
-  // Batch lookup contact names for multiple identifiers
-  const lookupContactNames = async (identifiers) => {
-    const results = new Map();
-    const uniqueIds = [...new Set(identifiers.filter(Boolean))];
-    
-    await Promise.all(uniqueIds.map(async (id) => {
-      const name = await lookupContactName(id);
-      results.set(id, name);
-    }));
-    
-    return results;
-  };
-
-  const iMessageTools = [
-    {
-      name: "get_recent_messages",
-      description: "Get recent text messages (iMessage/SMS) with sender names resolved from contacts. Use this when the user asks about their texts or messages they received.",
-      input_schema: {
-        type: "object",
-        properties: {
-          hours: { type: "number", description: "Hours back to look (default 24)" },
-          contact: { type: "string", description: "Filter by contact name or phone number (e.g., 'Adaira' or '+1234567890')" },
-          limit: { type: "number", description: "Max messages (default 50)" }
-        },
-        required: []
-      }
-    },
-    {
-      name: "search_messages",
-      description: "Search through text messages with sender names resolved. Use to find specific messages or conversations.",
-      input_schema: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search term to find in message content" },
-          contact: { type: "string", description: "Filter by contact name or phone number" },
-          limit: { type: "number", description: "Max results (default 20)" }
-        },
-        required: ["query"]
-      }
-    },
-    {
-      name: "lookup_contact",
-      description: "Look up a contact's phone number from Apple Contacts by name. Returns the contact's name and phone numbers. Use this FIRST when you need to text someone by name to get their phone number.",
-      input_schema: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "Contact name to search for (first name, last name, or full name)" }
-        },
-        required: ["name"]
-      }
-    },
-    {
-      name: "send_imessage",
-      description: "Send a text message via iMessage or SMS. The recipient can be a contact name (will auto-lookup phone number) or a phone number directly. Always confirm with user first before sending.",
-      input_schema: {
-        type: "object",
-        properties: {
-          recipient: { type: "string", description: "Contact name (e.g., 'Adaira', 'John Smith') or phone number (e.g., '+15551234567')" },
-          message: { type: "string", description: "The message content to send" }
-        },
-        required: ["recipient", "message"]
-      }
-    }
-  ];
-
-  // Weather tools (using Open-Meteo API - free, no API key required)
-  const weatherTools = [
-    {
-      name: "get_weather_forecast",
-      description: "Get weather forecast for a location. Use this when user asks about weather, forecast, temperature, rain, etc. Can specify a location name or coordinates.",
-      input_schema: {
-        type: "object",
-        properties: {
-          location: { type: "string", description: "Location name (e.g., 'Paris, France', 'New York')" },
-          latitude: { type: "number", description: "Latitude coordinate (-90 to 90)" },
-          longitude: { type: "number", description: "Longitude coordinate (-180 to 180)" },
-          days: { type: "number", description: "Number of days to forecast (1-16, default 7)" }
-        },
-        required: []
-      }
-    },
-    {
-      name: "get_current_weather",
-      description: "Get current weather conditions for a location. Use this for real-time weather.",
-      input_schema: {
-        type: "object",
-        properties: {
-          location: { type: "string", description: "Location name (e.g., 'San Francisco', 'London')" },
-          latitude: { type: "number", description: "Latitude coordinate (-90 to 90)" },
-          longitude: { type: "number", description: "Longitude coordinate (-180 to 180)" }
-        },
-        required: []
-      }
-    },
-    {
-      name: "search_location",
-      description: "Find coordinates for a location by name. Use this to get latitude/longitude for weather lookups.",
-      input_schema: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Location name to search (e.g., 'Tokyo', 'New York, NY')" }
-        },
-        required: ["query"]
-      }
-    }
-  ];
-
-  // Time and Reminder tools
-  const timeTools = [
-    {
-      name: "get_current_time",
-      description: "Get the current date and time. Use this for time-based reminders and scheduling checks. Returns current time, date, day of week, and hour.",
-      input_schema: {
-        type: "object",
-        properties: {
-          timezone: { type: "string", description: "Optional timezone (default: local system time)" }
-        }
-      }
-    },
-    {
-      name: "send_reminder",
-      description: "Send a reminder message to the user in the chat. Use this for timed notifications and alerts. The message will appear in the chat window.",
-      input_schema: {
-        type: "object",
-        properties: {
-          message: { type: "string", description: "The reminder message to display to the user" }
-        },
-        required: ["message"]
-      }
-    }
-  ];
-
-  // Execute Time tool
-  const executeTimeTool = async (toolName, toolInput) => {
-    console.log(`[Time] Executing ${toolName} with input:`, JSON.stringify(toolInput));
-    try {
-      switch (toolName) {
-        case "get_current_time": {
-          const now = new Date();
-          const timeInfo = {
-            time: now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true }),
-            time24: now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
-            date: now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }),
-            dayOfWeek: now.toLocaleDateString('en-US', { weekday: 'long' }),
-            hour: now.getHours(),
-            minute: now.getMinutes(),
-            iso: now.toISOString()
-          };
-          console.log(`[Time] Current time:`, timeInfo);
-          return timeInfo;
-        }
-        case "send_reminder": {
-          const message = toolInput.message;
-          if (!message) {
-            return { error: "Message is required for send_reminder" };
-          }
-          // Send the reminder to the chat window
-          if (win && win.webContents) {
-            win.webContents.send("chat:newMessage", {
-              role: "assistant",
-              content: `🔔 **Reminder:** ${message}`,
-              source: "task"
-            });
-          }
-          console.log(`[Time] Sent reminder: ${message}`);
-          return { success: true, message: `Reminder sent: ${message}` };
-        }
-        default:
-          return { error: `Unknown time tool: ${toolName}` };
-      }
-    } catch (err) {
-      console.error(`[Time] Error executing ${toolName}:`, err.message);
-      return { error: err.message };
-    }
-  };
-
-  // Execute Weather tool (using Open-Meteo API)
-  const executeWeatherTool = async (toolName, toolInput) => {
-    console.log(`[Weather] Executing ${toolName} with input:`, JSON.stringify(toolInput));
-    try {
-      // Helper to geocode location name to coordinates
-      const geocodeLocation = async (locationName) => {
-        console.log(`[Weather] Geocoding location: ${locationName}`);
-        
-        // Try different variations of the location name
-        const variations = [
-          locationName,
-          // Strip state/country suffix (e.g., "Boston, MA" -> "Boston")
-          locationName.split(',')[0].trim(),
-          // Replace comma with space
-          locationName.replace(/,/g, ' ').trim()
-        ];
-        
-        for (const variation of variations) {
-          console.log(`[Weather] Trying geocode variation: ${variation}`);
-          const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(variation)}&count=5&language=en&format=json`;
-          const response = await fetch(url);
-          
-          if (!response.ok) {
-            console.error(`[Weather] Geocoding API failed: ${response.status}`);
-            continue;
-          }
-          
-          const data = await response.json();
-          
-          if (data.results && data.results.length > 0) {
-            // If original had state info, try to match it
-            const originalLower = locationName.toLowerCase();
-            let bestMatch = data.results[0];
-            
-            // Try to find a better match based on state/country
-            if (originalLower.includes('ma') || originalLower.includes('massachusetts')) {
-              const maMatch = data.results.find(r => r.admin1?.toLowerCase().includes('massachusetts'));
-              if (maMatch) bestMatch = maMatch;
-            } else if (originalLower.includes('tx') || originalLower.includes('texas')) {
-              const txMatch = data.results.find(r => r.admin1?.toLowerCase().includes('texas'));
-              if (txMatch) bestMatch = txMatch;
-            } else if (originalLower.includes('ca') || originalLower.includes('california')) {
-              const caMatch = data.results.find(r => r.admin1?.toLowerCase().includes('california'));
-              if (caMatch) bestMatch = caMatch;
-            } else if (originalLower.includes('ny') || originalLower.includes('new york')) {
-              const nyMatch = data.results.find(r => r.admin1?.toLowerCase().includes('new york'));
-              if (nyMatch) bestMatch = nyMatch;
-            }
-            
-            console.log(`[Weather] Geocoded to: ${bestMatch.latitude}, ${bestMatch.longitude} (${bestMatch.name}, ${bestMatch.admin1 || bestMatch.country})`);
-            return {
-              latitude: bestMatch.latitude,
-              longitude: bestMatch.longitude,
-              name: bestMatch.name,
-              country: bestMatch.country,
-              admin1: bestMatch.admin1,
-              timezone: bestMatch.timezone
-            };
-          }
-        }
-        
-        console.error(`[Weather] Location not found after all variations: ${locationName}`);
-        throw new Error(`Location not found: ${locationName}`);
-      };
-
-      switch (toolName) {
-        case "search_location": {
-          const { query } = toolInput;
-          
-          // Try different variations - strip state/country suffix if needed
-          const variations = [
-            query,
-            query.split(',')[0].trim(),
-            query.replace(/,/g, ' ').trim()
-          ];
-          
-          for (const variation of variations) {
-            console.log(`[Weather] Searching location variation: ${variation}`);
-            const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(variation)}&count=5&language=en&format=json`;
-            const response = await fetch(url);
-            if (!response.ok) continue;
-            const data = await response.json();
-            
-            if (data.results && data.results.length > 0) {
-              return {
-                locations: data.results.map(r => ({
-                  name: r.name,
-                  country: r.country,
-                  admin1: r.admin1,
-                  latitude: r.latitude,
-                  longitude: r.longitude,
-                  timezone: r.timezone,
-                  population: r.population
-                }))
-              };
-            }
-          }
-          
-          return { error: `No locations found for: ${query}` };
-        }
-
-        case "get_current_weather": {
-          let lat, lon, locationName;
-          
-          // Handle case where toolInput might be null/undefined
-          if (!toolInput) {
-            console.error("[Weather] No input provided to get_current_weather");
-            return { error: "Please provide a location name or coordinates" };
-          }
-          
-          if (toolInput.latitude !== undefined && toolInput.longitude !== undefined) {
-            lat = toolInput.latitude;
-            lon = toolInput.longitude;
-            locationName = `${lat}, ${lon}`;
-          } else if (toolInput.location) {
-            const geo = await geocodeLocation(toolInput.location);
-            lat = geo.latitude;
-            lon = geo.longitude;
-            locationName = geo.admin1 ? `${geo.name}, ${geo.admin1}` : `${geo.name}, ${geo.country}`;
-          } else {
-            console.error("[Weather] Neither location nor coordinates provided");
-            return { error: "Please provide either a location name or coordinates" };
-          }
-
-          const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto`;
-          
-          const response = await fetch(url);
-          if (!response.ok) throw new Error("Failed to fetch weather");
-          const data = await response.json();
-          
-          const weatherCodes = {
-            0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
-            45: "Fog", 48: "Depositing rime fog",
-            51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
-            61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
-            71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow",
-            80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
-            95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail"
-          };
-
-          const current = data.current;
-          return {
-            location: locationName,
-            temperature: `${Math.round(current.temperature_2m)}°F`,
-            feels_like: `${Math.round(current.apparent_temperature)}°F`,
-            conditions: weatherCodes[current.weather_code] || "Unknown",
-            humidity: `${current.relative_humidity_2m}%`,
-            wind: `${Math.round(current.wind_speed_10m)} mph`,
-            precipitation: `${current.precipitation}" in last hour`,
-            time: current.time
-          };
-        }
-
-        case "get_weather_forecast": {
-          let lat, lon, locationName;
-          
-          // Handle case where toolInput might be null/undefined
-          if (!toolInput) {
-            console.error("[Weather] No input provided to get_weather_forecast");
-            return { error: "Please provide a location name or coordinates" };
-          }
-          
-          const days = Math.min(toolInput.days || 7, 16);
-          
-          if (toolInput.latitude !== undefined && toolInput.longitude !== undefined) {
-            lat = toolInput.latitude;
-            lon = toolInput.longitude;
-            locationName = `${lat}, ${lon}`;
-          } else if (toolInput.location) {
-            const geo = await geocodeLocation(toolInput.location);
-            lat = geo.latitude;
-            lon = geo.longitude;
-            locationName = geo.admin1 ? `${geo.name}, ${geo.admin1}` : `${geo.name}, ${geo.country}`;
-          } else {
-            console.error("[Weather] Neither location nor coordinates provided");
-            return { error: "Please provide either a location name or coordinates" };
-          }
-
-          const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,precipitation_sum,precipitation_probability_max,sunrise,sunset,wind_speed_10m_max&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&forecast_days=${days}`;
-          
-          const response = await fetch(url);
-          if (!response.ok) throw new Error("Failed to fetch forecast");
-          const data = await response.json();
-          
-          const weatherCodes = {
-            0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
-            45: "Foggy", 48: "Rime fog", 51: "Light drizzle", 53: "Drizzle", 55: "Dense drizzle",
-            61: "Light rain", 63: "Rain", 65: "Heavy rain", 71: "Light snow", 73: "Snow", 75: "Heavy snow",
-            80: "Rain showers", 81: "Mod. rain showers", 82: "Heavy showers",
-            95: "Thunderstorm", 96: "T-storm w/ hail", 99: "Severe t-storm"
-          };
-
-          const daily = data.daily;
-          const forecast = [];
-          
-          for (let i = 0; i < daily.time.length; i++) {
-            const date = new Date(daily.time[i]);
-            forecast.push({
-              date: daily.time[i],
-              day: date.toLocaleDateString("en-US", { weekday: "short" }),
-              conditions: weatherCodes[daily.weather_code[i]] || "Unknown",
-              high: `${Math.round(daily.temperature_2m_max[i])}°F`,
-              low: `${Math.round(daily.temperature_2m_min[i])}°F`,
-              precipitation_chance: `${daily.precipitation_probability_max[i]}%`,
-              precipitation: `${daily.precipitation_sum[i]}"`,
-              wind_max: `${Math.round(daily.wind_speed_10m_max[i])} mph`,
-              sunrise: daily.sunrise[i]?.split("T")[1],
-              sunset: daily.sunset[i]?.split("T")[1]
-            });
-          }
-
-          return {
-            location: locationName,
-            forecast_days: days,
-            forecast
-          };
-        }
-
-        default:
-          return { error: `Unknown weather tool: ${toolName}` };
-      }
-    } catch (err) {
-      console.error(`[Weather] Error executing ${toolName}:`, err.message);
-      return { error: err.message };
-    }
-  };
-
-  // Slack tools
-  const slackTools = [
-    {
-      name: "list_slack_channels",
-      description: "List Slack channels and direct messages in the connected workspace.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        required: []
-      }
-    },
-    {
-      name: "get_slack_messages",
-      description: "Get recent messages from a Slack channel or DM. For DMs, you can pass a person's name and it will find their DM channel automatically.",
-      input_schema: {
-        type: "object",
-        properties: {
-          channel: { type: "string", description: "Channel name (e.g., #general), channel ID, user ID (e.g., U12345), or person's name (e.g., 'Chris Gorog') to get their DMs" },
-          limit: { type: "number", description: "Number of messages to fetch (default 20)" }
-        },
-        required: ["channel"]
-      }
-    },
-    {
-      name: "send_slack_message",
-      description: "Send a message to a Slack channel or user. Always confirm with user before sending.",
-      input_schema: {
-        type: "object",
-        properties: {
-          channel: { type: "string", description: "Channel name (e.g., #general), channel ID, or user ID" },
-          message: { type: "string", description: "Message text to send" }
-        },
-        required: ["channel", "message"]
-      }
-    },
-    {
-      name: "search_slack_users",
-      description: "Search for Slack users in the workspace.",
-      input_schema: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search query (name or email)" }
-        },
-        required: []
-      }
-    }
-  ];
-
-  // Execute Slack tool
-  const executeSlackTool = async (toolName, toolInput, accessToken) => {
-    try {
-      switch (toolName) {
-        case "list_slack_channels": {
-          const channels = await fetchSlackChannels(accessToken);
-          return {
-            channels: channels.map(c => ({
-              id: c.id,
-              name: c.name || c.user,
-              type: c.is_channel ? "channel" : c.is_group ? "private" : c.is_im ? "dm" : "group_dm",
-              is_member: c.is_member,
-              num_members: c.num_members
-            })).slice(0, 50)
-          };
-        }
-
-        case "get_slack_messages": {
-          let channelId = toolInput.channel;
-          const limit = toolInput.limit || 20;
-
-          // If channel starts with #, find the channel ID
-          if (channelId.startsWith("#")) {
-            const channels = await fetchSlackChannels(accessToken);
-            const channel = channels.find(c => c.name === channelId.slice(1));
-            if (!channel) {
-              return { error: `Channel ${channelId} not found` };
-            }
-            channelId = channel.id;
-          } 
-          // If it's a user ID (starts with U), open DM channel
-          else if (channelId.startsWith("U")) {
-            console.log(`[Slack] Opening DM channel with user ID: ${channelId}`);
-            const dmResponse = await fetch("https://slack.com/api/conversations.open", {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${accessToken}`,
-                "Content-Type": "application/json"
-              },
-              body: JSON.stringify({ users: channelId })
-            });
-            const dmData = await dmResponse.json();
-            if (dmData.ok && dmData.channel) {
-              channelId = dmData.channel.id;
-              console.log(`[Slack] DM channel ID: ${channelId}`);
-            } else {
-              return { error: `Failed to open DM with user: ${dmData.error}` };
-            }
-          }
-          // If it doesn't look like a channel/DM ID (C/D/G prefix), treat as user name search
-          else if (!channelId.match(/^[CDG][A-Z0-9]+$/)) {
-            console.log(`[Slack] Searching for user: ${channelId}`);
-            const users = await fetchSlackUsers(accessToken);
-            const query = channelId.toLowerCase();
-            const matchedUser = users.find(u => 
-              !u.deleted && !u.is_bot && (
-                (u.real_name || "").toLowerCase().includes(query) ||
-                (u.name || "").toLowerCase().includes(query)
-              )
-            );
-            
-            if (!matchedUser) {
-              return { error: `User "${channelId}" not found in Slack workspace` };
-            }
-            
-            console.log(`[Slack] Found user: ${matchedUser.real_name || matchedUser.name} (${matchedUser.id})`);
-            
-            // Open DM channel with the user
-            const dmResponse = await fetch("https://slack.com/api/conversations.open", {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${accessToken}`,
-                "Content-Type": "application/json"
-              },
-              body: JSON.stringify({ users: matchedUser.id })
-            });
-            const dmData = await dmResponse.json();
-            if (dmData.ok && dmData.channel) {
-              channelId = dmData.channel.id;
-              console.log(`[Slack] DM channel ID: ${channelId}`);
-            } else {
-              return { error: `Failed to open DM with ${matchedUser.real_name || matchedUser.name}: ${dmData.error}` };
-            }
-          }
-
-          const messages = await fetchSlackMessages(accessToken, channelId, limit);
-          
-          // Get user info for names
-          const users = await fetchSlackUsers(accessToken);
-          const userMap = new Map(users.map(u => [u.id, u.real_name || u.name]));
-
-          return {
-            messages: messages.map(m => ({
-              user: userMap.get(m.user) || m.user,
-              text: m.text,
-              timestamp: new Date(parseFloat(m.ts) * 1000).toISOString()
-            }))
-          };
-        }
-
-        case "send_slack_message": {
-          let channelId = toolInput.channel;
-          const message = toolInput.message;
-
-          // If channel starts with #, find the channel ID
-          if (channelId.startsWith("#")) {
-            const channels = await fetchSlackChannels(accessToken);
-            const channel = channels.find(c => c.name === channelId.slice(1));
-            if (!channel) {
-              return { error: `Channel ${channelId} not found` };
-            }
-            channelId = channel.id;
-          }
-
-          const sendResult = await sendSlackMessage(accessToken, channelId, message);
-          return { 
-            success: true, 
-            message: `Message sent to ${toolInput.channel}`,
-            channel: channelId,  // Return the resolved channel ID for conversation tracking
-            ts: sendResult?.ts   // Slack message timestamp (can be used for thread replies)
-          };
-        }
-
-        case "search_slack_users": {
-          const users = await fetchSlackUsers(accessToken);
-          const query = (toolInput.query || "").toLowerCase();
-          
-          let filtered = users.filter(u => !u.deleted && !u.is_bot);
-          if (query) {
-            filtered = filtered.filter(u => 
-              (u.real_name || "").toLowerCase().includes(query) ||
-              (u.name || "").toLowerCase().includes(query) ||
-              (u.profile?.email || "").toLowerCase().includes(query)
-            );
-          }
-
-          return {
-            users: filtered.slice(0, 20).map(u => ({
-              id: u.id,
-              name: u.real_name || u.name,
-              username: u.name,
-              email: u.profile?.email,
-              title: u.profile?.title
-            }))
-          };
-        }
-
-        default:
-          return { error: `Unknown Slack tool: ${toolName}` };
-      }
-    } catch (err) {
-      return { error: err.message };
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Custom Web Integration (Brightwheel, etc.)
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  // Custom Web Tools
-  const customWebTools = [
-    {
-      name: "search_custom_web_messages",
-      description: "Search messages from custom web integrations like Brightwheel, tax sites, school portals. Use when user asks about messages from sites without native APIs.",
-      input_schema: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "Text to search for in message content"
-          },
-          site: {
-            type: "string",
-            description: "Filter by site ID (e.g., 'brightwheel', 'turbotax')"
-          },
-          from: {
-            type: "string",
-            description: "Filter by sender name"
-          },
-          days_back: {
-            type: "number",
-            description: "How many days to search back (default 30)"
-          },
-          limit: {
-            type: "number",
-            description: "Max results to return (default 20)"
-          }
-        },
-        required: ["query"]
-      }
-    },
-    {
-      name: "get_recent_custom_web_messages",
-      description: "Get recent messages from custom web integrations. Lists all messages from Brightwheel, tax sites, etc. in chronological order.",
-      input_schema: {
-        type: "object",
-        properties: {
-          site: {
-            type: "string",
-            description: "Filter by site ID (optional)"
-          },
-          hours: {
-            type: "number",
-            description: "Hours back to look (default 24)"
-          },
-          limit: {
-            type: "number",
-            description: "Max messages (default 50)"
-          }
-        },
-        required: []
-      }
-    },
-    {
-      name: "get_custom_web_messages_by_date",
-      description: "Get all messages from custom web integrations for a specific date or date range.",
-      input_schema: {
-        type: "object",
-        properties: {
-          date: {
-            type: "string",
-            description: "Date in YYYY-MM-DD format"
-          },
-          end_date: {
-            type: "string",
-            description: "Optional end date for range (YYYY-MM-DD)"
-          },
-          site: {
-            type: "string",
-            description: "Filter by site ID (optional)"
-          }
-        },
-        required: ["date"]
-      }
-    },
-    {
-      name: "list_custom_web_sites",
-      description: "List all configured custom web integrations with their status. Shows which sites are enabled, paused, or having issues.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        required: []
-      }
-    }
-  ];
-
-  // Execute Custom Web tool
-  const executeCustomWebTool = async (toolName, toolInput) => {
-    try {
-      const { executeCustomWebTool: execute } = require('./dist/tools/customweb');
-      return await execute(toolName, toolInput, currentUser?.username);
-    } catch (err) {
-      console.error(`[CustomWeb] Error executing ${toolName}:`, err);
-      return { error: err.message };
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Telegram Integration
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  // Get Telegram bot token from settings
-  // Telegram tools
-  const telegramTools = [
-    {
-      name: "send_telegram_message",
-      description: "Send a message via Telegram bot. Always confirm with user before sending.",
-      input_schema: {
-        type: "object",
-        properties: {
-          chat_id: { type: "string", description: "Chat ID or username (e.g., @username or numeric chat ID)" },
-          message: { type: "string", description: "Message text to send" }
-        },
-        required: ["chat_id", "message"]
-      }
-    },
-    {
-      name: "get_telegram_updates",
-      description: "Get recent messages received by the Telegram bot.",
-      input_schema: {
-        type: "object",
-        properties: {
-          limit: { type: "number", description: "Number of updates to fetch (default 20, max 100)" }
-        },
-        required: []
-      }
-    },
-    {
-      name: "get_telegram_chat_info",
-      description: "Get information about a Telegram chat or user.",
-      input_schema: {
-        type: "object",
-        properties: {
-          chat_id: { type: "string", description: "Chat ID or username" }
-        },
-        required: ["chat_id"]
-      }
-    }
-  ];
-
-  // Execute Telegram tool
-  const executeTelegramTool = async (toolName, toolInput) => {
-    const botToken = await getTelegramToken();
-    if (!botToken) {
-      return { error: "Telegram not connected. Please set up Telegram in the Integrations page." };
-    }
-
-    const baseUrl = `https://api.telegram.org/bot${botToken}`;
-
-    try {
-      switch (toolName) {
-        case "send_telegram_message": {
-          const response = await fetch(`${baseUrl}/sendMessage`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              chat_id: toolInput.chat_id,
-              text: toolInput.message,
-              parse_mode: "Markdown"
-            })
-          });
-          const data = await response.json();
-          if (!data.ok) {
-            return { error: data.description || "Failed to send message" };
-          }
-          return { 
-            success: true, 
-            message: `Message sent to ${toolInput.chat_id}`, 
-            message_id: data.result.message_id,
-            chat_id: toolInput.chat_id  // Return chat_id for conversation tracking
-          };
-        }
-
-        case "get_telegram_updates": {
-          const limit = Math.min(toolInput.limit || 20, 100);
-          const response = await fetch(`${baseUrl}/getUpdates?limit=${limit}`);
-          const data = await response.json();
-          if (!data.ok) {
-            return { error: data.description || "Failed to get updates" };
-          }
-          return {
-            updates: data.result.map(u => ({
-              update_id: u.update_id,
-              message: u.message ? {
-                message_id: u.message.message_id,
-                from: u.message.from?.first_name || u.message.from?.username,
-                chat_id: u.message.chat.id,
-                chat_type: u.message.chat.type,
-                text: u.message.text,
-                date: new Date(u.message.date * 1000).toISOString()
-              } : null
-            })).filter(u => u.message)
-          };
-        }
-
-        case "get_telegram_chat_info": {
-          const response = await fetch(`${baseUrl}/getChat?chat_id=${encodeURIComponent(toolInput.chat_id)}`);
-          const data = await response.json();
-          if (!data.ok) {
-            return { error: data.description || "Failed to get chat info" };
-          }
-          return {
-            chat: {
-              id: data.result.id,
-              type: data.result.type,
-              title: data.result.title,
-              username: data.result.username,
-              first_name: data.result.first_name,
-              last_name: data.result.last_name,
-              description: data.result.description
-            }
-          };
-        }
-
-        default:
-          return { error: `Unknown Telegram tool: ${toolName}` };
-      }
-    } catch (err) {
-      console.error(`[Telegram] Error executing ${toolName}:`, err.message);
-      return { error: err.message };
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Discord Integration
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  // Get Discord access token from settings
-  const getDiscordAccessToken = async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      if (!settings.discordTokens) return null;
-      
-      // Check if token needs refresh
-      if (settings.discordTokens.expires_at && Date.now() > settings.discordTokens.expires_at - 60000) {
-        // Refresh the token
-        const refreshed = await refreshDiscordToken(settings.discordTokens);
-        if (refreshed) {
-          settings.discordTokens = refreshed;
-          await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-          return refreshed.access_token;
-        }
-        return null;
-      }
-      return settings.discordTokens.access_token;
-    } catch {
-      return null;
-    }
-  };
-
-  const refreshDiscordToken = async (tokens) => {
-    try {
-      const response = await fetch("https://discord.com/api/oauth2/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          client_id: tokens.client_id,
-          client_secret: tokens.client_secret,
-          grant_type: "refresh_token",
-          refresh_token: tokens.refresh_token
-        })
-      });
-      const data = await response.json();
-      if (data.access_token) {
-        return {
-          ...tokens,
-          access_token: data.access_token,
-          refresh_token: data.refresh_token || tokens.refresh_token,
-          expires_at: Date.now() + (data.expires_in * 1000)
-        };
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  };
-
-  // Discord tools
-  const discordTools = [
-    {
-      name: "send_discord_message",
-      description: "Send a message to a Discord channel or DM. Always confirm with user before sending.",
-      input_schema: {
-        type: "object",
-        properties: {
-          channel_id: { type: "string", description: "Channel ID or user ID for DM" },
-          message: { type: "string", description: "Message content to send" }
-        },
-        required: ["channel_id", "message"]
-      }
-    },
-    {
-      name: "get_discord_messages",
-      description: "Get recent messages from a Discord channel.",
-      input_schema: {
-        type: "object",
-        properties: {
-          channel_id: { type: "string", description: "Channel ID" },
-          limit: { type: "number", description: "Number of messages to fetch (default 20, max 100)" }
-        },
-        required: ["channel_id"]
-      }
-    },
-    {
-      name: "list_discord_channels",
-      description: "List channels in a Discord server (guild).",
-      input_schema: {
-        type: "object",
-        properties: {
-          guild_id: { type: "string", description: "Server/Guild ID" }
-        },
-        required: ["guild_id"]
-      }
-    },
-    {
-      name: "list_discord_servers",
-      description: "List Discord servers (guilds) the bot/user has access to.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        required: []
-      }
-    }
-  ];
-
-  // Execute Discord tool
-  const executeDiscordTool = async (toolName, toolInput, accessToken) => {
-    if (!accessToken) {
-      return { error: "Discord not connected. Please set up Discord in the Integrations page." };
-    }
-
-    const baseUrl = "https://discord.com/api/v10";
-    const headers = { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" };
-
-    try {
-      switch (toolName) {
-        case "send_discord_message": {
-          const response = await fetch(`${baseUrl}/channels/${toolInput.channel_id}/messages`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({ content: toolInput.message })
-          });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.message || "Failed to send message" };
-          }
-          const data = await response.json();
-          return { 
-            success: true, 
-            message: `Message sent`, 
-            message_id: data.id,
-            channel_id: toolInput.channel_id  // Return channel_id for conversation tracking
-          };
-        }
-
-        case "get_discord_messages": {
-          const limit = Math.min(toolInput.limit || 20, 100);
-          const response = await fetch(`${baseUrl}/channels/${toolInput.channel_id}/messages?limit=${limit}`, { headers });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.message || "Failed to get messages" };
-          }
-          const messages = await response.json();
-          return {
-            messages: messages.map(m => ({
-              id: m.id,
-              content: m.content,
-              author: m.author.username,
-              timestamp: m.timestamp
-            }))
-          };
-        }
-
-        case "list_discord_channels": {
-          const response = await fetch(`${baseUrl}/guilds/${toolInput.guild_id}/channels`, { headers });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.message || "Failed to list channels" };
-          }
-          const channels = await response.json();
-          return {
-            channels: channels.filter(c => c.type === 0 || c.type === 2).map(c => ({
-              id: c.id,
-              name: c.name,
-              type: c.type === 0 ? "text" : "voice"
-            }))
-          };
-        }
-
-        case "list_discord_servers": {
-          const response = await fetch(`${baseUrl}/users/@me/guilds`, { headers });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.message || "Failed to list servers" };
-          }
-          const guilds = await response.json();
-          return {
-            servers: guilds.map(g => ({
-              id: g.id,
-              name: g.name,
-              icon: g.icon
-            }))
-          };
-        }
-
-        default:
-          return { error: `Unknown Discord tool: ${toolName}` };
-      }
-    } catch (err) {
-      console.error(`[Discord] Error executing ${toolName}:`, err.message);
-      return { error: err.message };
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // X (Twitter) Integration
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  // Get X access token from settings
-  const getXAccessToken = async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      if (!settings.xTokens) return null;
-      
-      // Check if token needs refresh
-      if (settings.xTokens.expires_at && Date.now() > settings.xTokens.expires_at - 60000) {
-        const refreshed = await refreshXToken(settings.xTokens);
-        if (refreshed) {
-          settings.xTokens = refreshed;
-          await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-          return refreshed.access_token;
-        }
-        return null;
-      }
-      return settings.xTokens.access_token;
-    } catch {
-      return null;
-    }
-  };
-
-  const refreshXToken = async (tokens) => {
-    try {
-      const response = await fetch("https://api.twitter.com/2/oauth2/token", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "Authorization": `Basic ${Buffer.from(`${tokens.client_id}:${tokens.client_secret}`).toString("base64")}`
-        },
-        body: new URLSearchParams({
-          grant_type: "refresh_token",
-          refresh_token: tokens.refresh_token
-        })
-      });
-      const data = await response.json();
-      if (data.access_token) {
-        return {
-          ...tokens,
-          access_token: data.access_token,
-          refresh_token: data.refresh_token || tokens.refresh_token,
-          expires_at: Date.now() + (data.expires_in * 1000)
-        };
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  };
-
-  // X tools
-  const xTools = [
-    {
-      name: "post_tweet",
-      description: "Post a tweet to X (Twitter). Always confirm with user before posting.",
-      input_schema: {
-        type: "object",
-        properties: {
-          text: { type: "string", description: "Tweet text (max 280 characters)" },
-          reply_to: { type: "string", description: "Tweet ID to reply to (optional)" }
-        },
-        required: ["text"]
-      }
-    },
-    {
-      name: "get_x_timeline",
-      description: "Get recent tweets from your home timeline.",
-      input_schema: {
-        type: "object",
-        properties: {
-          limit: { type: "number", description: "Number of tweets to fetch (default 20, max 100)" }
-        },
-        required: []
-      }
-    },
-    {
-      name: "get_x_mentions",
-      description: "Get recent mentions of your account.",
-      input_schema: {
-        type: "object",
-        properties: {
-          limit: { type: "number", description: "Number of mentions to fetch (default 20)" }
-        },
-        required: []
-      }
-    },
-    {
-      name: "search_x_tweets",
-      description: "Search for tweets on X.",
-      input_schema: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search query" },
-          limit: { type: "number", description: "Number of results (default 20, max 100)" }
-        },
-        required: ["query"]
-      }
-    },
-    {
-      name: "send_x_dm",
-      description: "Send a direct message on X. Always confirm with user before sending.",
-      input_schema: {
-        type: "object",
-        properties: {
-          recipient_id: { type: "string", description: "User ID of the recipient" },
-          message: { type: "string", description: "Message text" }
-        },
-        required: ["recipient_id", "message"]
-      }
-    }
-  ];
-
-  // Execute X tool
-  const executeXTool = async (toolName, toolInput, accessToken) => {
-    if (!accessToken) {
-      return { error: "X (Twitter) not connected. Please set up X in the Integrations page." };
-    }
-
-    const baseUrl = "https://api.twitter.com/2";
-    const headers = { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" };
-
-    try {
-      switch (toolName) {
-        case "post_tweet": {
-          const body = { text: toolInput.text };
-          if (toolInput.reply_to) {
-            body.reply = { in_reply_to_tweet_id: toolInput.reply_to };
-          }
-          const response = await fetch(`${baseUrl}/tweets`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(body)
-          });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.detail || err.title || "Failed to post tweet" };
-          }
-          const data = await response.json();
-          return { success: true, tweet_id: data.data.id, message: "Tweet posted successfully" };
-        }
-
-        case "get_x_timeline": {
-          const limit = Math.min(toolInput.limit || 20, 100);
-          const response = await fetch(`${baseUrl}/users/me/timelines/reverse_chronological?max_results=${limit}&tweet.fields=created_at,author_id,text`, { headers });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.detail || "Failed to get timeline" };
-          }
-          const data = await response.json();
-          return {
-            tweets: (data.data || []).map(t => ({
-              id: t.id,
-              text: t.text,
-              created_at: t.created_at,
-              author_id: t.author_id
-            }))
-          };
-        }
-
-        case "get_x_mentions": {
-          // First get user ID
-          const meResponse = await fetch(`${baseUrl}/users/me`, { headers });
-          if (!meResponse.ok) {
-            return { error: "Failed to get user info" };
-          }
-          const meData = await meResponse.json();
-          const userId = meData.data.id;
-          
-          const limit = Math.min(toolInput.limit || 20, 100);
-          const response = await fetch(`${baseUrl}/users/${userId}/mentions?max_results=${limit}&tweet.fields=created_at,author_id,text`, { headers });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.detail || "Failed to get mentions" };
-          }
-          const data = await response.json();
-          return {
-            mentions: (data.data || []).map(t => ({
-              id: t.id,
-              text: t.text,
-              created_at: t.created_at,
-              author_id: t.author_id
-            }))
-          };
-        }
-
-        case "search_x_tweets": {
-          const limit = Math.min(toolInput.limit || 20, 100);
-          const response = await fetch(`${baseUrl}/tweets/search/recent?query=${encodeURIComponent(toolInput.query)}&max_results=${limit}&tweet.fields=created_at,author_id,text`, { headers });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.detail || "Failed to search tweets" };
-          }
-          const data = await response.json();
-          return {
-            tweets: (data.data || []).map(t => ({
-              id: t.id,
-              text: t.text,
-              created_at: t.created_at,
-              author_id: t.author_id
-            }))
-          };
-        }
-
-        case "send_x_dm": {
-          const response = await fetch(`${baseUrl}/dm_conversations/with/${toolInput.recipient_id}/messages`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({ text: toolInput.message })
-          });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.detail || "Failed to send DM" };
-          }
-          const data = await response.json();
-          return { success: true, message: "DM sent successfully", dm_id: data.data?.dm_event_id };
-        }
-
-        default:
-          return { error: `Unknown X tool: ${toolName}` };
-      }
-    } catch (err) {
-      console.error(`[X] Error executing ${toolName}:`, err.message);
-      return { error: err.message };
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Notion Integration
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  // Get Notion access token from settings
-  const getNotionAccessToken = async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      return settings.notionTokens?.access_token || null;
-    } catch {
-      return null;
-    }
-  };
-
-  // Notion tools
-  const notionTools = [
-    {
-      name: "search_notion",
-      description: "Search for pages and databases in Notion.",
-      input_schema: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search query" },
-          filter: { type: "string", enum: ["page", "database"], description: "Filter by object type (optional)" }
-        },
-        required: []
-      }
-    },
-    {
-      name: "get_notion_page",
-      description: "Get the content of a Notion page.",
-      input_schema: {
-        type: "object",
-        properties: {
-          page_id: { type: "string", description: "The page ID" }
-        },
-        required: ["page_id"]
-      }
-    },
-    {
-      name: "create_notion_page",
-      description: "Create a new page in Notion.",
-      input_schema: {
-        type: "object",
-        properties: {
-          parent_id: { type: "string", description: "Parent page or database ID" },
-          title: { type: "string", description: "Page title" },
-          content: { type: "string", description: "Page content (plain text)" }
-        },
-        required: ["parent_id", "title"]
-      }
-    },
-    {
-      name: "query_notion_database",
-      description: "Query a Notion database.",
-      input_schema: {
-        type: "object",
-        properties: {
-          database_id: { type: "string", description: "Database ID" },
-          filter: { type: "object", description: "Filter object (optional)" },
-          sorts: { type: "array", description: "Sort array (optional)" }
-        },
-        required: ["database_id"]
-      }
-    },
-    {
-      name: "create_notion_database_item",
-      description: "Add a new item to a Notion database.",
-      input_schema: {
-        type: "object",
-        properties: {
-          database_id: { type: "string", description: "Database ID" },
-          properties: { type: "object", description: "Property values for the new item" }
-        },
-        required: ["database_id", "properties"]
-      }
-    }
-  ];
-
-  // Execute Notion tool
-  const executeNotionTool = async (toolName, toolInput, accessToken) => {
-    if (!accessToken) {
-      return { error: "Notion not connected. Please set up Notion in the Integrations page." };
-    }
-
-    const baseUrl = "https://api.notion.com/v1";
-    const headers = {
-      "Authorization": `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      "Notion-Version": "2022-06-28"
-    };
-
-    try {
-      switch (toolName) {
-        case "search_notion": {
-          const body = {};
-          if (toolInput.query) body.query = toolInput.query;
-          if (toolInput.filter) body.filter = { value: toolInput.filter, property: "object" };
-          
-          const response = await fetch(`${baseUrl}/search`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(body)
-          });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.message || "Search failed" };
-          }
-          const data = await response.json();
-          return {
-            results: data.results.slice(0, 20).map(r => ({
-              id: r.id,
-              type: r.object,
-              title: r.properties?.title?.title?.[0]?.plain_text || r.properties?.Name?.title?.[0]?.plain_text || "Untitled",
-              url: r.url
-            }))
-          };
-        }
-
-        case "get_notion_page": {
-          // Get page metadata
-          const pageResponse = await fetch(`${baseUrl}/pages/${toolInput.page_id}`, { headers });
-          if (!pageResponse.ok) {
-            const err = await pageResponse.json();
-            return { error: err.message || "Failed to get page" };
-          }
-          const page = await pageResponse.json();
-          
-          // Get page content (blocks)
-          const blocksResponse = await fetch(`${baseUrl}/blocks/${toolInput.page_id}/children?page_size=100`, { headers });
-          const blocks = blocksResponse.ok ? await blocksResponse.json() : { results: [] };
-          
-          return {
-            page: {
-              id: page.id,
-              title: page.properties?.title?.title?.[0]?.plain_text || "Untitled",
-              url: page.url,
-              created_time: page.created_time,
-              last_edited_time: page.last_edited_time
-            },
-            content: blocks.results.map(b => ({
-              type: b.type,
-              text: b[b.type]?.rich_text?.map(t => t.plain_text).join("") || ""
-            })).filter(b => b.text)
-          };
-        }
-
-        case "create_notion_page": {
-          const body = {
-            parent: { page_id: toolInput.parent_id },
-            properties: {
-              title: { title: [{ text: { content: toolInput.title } }] }
-            }
-          };
-          
-          if (toolInput.content) {
-            body.children = [{
-              object: "block",
-              type: "paragraph",
-              paragraph: {
-                rich_text: [{ type: "text", text: { content: toolInput.content } }]
-              }
-            }];
-          }
-          
-          const response = await fetch(`${baseUrl}/pages`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(body)
-          });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.message || "Failed to create page" };
-          }
-          const data = await response.json();
-          return { success: true, page_id: data.id, url: data.url };
-        }
-
-        case "query_notion_database": {
-          const body = {};
-          if (toolInput.filter) body.filter = toolInput.filter;
-          if (toolInput.sorts) body.sorts = toolInput.sorts;
-          
-          const response = await fetch(`${baseUrl}/databases/${toolInput.database_id}/query`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(body)
-          });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.message || "Query failed" };
-          }
-          const data = await response.json();
-          return {
-            results: data.results.slice(0, 50).map(r => ({
-              id: r.id,
-              properties: Object.fromEntries(
-                Object.entries(r.properties).map(([key, val]) => [
-                  key,
-                  val.title?.[0]?.plain_text || val.rich_text?.[0]?.plain_text || val.number || val.select?.name || val.date?.start || val.checkbox || JSON.stringify(val)
-                ])
-              )
-            }))
-          };
-        }
-
-        case "create_notion_database_item": {
-          const response = await fetch(`${baseUrl}/pages`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({
-              parent: { database_id: toolInput.database_id },
-              properties: toolInput.properties
-            })
-          });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.message || "Failed to create item" };
-          }
-          const data = await response.json();
-          return { success: true, id: data.id, url: data.url };
-        }
-
-        default:
-          return { error: `Unknown Notion tool: ${toolName}` };
-      }
-    } catch (err) {
-      console.error(`[Notion] Error executing ${toolName}:`, err.message);
-      return { error: err.message };
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // GitHub Integration
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  // Get GitHub access token from settings
-  const getGitHubAccessToken = async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      return settings.githubTokens?.access_token || null;
-    } catch {
-      return null;
-    }
-  };
-
-  // GitHub tools
-  const githubTools = [
-    {
-      name: "list_github_repos",
-      description: "List repositories for the authenticated user.",
-      input_schema: {
-        type: "object",
-        properties: {
-          type: { type: "string", enum: ["all", "owner", "member"], description: "Type of repos (default: all)" },
-          sort: { type: "string", enum: ["created", "updated", "pushed", "full_name"], description: "Sort by" }
-        },
-        required: []
-      }
-    },
-    {
-      name: "get_github_issues",
-      description: "Get issues from a repository.",
-      input_schema: {
-        type: "object",
-        properties: {
-          owner: { type: "string", description: "Repository owner" },
-          repo: { type: "string", description: "Repository name" },
-          state: { type: "string", enum: ["open", "closed", "all"], description: "Issue state (default: open)" }
-        },
-        required: ["owner", "repo"]
-      }
-    },
-    {
-      name: "create_github_issue",
-      description: "Create an issue in a repository.",
-      input_schema: {
-        type: "object",
-        properties: {
-          owner: { type: "string", description: "Repository owner" },
-          repo: { type: "string", description: "Repository name" },
-          title: { type: "string", description: "Issue title" },
-          body: { type: "string", description: "Issue body/description" },
-          labels: { type: "array", items: { type: "string" }, description: "Labels to add" }
-        },
-        required: ["owner", "repo", "title"]
-      }
-    },
-    {
-      name: "get_github_prs",
-      description: "Get pull requests from a repository.",
-      input_schema: {
-        type: "object",
-        properties: {
-          owner: { type: "string", description: "Repository owner" },
-          repo: { type: "string", description: "Repository name" },
-          state: { type: "string", enum: ["open", "closed", "all"], description: "PR state (default: open)" }
-        },
-        required: ["owner", "repo"]
-      }
-    },
-    {
-      name: "search_github_code",
-      description: "Search for code on GitHub.",
-      input_schema: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search query (can include qualifiers like repo:owner/name)" }
-        },
-        required: ["query"]
-      }
-    },
-    {
-      name: "get_github_notifications",
-      description: "Get notifications for the authenticated user.",
-      input_schema: {
-        type: "object",
-        properties: {
-          all: { type: "boolean", description: "Show all notifications (default: false, shows only unread)" }
-        },
-        required: []
-      }
-    }
-  ];
-
-  // Execute GitHub tool
-  const executeGitHubTool = async (toolName, toolInput, accessToken) => {
-    if (!accessToken) {
-      return { error: "GitHub not connected. Please set up GitHub in the Integrations page." };
-    }
-
-    const baseUrl = "https://api.github.com";
-    const headers = {
-      "Authorization": `Bearer ${accessToken}`,
-      "Accept": "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28"
-    };
-
-    try {
-      switch (toolName) {
-        case "list_github_repos": {
-          const params = new URLSearchParams();
-          if (toolInput.type) params.set("type", toolInput.type);
-          if (toolInput.sort) params.set("sort", toolInput.sort);
-          params.set("per_page", "30");
-          
-          const response = await fetch(`${baseUrl}/user/repos?${params}`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to list repos" };
-          }
-          const repos = await response.json();
-          return {
-            repos: repos.map(r => ({
-              name: r.full_name,
-              description: r.description,
-              private: r.private,
-              stars: r.stargazers_count,
-              language: r.language,
-              updated_at: r.updated_at
-            }))
-          };
-        }
-
-        case "get_github_issues": {
-          const state = toolInput.state || "open";
-          const response = await fetch(`${baseUrl}/repos/${toolInput.owner}/${toolInput.repo}/issues?state=${state}&per_page=30`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to get issues" };
-          }
-          const issues = await response.json();
-          return {
-            issues: issues.filter(i => !i.pull_request).map(i => ({
-              number: i.number,
-              title: i.title,
-              state: i.state,
-              author: i.user.login,
-              labels: i.labels.map(l => l.name),
-              created_at: i.created_at
-            }))
-          };
-        }
-
-        case "create_github_issue": {
-          const body = {
-            title: toolInput.title,
-            body: toolInput.body || ""
-          };
-          if (toolInput.labels) body.labels = toolInput.labels;
-          
-          const response = await fetch(`${baseUrl}/repos/${toolInput.owner}/${toolInput.repo}/issues`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(body)
-          });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.message || "Failed to create issue" };
-          }
-          const issue = await response.json();
-          return { success: true, number: issue.number, url: issue.html_url };
-        }
-
-        case "get_github_prs": {
-          const state = toolInput.state || "open";
-          const response = await fetch(`${baseUrl}/repos/${toolInput.owner}/${toolInput.repo}/pulls?state=${state}&per_page=30`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to get PRs" };
-          }
-          const prs = await response.json();
-          return {
-            pull_requests: prs.map(pr => ({
-              number: pr.number,
-              title: pr.title,
-              state: pr.state,
-              author: pr.user.login,
-              created_at: pr.created_at,
-              merged: pr.merged_at !== null
-            }))
-          };
-        }
-
-        case "search_github_code": {
-          const response = await fetch(`${baseUrl}/search/code?q=${encodeURIComponent(toolInput.query)}&per_page=20`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to search code" };
-          }
-          const data = await response.json();
-          return {
-            results: data.items.map(i => ({
-              name: i.name,
-              path: i.path,
-              repo: i.repository.full_name,
-              url: i.html_url
-            }))
-          };
-        }
-
-        case "get_github_notifications": {
-          const all = toolInput.all ? "true" : "false";
-          const response = await fetch(`${baseUrl}/notifications?all=${all}&per_page=30`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to get notifications" };
-          }
-          const notifications = await response.json();
-          return {
-            notifications: notifications.map(n => ({
-              id: n.id,
-              reason: n.reason,
-              unread: n.unread,
-              title: n.subject.title,
-              type: n.subject.type,
-              repo: n.repository.full_name,
-              updated_at: n.updated_at
-            }))
-          };
-        }
-
-        default:
-          return { error: `Unknown GitHub tool: ${toolName}` };
-      }
-    } catch (err) {
-      console.error(`[GitHub] Error executing ${toolName}:`, err.message);
-      return { error: err.message };
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Asana Integration
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  // Get Asana access token from settings
-  const getAsanaAccessToken = async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      if (!settings.asanaTokens) return null;
-      
-      // Check if token needs refresh
-      if (settings.asanaTokens.expires_at && Date.now() > settings.asanaTokens.expires_at - 60000) {
-        const refreshed = await refreshAsanaToken(settings.asanaTokens);
-        if (refreshed) {
-          settings.asanaTokens = refreshed;
-          await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-          return refreshed.access_token;
-        }
-        return null;
-      }
-      return settings.asanaTokens.access_token;
-    } catch {
-      return null;
-    }
-  };
-
-  const refreshAsanaToken = async (tokens) => {
-    try {
-      const response = await fetch("https://app.asana.com/-/oauth_token", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          grant_type: "refresh_token",
-          client_id: tokens.client_id,
-          client_secret: tokens.client_secret,
-          refresh_token: tokens.refresh_token
-        })
-      });
-      const data = await response.json();
-      if (data.access_token) {
-        return {
-          ...tokens,
-          access_token: data.access_token,
-          refresh_token: data.refresh_token || tokens.refresh_token,
-          expires_at: Date.now() + (data.expires_in * 1000)
-        };
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  };
-
-  // Asana tools
-  const asanaTools = [
-    {
-      name: "list_asana_workspaces",
-      description: "List Asana workspaces the user has access to.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        required: []
-      }
-    },
-    {
-      name: "list_asana_projects",
-      description: "List projects in an Asana workspace.",
-      input_schema: {
-        type: "object",
-        properties: {
-          workspace_id: { type: "string", description: "Workspace ID" }
-        },
-        required: ["workspace_id"]
-      }
-    },
-    {
-      name: "get_asana_tasks",
-      description: "Get tasks from an Asana project.",
-      input_schema: {
-        type: "object",
-        properties: {
-          project_id: { type: "string", description: "Project ID" },
-          completed: { type: "boolean", description: "Include completed tasks (default: false)" }
-        },
-        required: ["project_id"]
-      }
-    },
-    {
-      name: "create_asana_task",
-      description: "Create a task in Asana.",
-      input_schema: {
-        type: "object",
-        properties: {
-          project_id: { type: "string", description: "Project ID to add the task to" },
-          name: { type: "string", description: "Task name" },
-          notes: { type: "string", description: "Task description/notes" },
-          due_on: { type: "string", description: "Due date (YYYY-MM-DD format)" },
-          assignee: { type: "string", description: "Assignee user ID or email" }
-        },
-        required: ["project_id", "name"]
-      }
-    },
-    {
-      name: "update_asana_task",
-      description: "Update an existing Asana task.",
-      input_schema: {
-        type: "object",
-        properties: {
-          task_id: { type: "string", description: "Task ID" },
-          name: { type: "string", description: "New task name" },
-          notes: { type: "string", description: "New notes" },
-          due_on: { type: "string", description: "New due date" },
-          completed: { type: "boolean", description: "Mark as completed" }
-        },
-        required: ["task_id"]
-      }
-    },
-    {
-      name: "complete_asana_task",
-      description: "Mark an Asana task as complete.",
-      input_schema: {
-        type: "object",
-        properties: {
-          task_id: { type: "string", description: "Task ID to complete" }
-        },
-        required: ["task_id"]
-      }
-    }
-  ];
-
-  // Execute Asana tool
-  const executeAsanaTool = async (toolName, toolInput, accessToken) => {
-    if (!accessToken) {
-      return { error: "Asana not connected. Please set up Asana in the Integrations page." };
-    }
-
-    const baseUrl = "https://app.asana.com/api/1.0";
-    const headers = {
-      "Authorization": `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    };
-
-    try {
-      switch (toolName) {
-        case "list_asana_workspaces": {
-          const response = await fetch(`${baseUrl}/workspaces`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to list workspaces" };
-          }
-          const data = await response.json();
-          return {
-            workspaces: data.data.map(w => ({
-              id: w.gid,
-              name: w.name
-            }))
-          };
-        }
-
-        case "list_asana_projects": {
-          const response = await fetch(`${baseUrl}/workspaces/${toolInput.workspace_id}/projects`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to list projects" };
-          }
-          const data = await response.json();
-          return {
-            projects: data.data.map(p => ({
-              id: p.gid,
-              name: p.name
-            }))
-          };
-        }
-
-        case "get_asana_tasks": {
-          const completed = toolInput.completed ? "true" : "false";
-          const response = await fetch(`${baseUrl}/projects/${toolInput.project_id}/tasks?opt_fields=name,notes,due_on,completed,assignee.name&completed_since=${completed === "true" ? "now" : ""}`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to get tasks" };
-          }
-          const data = await response.json();
-          return {
-            tasks: data.data.map(t => ({
-              id: t.gid,
-              name: t.name,
-              notes: t.notes,
-              due_on: t.due_on,
-              completed: t.completed,
-              assignee: t.assignee?.name
-            }))
-          };
-        }
-
-        case "create_asana_task": {
-          const taskData = {
-            name: toolInput.name,
-            projects: [toolInput.project_id]
-          };
-          if (toolInput.notes) taskData.notes = toolInput.notes;
-          if (toolInput.due_on) taskData.due_on = toolInput.due_on;
-          if (toolInput.assignee) taskData.assignee = toolInput.assignee;
-          
-          const response = await fetch(`${baseUrl}/tasks`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({ data: taskData })
-          });
-          if (!response.ok) {
-            const err = await response.json();
-            return { error: err.errors?.[0]?.message || "Failed to create task" };
-          }
-          const data = await response.json();
-          return { success: true, task_id: data.data.gid, name: data.data.name };
-        }
-
-        case "update_asana_task": {
-          const taskData = {};
-          if (toolInput.name) taskData.name = toolInput.name;
-          if (toolInput.notes !== undefined) taskData.notes = toolInput.notes;
-          if (toolInput.due_on) taskData.due_on = toolInput.due_on;
-          if (toolInput.completed !== undefined) taskData.completed = toolInput.completed;
-          
-          const response = await fetch(`${baseUrl}/tasks/${toolInput.task_id}`, {
-            method: "PUT",
-            headers,
-            body: JSON.stringify({ data: taskData })
-          });
-          if (!response.ok) {
-            return { error: "Failed to update task" };
-          }
-          return { success: true, message: "Task updated" };
-        }
-
-        case "complete_asana_task": {
-          const response = await fetch(`${baseUrl}/tasks/${toolInput.task_id}`, {
-            method: "PUT",
-            headers,
-            body: JSON.stringify({ data: { completed: true } })
-          });
-          if (!response.ok) {
-            return { error: "Failed to complete task" };
-          }
-          return { success: true, message: "Task marked as complete" };
-        }
-
-        default:
-          return { error: `Unknown Asana tool: ${toolName}` };
-      }
-    } catch (err) {
-      console.error(`[Asana] Error executing ${toolName}:`, err.message);
-      return { error: err.message };
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Reddit Integration
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  // Get Reddit access token from settings
-  const getRedditAccessToken = async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      if (!settings.redditTokens) return null;
-      
-      // Check if token needs refresh
-      if (settings.redditTokens.expires_at && Date.now() > settings.redditTokens.expires_at - 60000) {
-        const refreshed = await refreshRedditToken(settings.redditTokens);
-        if (refreshed) {
-          settings.redditTokens = refreshed;
-          await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-          return refreshed.access_token;
-        }
-        return null;
-      }
-      return settings.redditTokens.access_token;
-    } catch {
-      return null;
-    }
-  };
-
-  const refreshRedditToken = async (tokens) => {
-    try {
-      const response = await fetch("https://www.reddit.com/api/v1/access_token", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "Authorization": `Basic ${Buffer.from(`${tokens.client_id}:${tokens.client_secret}`).toString("base64")}`
-        },
-        body: new URLSearchParams({
-          grant_type: "refresh_token",
-          refresh_token: tokens.refresh_token
-        })
-      });
-      const data = await response.json();
-      if (data.access_token) {
-        return {
-          ...tokens,
-          access_token: data.access_token,
-          refresh_token: data.refresh_token || tokens.refresh_token,
-          expires_at: Date.now() + (data.expires_in * 1000)
-        };
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  };
-
-  // Reddit tools
-  const redditTools = [
-    {
-      name: "get_reddit_feed",
-      description: "Get posts from Reddit home feed.",
-      input_schema: {
-        type: "object",
-        properties: {
-          sort: { type: "string", enum: ["hot", "new", "top", "rising"], description: "Sort order (default: hot)" },
-          limit: { type: "number", description: "Number of posts (default 25, max 100)" }
-        },
-        required: []
-      }
-    },
-    {
-      name: "get_subreddit_posts",
-      description: "Get posts from a specific subreddit.",
-      input_schema: {
-        type: "object",
-        properties: {
-          subreddit: { type: "string", description: "Subreddit name (without r/)" },
-          sort: { type: "string", enum: ["hot", "new", "top", "rising"], description: "Sort order" },
-          limit: { type: "number", description: "Number of posts (default 25)" }
-        },
-        required: ["subreddit"]
-      }
-    },
-    {
-      name: "get_reddit_comments",
-      description: "Get comments on a Reddit post.",
-      input_schema: {
-        type: "object",
-        properties: {
-          post_id: { type: "string", description: "Post ID (the thing after t3_)" },
-          subreddit: { type: "string", description: "Subreddit name" },
-          limit: { type: "number", description: "Number of comments (default 25)" }
-        },
-        required: ["post_id", "subreddit"]
-      }
-    },
-    {
-      name: "create_reddit_post",
-      description: "Create a post on Reddit. Always confirm with user before posting.",
-      input_schema: {
-        type: "object",
-        properties: {
-          subreddit: { type: "string", description: "Subreddit to post to" },
-          title: { type: "string", description: "Post title" },
-          text: { type: "string", description: "Post text (for self posts)" },
-          url: { type: "string", description: "URL to link (for link posts)" }
-        },
-        required: ["subreddit", "title"]
-      }
-    },
-    {
-      name: "create_reddit_comment",
-      description: "Add a comment to a Reddit post. Always confirm with user before posting.",
-      input_schema: {
-        type: "object",
-        properties: {
-          parent_id: { type: "string", description: "Parent thing ID (t1_ for comment, t3_ for post)" },
-          text: { type: "string", description: "Comment text" }
-        },
-        required: ["parent_id", "text"]
-      }
-    },
-    {
-      name: "get_reddit_messages",
-      description: "Get Reddit inbox messages.",
-      input_schema: {
-        type: "object",
-        properties: {
-          where: { type: "string", enum: ["inbox", "unread", "sent"], description: "Message location (default: inbox)" }
-        },
-        required: []
-      }
-    }
-  ];
-
-  // Execute Reddit tool
-  const executeRedditTool = async (toolName, toolInput, accessToken) => {
-    if (!accessToken) {
-      return { error: "Reddit not connected. Please set up Reddit in the Integrations page." };
-    }
-
-    const baseUrl = "https://oauth.reddit.com";
-    const headers = {
-      "Authorization": `Bearer ${accessToken}`,
-      "User-Agent": "Wovly/1.0"
-    };
-
-    try {
-      switch (toolName) {
-        case "get_reddit_feed": {
-          const sort = toolInput.sort || "hot";
-          const limit = Math.min(toolInput.limit || 25, 100);
-          const response = await fetch(`${baseUrl}/${sort}?limit=${limit}`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to get feed" };
-          }
-          const data = await response.json();
-          return {
-            posts: data.data.children.map(p => ({
-              id: p.data.id,
-              title: p.data.title,
-              subreddit: p.data.subreddit,
-              author: p.data.author,
-              score: p.data.score,
-              num_comments: p.data.num_comments,
-              url: p.data.url,
-              selftext: p.data.selftext?.slice(0, 500)
-            }))
-          };
-        }
-
-        case "get_subreddit_posts": {
-          const sort = toolInput.sort || "hot";
-          const limit = Math.min(toolInput.limit || 25, 100);
-          const response = await fetch(`${baseUrl}/r/${toolInput.subreddit}/${sort}?limit=${limit}`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to get subreddit posts" };
-          }
-          const data = await response.json();
-          return {
-            posts: data.data.children.map(p => ({
-              id: p.data.id,
-              title: p.data.title,
-              author: p.data.author,
-              score: p.data.score,
-              num_comments: p.data.num_comments,
-              url: p.data.url,
-              selftext: p.data.selftext?.slice(0, 500)
-            }))
-          };
-        }
-
-        case "get_reddit_comments": {
-          const limit = Math.min(toolInput.limit || 25, 100);
-          const response = await fetch(`${baseUrl}/r/${toolInput.subreddit}/comments/${toolInput.post_id}?limit=${limit}`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to get comments" };
-          }
-          const data = await response.json();
-          const comments = data[1]?.data?.children || [];
-          return {
-            comments: comments.filter(c => c.kind === "t1").map(c => ({
-              id: c.data.id,
-              author: c.data.author,
-              body: c.data.body?.slice(0, 500),
-              score: c.data.score,
-              created_utc: c.data.created_utc
-            }))
-          };
-        }
-
-        case "create_reddit_post": {
-          const formData = new URLSearchParams();
-          formData.append("sr", toolInput.subreddit);
-          formData.append("title", toolInput.title);
-          formData.append("kind", toolInput.url ? "link" : "self");
-          if (toolInput.url) formData.append("url", toolInput.url);
-          if (toolInput.text) formData.append("text", toolInput.text);
-          
-          const response = await fetch(`${baseUrl}/api/submit`, {
-            method: "POST",
-            headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
-            body: formData
-          });
-          if (!response.ok) {
-            return { error: "Failed to create post" };
-          }
-          const data = await response.json();
-          if (data.json?.errors?.length > 0) {
-            return { error: data.json.errors[0][1] };
-          }
-          return { success: true, url: data.json?.data?.url, id: data.json?.data?.id };
-        }
-
-        case "create_reddit_comment": {
-          const formData = new URLSearchParams();
-          formData.append("thing_id", toolInput.parent_id);
-          formData.append("text", toolInput.text);
-          
-          const response = await fetch(`${baseUrl}/api/comment`, {
-            method: "POST",
-            headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
-            body: formData
-          });
-          if (!response.ok) {
-            return { error: "Failed to create comment" };
-          }
-          const data = await response.json();
-          if (data.json?.errors?.length > 0) {
-            return { error: data.json.errors[0][1] };
-          }
-          return { success: true, message: "Comment posted" };
-        }
-
-        case "get_reddit_messages": {
-          const where = toolInput.where || "inbox";
-          const response = await fetch(`${baseUrl}/message/${where}`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to get messages" };
-          }
-          const data = await response.json();
-          return {
-            messages: data.data.children.map(m => ({
-              id: m.data.id,
-              subject: m.data.subject,
-              author: m.data.author,
-              body: m.data.body?.slice(0, 500),
-              created_utc: m.data.created_utc,
-              new: m.data.new
-            }))
-          };
-        }
-
-        default:
-          return { error: `Unknown Reddit tool: ${toolName}` };
-      }
-    } catch (err) {
-      console.error(`[Reddit] Error executing ${toolName}:`, err.message);
-      return { error: err.message };
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Spotify Integration
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  // Get Spotify access token from settings
-  const getSpotifyAccessToken = async () => {
-    try {
-      const settingsPath = await getSettingsPath(currentUser?.username);
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      if (!settings.spotifyTokens) return null;
-      
-      // Check if token needs refresh
-      if (settings.spotifyTokens.expires_at && Date.now() > settings.spotifyTokens.expires_at - 60000) {
-        const refreshed = await refreshSpotifyToken(settings.spotifyTokens);
-        if (refreshed) {
-          settings.spotifyTokens = refreshed;
-          await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-          return refreshed.access_token;
-        }
-        return null;
-      }
-      return settings.spotifyTokens.access_token;
-    } catch {
-      return null;
-    }
-  };
-
-  const refreshSpotifyToken = async (tokens) => {
-    try {
-      const response = await fetch("https://accounts.spotify.com/api/token", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "Authorization": `Basic ${Buffer.from(`${tokens.client_id}:${tokens.client_secret}`).toString("base64")}`
-        },
-        body: new URLSearchParams({
-          grant_type: "refresh_token",
-          refresh_token: tokens.refresh_token
-        })
-      });
-      const data = await response.json();
-      if (data.access_token) {
-        return {
-          ...tokens,
-          access_token: data.access_token,
-          expires_at: Date.now() + (data.expires_in * 1000)
-        };
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  };
-
-  // Spotify tools
-  const spotifyTools = [
-    {
-      name: "get_spotify_now_playing",
-      description: "Get the currently playing track on Spotify.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        required: []
-      }
-    },
-    {
-      name: "spotify_play",
-      description: "Start or resume playback on Spotify. Requires Spotify Premium.",
-      input_schema: {
-        type: "object",
-        properties: {
-          uri: { type: "string", description: "Spotify URI to play (optional, resumes current if not specified)" }
-        },
-        required: []
-      }
-    },
-    {
-      name: "spotify_pause",
-      description: "Pause Spotify playback. Requires Spotify Premium.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        required: []
-      }
-    },
-    {
-      name: "spotify_next",
-      description: "Skip to next track on Spotify. Requires Spotify Premium.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        required: []
-      }
-    },
-    {
-      name: "spotify_previous",
-      description: "Go to previous track on Spotify. Requires Spotify Premium.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        required: []
-      }
-    },
-    {
-      name: "search_spotify",
-      description: "Search for tracks, artists, albums, or playlists on Spotify.",
-      input_schema: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search query" },
-          type: { type: "string", enum: ["track", "artist", "album", "playlist"], description: "Type to search for (default: track)" },
-          limit: { type: "number", description: "Number of results (default 10, max 50)" }
-        },
-        required: ["query"]
-      }
-    },
-    {
-      name: "get_spotify_playlists",
-      description: "Get the user's Spotify playlists.",
-      input_schema: {
-        type: "object",
-        properties: {
-          limit: { type: "number", description: "Number of playlists (default 20, max 50)" }
-        },
-        required: []
-      }
-    }
-  ];
-
-  // Execute Spotify tool
-  const executeSpotifyTool = async (toolName, toolInput, accessToken) => {
-    if (!accessToken) {
-      return { error: "Spotify not connected. Please set up Spotify in the Integrations page." };
-    }
-
-    const baseUrl = "https://api.spotify.com/v1";
-    const headers = {
-      "Authorization": `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    };
-
-    try {
-      switch (toolName) {
-        case "get_spotify_now_playing": {
-          const response = await fetch(`${baseUrl}/me/player/currently-playing`, { headers });
-          if (response.status === 204) {
-            return { playing: false, message: "Nothing currently playing" };
-          }
-          if (!response.ok) {
-            return { error: "Failed to get now playing" };
-          }
-          const data = await response.json();
-          return {
-            playing: data.is_playing,
-            track: {
-              name: data.item?.name,
-              artist: data.item?.artists?.map(a => a.name).join(", "),
-              album: data.item?.album?.name,
-              duration_ms: data.item?.duration_ms,
-              progress_ms: data.progress_ms
-            }
-          };
-        }
-
-        case "spotify_play": {
-          const body = toolInput.uri ? { uris: [toolInput.uri] } : undefined;
-          const response = await fetch(`${baseUrl}/me/player/play`, {
-            method: "PUT",
-            headers,
-            body: body ? JSON.stringify(body) : undefined
-          });
-          if (response.status === 204 || response.ok) {
-            return { success: true, message: "Playback started" };
-          }
-          const err = await response.json();
-          return { error: err.error?.message || "Failed to start playback" };
-        }
-
-        case "spotify_pause": {
-          const response = await fetch(`${baseUrl}/me/player/pause`, {
-            method: "PUT",
-            headers
-          });
-          if (response.status === 204 || response.ok) {
-            return { success: true, message: "Playback paused" };
-          }
-          return { error: "Failed to pause playback" };
-        }
-
-        case "spotify_next": {
-          const response = await fetch(`${baseUrl}/me/player/next`, {
-            method: "POST",
-            headers
-          });
-          if (response.status === 204 || response.ok) {
-            return { success: true, message: "Skipped to next track" };
-          }
-          return { error: "Failed to skip track" };
-        }
-
-        case "spotify_previous": {
-          const response = await fetch(`${baseUrl}/me/player/previous`, {
-            method: "POST",
-            headers
-          });
-          if (response.status === 204 || response.ok) {
-            return { success: true, message: "Went to previous track" };
-          }
-          return { error: "Failed to go to previous track" };
-        }
-
-        case "search_spotify": {
-          const type = toolInput.type || "track";
-          const limit = Math.min(toolInput.limit || 10, 50);
-          const response = await fetch(`${baseUrl}/search?q=${encodeURIComponent(toolInput.query)}&type=${type}&limit=${limit}`, { headers });
-          if (!response.ok) {
-            return { error: "Search failed" };
-          }
-          const data = await response.json();
-          const key = `${type}s`;
-          return {
-            results: (data[key]?.items || []).map(item => ({
-              name: item.name,
-              uri: item.uri,
-              ...(type === "track" ? { artist: item.artists?.map(a => a.name).join(", "), album: item.album?.name } : {}),
-              ...(type === "artist" ? { genres: item.genres, followers: item.followers?.total } : {}),
-              ...(type === "album" ? { artist: item.artists?.map(a => a.name).join(", "), release_date: item.release_date } : {}),
-              ...(type === "playlist" ? { owner: item.owner?.display_name, tracks: item.tracks?.total } : {})
-            }))
-          };
-        }
-
-        case "get_spotify_playlists": {
-          const limit = Math.min(toolInput.limit || 20, 50);
-          const response = await fetch(`${baseUrl}/me/playlists?limit=${limit}`, { headers });
-          if (!response.ok) {
-            return { error: "Failed to get playlists" };
-          }
-          const data = await response.json();
-          return {
-            playlists: data.items.map(p => ({
-              id: p.id,
-              name: p.name,
-              uri: p.uri,
-              tracks: p.tracks?.total,
-              public: p.public
-            }))
-          };
-        }
-
-        default:
-          return { error: `Unknown Spotify tool: ${toolName}` };
-      }
-    } catch (err) {
-      console.error(`[Spotify] Error executing ${toolName}:`, err.message);
-      return { error: err.message };
-    }
-  };
-
-  // Task tools - for creating and managing background tasks
-  const taskTools = [
-    {
-      name: "create_task",
-      description: "IMPORTANT: Only call this AFTER the user has explicitly confirmed they want to create the task. Do NOT call this immediately - first describe your proposed plan in plain text and ask 'Would you like me to create this task?' Then WAIT for the user to say yes/confirm/go ahead before calling this tool. This creates an autonomous background task that runs independently. CRITICAL: When you call create_task, do NOT also call send_email, send_imessage, or any other action tool - the task executor will handle ALL steps automatically. If you send a message AND create a task, duplicate messages will be sent.",
-      input_schema: {
-        type: "object",
-        properties: {
-          title: { type: "string", description: "Short descriptive title for the task (e.g., 'Schedule lunch with Jeff')" },
-          originalRequest: { type: "string", description: "The user's original request verbatim - copy exactly what they said" },
-          messagingChannel: { 
-            type: "string", 
-            enum: ["imessage", "email", "slack", "telegram", "discord", "x"],
-            description: "REQUIRED: Which messaging channel to use. Detect from keywords in user's request: 'text'/'message'/'sms' = imessage, 'email'/'mail' = email, 'slack' = slack, 'telegram' = telegram, 'discord' = discord, 'tweet'/'x'/'twitter' = x" 
-          },
-          plan: { 
-            type: "array", 
-            items: { type: "string" }, 
-            description: "Step-by-step plan to accomplish the task. Be specific about what each step does." 
-          },
-          context: { 
-            type: "object", 
-            description: "Key context needed for the task - emails, names, durations, dates, etc. Store anything the task needs to remember." 
-          }
-        },
-        required: ["title", "originalRequest", "messagingChannel", "plan"]
-      }
-    },
-    {
-      name: "list_tasks",
-      description: "List all existing tasks with their current status.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        required: []
-      }
-    },
-    {
-      name: "cancel_task",
-      description: "Cancel an existing task by its ID.",
-      input_schema: {
-        type: "object",
-        properties: {
-          taskId: { type: "string", description: "The ID of the task to cancel" }
-        },
-        required: ["taskId"]
-      }
-    }
-  ];
-
-  // Execute task tool
-  const executeTaskTool = async (toolName, toolInput) => {
-    try {
-      switch (toolName) {
-        case "create_task": {
-          const task = await createTask(toolInput, currentUser?.username);
-          
-          // Send initial notification that task is starting
-          if (win && win.webContents) {
-            win.webContents.send("chat:newMessage", {
-              role: "assistant",
-              content: `🚀 **Task Started: ${task.title}**\n\nExecuting step 1: ${task.plan[0] || "Starting..."}`,
-              source: "task"
-            });
-          }
-          
-          // Auto-start the task immediately (don't await - let it run in background)
-          setTimeout(async () => {
-            console.log(`[Tasks] Auto-starting task: ${task.id}`);
-            await executeTaskStep(task.id, currentUser?.username);
-          }, 100);
-          
-          return {
-            success: true,
-            taskId: task.id,
-            message: `Task "${task.title}" created and started! The first step is now executing.`,
-            plan: task.plan
-          };
-        }
-        case "list_tasks": {
-          const tasks = await listTasks(currentUser?.username);
-          return {
-            tasks: tasks.map(t => ({
-              id: t.id,
-              title: t.title,
-              status: t.status,
-              currentStep: t.currentStep.step,
-              totalSteps: t.plan.length,
-              lastUpdated: t.lastUpdated
-            }))
-          };
-        }
-        case "cancel_task": {
-          const result = await cancelTask(toolInput.taskId);
-          if (result.error) {
-            return { error: result.error };
-          }
-          return { success: true, message: `Task cancelled successfully` };
-        }
-        default:
-          return { error: `Unknown task tool: ${toolName}` };
-      }
-    } catch (err) {
-      return { error: err.message };
-    }
-  };
-
-  // Execute Google tool
-  const executeGoogleTool = async (toolName, toolInput, accessToken, apiKeys = null) => {
-    try {
-      switch (toolName) {
-        case "get_calendar_events": {
-          // Get today's date in local timezone if not specified
-          const today = new Date();
-          const dateStr = toolInput.date || `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-          const days = toolInput.days || 1;
-          
-          // Parse date in local timezone (not UTC)
-          // "2026-01-31" should be midnight Jan 31 LOCAL time, not UTC
-          const [year, month, day] = dateStr.split('-').map(Number);
-          const startDate = new Date(year, month - 1, day, 0, 0, 0, 0);
-          const endDate = new Date(year, month - 1, day + days, 0, 0, 0, 0);
-          
-          console.log(`[Calendar] Requested date: ${dateStr}, local start: ${startDate.toLocaleString()}, local end: ${endDate.toLocaleString()}`);
-          
-          return await fetchCalendarEvents(accessToken, startDate, endDate);
-        }
-
-        case "create_calendar_event": {
-          const { title, start, end, description, location, attendees, sendNotifications = true } = toolInput;
-          
-          // Build event body
-          const eventBody = {
-            summary: title,
-            start: { dateTime: start },
-            end: { dateTime: end },
-            description,
-            location
-          };
-          
-          // Add attendees if provided
-          if (attendees && attendees.length > 0) {
-            eventBody.attendees = attendees.map(email => ({ email }));
-          }
-          
-          // Build URL with sendUpdates parameter
-          const url = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
-          if (attendees && attendees.length > 0) {
-            url.searchParams.set("sendUpdates", sendNotifications ? "all" : "none");
-          }
-          
-          const response = await fetch(url.toString(), {
-            method: "POST",
-            headers: {
-              "Authorization": `Bearer ${accessToken}`,
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify(eventBody)
-          });
-          
-          if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            console.error("Calendar API error:", errorData);
-            throw new Error(errorData.error?.message || "Failed to create event");
-          }
-          
-          const event = await response.json();
-          const attendeeCount = attendees?.length || 0;
-          const attendeeMsg = attendeeCount > 0 ? ` with ${attendeeCount} attendee(s) invited` : "";
-          return { 
-            success: true, 
-            eventId: event.id, 
-            htmlLink: event.htmlLink,
-            message: `Created event: ${title}${attendeeMsg}` 
-          };
-        }
-
-        case "delete_calendar_event": {
-          const { eventId } = toolInput;
-          
-          const response = await fetch(
-            `https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}`,
-            {
-              method: "DELETE",
-              headers: { "Authorization": `Bearer ${accessToken}` }
-            }
-          );
-          
-          if (!response.ok && response.status !== 204) throw new Error("Failed to delete event");
-          return { success: true, message: "Event deleted" };
-        }
-
-        case "search_emails": {
-          const { query, maxResults = 10 } = toolInput;
-          
-          const url = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
-          url.searchParams.set("q", query);
-          url.searchParams.set("maxResults", maxResults.toString());
-          
-          const response = await fetch(url.toString(), {
-            headers: { "Authorization": `Bearer ${accessToken}` }
-          });
-          
-          if (!response.ok) throw new Error("Failed to search emails");
-          const data = await response.json();
-          return { messages: data.messages || [], resultCount: data.resultSizeEstimate || 0 };
-        }
-
-        case "get_email_content": {
-          const { messageId } = toolInput;
-
-          const response = await fetch(
-            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full`,
-            { headers: { "Authorization": `Bearer ${accessToken}` } }
-          );
-
-          if (!response.ok) throw new Error("Failed to get email");
-          const email = await response.json();
-
-          const headers = email.payload?.headers || [];
-          const getHeader = (name) => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || "";
-
-          let body = "";
-          const extractBody = (part) => {
-            if (part.body?.data) {
-              body = Buffer.from(part.body.data, "base64").toString("utf8");
-            }
-            if (part.parts) {
-              for (const p of part.parts) {
-                if (p.mimeType === "text/plain") extractBody(p);
-              }
-            }
-          };
-          extractBody(email.payload);
-
-          return {
-            id: email.id,
-            threadId: email.threadId, // For replying in the same thread
-            messageId: getHeader("Message-ID"), // For In-Reply-To header
-            subject: getHeader("Subject"),
-            from: getHeader("From"),
-            to: getHeader("To"),
-            date: getHeader("Date"),
-            body: body.substring(0, 2000)
-          };
-        }
-
-        case "get_email_contents_batch": {
-          const { messageIds, maxEmails = 50 } = toolInput;
-
-          if (!Array.isArray(messageIds) || messageIds.length === 0) {
-            return { success: false, error: "messageIds must be a non-empty array", emails: [] };
-          }
-
-          console.log(`[Gmail] Batch fetching ${messageIds.length} emails (sample IDs):`, messageIds.slice(0, 3));
-
-          // Extract IDs if messageIds contains objects instead of strings
-          const idsToFetch = messageIds.slice(0, maxEmails).map(item => {
-            if (typeof item === 'string') return item;
-            if (item && typeof item === 'object' && item.id) return item.id;
-            return null;
-          }).filter(id => id !== null);
-
-          if (idsToFetch.length === 0) {
-            return { success: false, error: "No valid message IDs found", emails: [] };
-          }
-
-          console.log(`[Gmail] Extracted ${idsToFetch.length} valid IDs (sample):`, idsToFetch.slice(0, 3));
-
-          const emails = [];
-          let fetchedCount = 0;
-          let errorCount = 0;
-          let firstError = null;
-
-          // Fetch emails in parallel (batches of 10 to avoid overwhelming the API)
-          const batchSize = 10;
-          for (let i = 0; i < idsToFetch.length; i += batchSize) {
-            const batch = idsToFetch.slice(i, i + batchSize);
-            const batchPromises = batch.map(async (id) => {
-              try {
-                const response = await fetch(
-                  `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
-                  { headers: { "Authorization": `Bearer ${accessToken}` } }
-                );
-
-                if (!response.ok) {
-                  const errorText = await response.text();
-                  if (!firstError) {
-                    firstError = `${response.status}: ${errorText.substring(0, 200)}`;
-                  }
-                  console.error(`[Gmail] Error fetching email ${id}: ${response.status} ${errorText.substring(0, 100)}`);
-                  errorCount++;
-                  return null;
-                }
-
-                const email = await response.json();
-                const headers = email.payload?.headers || [];
-                const getHeader = (name) => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || "";
-
-                let body = "";
-                const extractBody = (part) => {
-                  if (part.body?.data) {
-                    body = Buffer.from(part.body.data, "base64").toString("utf8");
-                  }
-                  if (part.parts) {
-                    for (const p of part.parts) {
-                      if (p.mimeType === "text/plain") extractBody(p);
-                    }
-                  }
-                };
-                extractBody(email.payload);
-
-                fetchedCount++;
-                return {
-                  id: email.id,
-                  threadId: email.threadId,
-                  messageId: getHeader("Message-ID"),
-                  subject: getHeader("Subject"),
-                  from: getHeader("From"),
-                  to: getHeader("To"),
-                  date: getHeader("Date"),
-                  body: body.substring(0, 2000) // Limit body length per email
-                };
-              } catch (err) {
-                if (!firstError) {
-                  firstError = err.message;
-                }
-                console.error(`[Gmail] Error fetching email ${id}:`, err.message);
-                errorCount++;
-                return null;
-              }
-            });
-
-            const batchResults = await Promise.all(batchPromises);
-            emails.push(...batchResults.filter(e => e !== null));
-          }
-
-          if (firstError) {
-            console.error(`[Gmail] Batch fetch first error: ${firstError}`);
-          }
-          console.log(`[Gmail] Batch fetched ${emails.length} emails (${errorCount} errors out of ${idsToFetch.length})`);
-          return {
-            success: emails.length > 0 || errorCount === 0,
-            emails,
-            fetched: emails.length,
-            errors: errorCount,
-            total: messageIds.length,
-            firstError: errorCount > 0 ? firstError : null
-          };
-        }
-
-        case "analyze_with_llm": {
-          const { content, instruction, format = "markdown" } = toolInput;
-
-          if (!content || !instruction) {
-            return { success: false, error: "content and instruction are required" };
-          }
-
-          if (!apiKeys?.anthropic) {
-            return {
-              success: false,
-              error: "Anthropic API key not available"
-            };
-          }
-
-          try {
-            // Format content properly - handle arrays and objects
-            let formattedContent = content;
-            if (Array.isArray(content)) {
-              // Array of objects (like emails) - format as readable text
-              if (content.length > 0 && typeof content[0] === 'object') {
-                formattedContent = JSON.stringify(content, null, 2);
-              } else {
-                formattedContent = content.join('\n');
-              }
-            } else if (typeof content === 'object' && content !== null) {
-              // Single object - stringify it
-              formattedContent = JSON.stringify(content, null, 2);
-            } else if (typeof content !== 'string') {
-              // Other types - convert to string
-              formattedContent = String(content);
-            }
-
-            console.log(`[LLM] Analyzing content: ${formattedContent.length} chars, type: ${Array.isArray(content) ? 'array' : typeof content}`);
-
-            // Call the LLM with the analysis request
-            const analysisPrompt = `${instruction}\n\n${format === "json" ? "Respond with valid JSON only, no other text." : ""}\n\nContent to analyze:\n${formattedContent}`;
-
-            const response = await fetch("https://api.anthropic.com/v1/messages", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "x-api-key": apiKeys.anthropic,
-                "anthropic-version": "2023-06-01"
-              },
-              body: JSON.stringify({
-                model: "claude-sonnet-4-20250514",
-                max_tokens: 4000,
-                messages: [{ role: "user", content: analysisPrompt }]
-              })
-            });
-
-            if (!response.ok) {
-              const errorText = await response.text();
-              throw new Error(`API error: ${response.status} ${errorText}`);
-            }
-
-            const data = await response.json();
-            const analysis = data.content[0].text;
-
-            console.log(`[LLM] Analysis completed (${analysis.length} chars)`);
-            return {
-              success: true,
-              analysis,
-              result: analysis, // Alias for template compatibility
-              formatted: analysis, // Alias for template compatibility
-              tokens_used: data.usage.input_tokens + data.usage.output_tokens
-            };
-          } catch (err) {
-            console.error(`[LLM] Analysis error:`, err.message);
-            return {
-              success: false,
-              error: err.message
-            };
-          }
-        }
-
-        case "send_email": {
-          const { to, subject, body, cc, bcc, threadId, replyToMessageId } = toolInput;
-          
-          let emailContent = `To: ${to}\r\n`;
-          if (cc) emailContent += `Cc: ${cc}\r\n`;
-          if (bcc) emailContent += `Bcc: ${bcc}\r\n`;
-          
-          // For replies, add In-Reply-To and References headers to maintain thread
-          if (replyToMessageId) {
-            emailContent += `In-Reply-To: ${replyToMessageId}\r\n`;
-            emailContent += `References: ${replyToMessageId}\r\n`;
-          }
-          
-          emailContent += `Subject: ${subject}\r\n`;
-          emailContent += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
-          emailContent += body;
-          
-          const encodedEmail = Buffer.from(emailContent).toString("base64")
-            .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-          
-          // Build request body - include threadId for replies
-          const requestBody = { raw: encodedEmail };
-          if (threadId) {
-            requestBody.threadId = threadId;
-          }
-          
-          const response = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
-            method: "POST",
-            headers: {
-              "Authorization": `Bearer ${accessToken}`,
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify(requestBody)
-          });
-          
-          if (!response.ok) {
-            const errData = await response.text();
-            throw new Error(`Failed to send email: ${errData}`);
-          }
-          
-          const result = await response.json();
-          return { 
-            success: true, 
-            message: `Email sent to ${to}`,
-            messageId: result.id,
-            threadId: result.threadId
-          };
-        }
-
-        case "list_drive_files": {
-          const { query, maxResults = 10 } = toolInput;
-          
-          const url = new URL("https://www.googleapis.com/drive/v3/files");
-          url.searchParams.set("pageSize", maxResults.toString());
-          if (query) url.searchParams.set("q", `name contains '${query}'`);
-          
-          const response = await fetch(url.toString(), {
-            headers: { "Authorization": `Bearer ${accessToken}` }
-          });
-          
-          if (!response.ok) throw new Error("Failed to list files");
-          const data = await response.json();
-          return { files: data.files || [] };
-        }
-
-        default:
-          return { error: `Unknown tool: ${toolName}` };
-      }
-    } catch (err) {
-      return { error: err.message };
-    }
-  };
-
-  // Execute profile tool
-  const executeProfileTool = async (toolName, toolInput) => {
-    try {
-      const profilePath = await getUserProfilePath(currentUser?.username);
-      const markdown = await fs.readFile(profilePath, "utf8");
-      const profile = parseUserProfile(markdown);
-
-      if (toolName === "get_user_profile") {
-        return profile;
-      }
-
-      if (toolName === "update_user_profile") {
-        // Track if goals were changed
-        let goalsChanged = false;
-
-        // Handle addNote
-        if (toolInput.addNote) {
-          if (!profile.notes) {
-            profile.notes = [];
-          }
-          // Check if similar note already exists
-          const existingIndex = profile.notes.findIndex(n =>
-            n.toLowerCase().includes(toolInput.addNote.toLowerCase().split(':')[0])
-          );
-          if (existingIndex >= 0) {
-            // Update existing note
-            profile.notes[existingIndex] = toolInput.addNote;
-          } else {
-            // Add new note
-            profile.notes.push(toolInput.addNote);
-          }
-          delete toolInput.addNote;
-        }
-
-        // Handle removeNote
-        if (toolInput.removeNote) {
-          if (profile.notes) {
-            profile.notes = profile.notes.filter(n =>
-              !n.toLowerCase().includes(toolInput.removeNote.toLowerCase())
-            );
-          }
-          delete toolInput.removeNote;
-        }
-
-        // Handle addGoal
-        if (toolInput.addGoal) {
-          goalsChanged = true;
-          if (!profile.goals) {
-            profile.goals = [];
-          }
-          // Check if similar goal already exists
-          const goalLower = toolInput.addGoal.toLowerCase();
-          const existingGoal = profile.goals.find(g =>
-            g.toLowerCase().includes(goalLower) || goalLower.includes(g.toLowerCase())
-          );
-          if (!existingGoal) {
-            // Add new goal
-            profile.goals.push(toolInput.addGoal);
-          }
-          delete toolInput.addGoal;
-        }
-
-        // Handle removeGoal
-        if (toolInput.removeGoal) {
-          goalsChanged = true;
-          if (profile.goals) {
-            profile.goals = profile.goals.filter(g =>
-              !g.toLowerCase().includes(toolInput.removeGoal.toLowerCase())
-            );
-          }
-          delete toolInput.removeGoal;
-        }
-
-        // Update other fields
-        const { addNote, removeNote, addGoal, removeGoal, ...otherFields } = toolInput;
-        Object.assign(profile, otherFields);
-        
-        // Check if we should advance onboarding from profile stage to task_demo
-        // Requires: first name (not default), and at least one of: occupation, city, or homeLife
-        const hasBasicInfo = profile.firstName && profile.firstName !== "User" && profile.firstName !== "";
-        const hasContextInfo = profile.occupation || profile.city || profile.homeLife;
-        if (profile.onboardingStage === "profile" && hasBasicInfo && hasContextInfo) {
-          console.log("[Onboarding] Profile info collected, advancing to task_demo stage");
-          profile.onboardingStage = "task_demo";
-        }
-        
-        const newMarkdown = serializeUserProfile(profile);
-        await fs.writeFile(profilePath, newMarkdown, "utf8");
-
-        // If goals were added or removed, trigger insights refresh
-        // This will re-analyze recent messages with the new goal priorities
-        if (goalsChanged) {
-          console.log("[Profile] Goals changed, triggering insights refresh");
-          // Run insights check in background
-          setTimeout(async () => {
-            try {
-              const limit = await loadSetting(currentUser.username, 'insightsLimit', 5);
-              runInsightsCheck(limit).catch(err =>
-                console.error("[Profile] Error refreshing insights after goal change:", err)
-              );
-            } catch (err) {
-              console.error("[Profile] Error loading settings for insights:", err);
-            }
-          }, 1000);
-        }
-
-        return { success: true, profile, message: "Profile updated successfully" };
-      }
-
-      return { error: "Unknown profile tool" };
-    } catch (err) {
-      return { error: err.message };
-    }
-  };
-
-  // Execute iMessage tool
-  const executeIMessageTool = async (toolName, toolInput) => {
-    const { exec } = require("child_process");
-    const dbPath = path.join(os.homedir(), "Library", "Messages", "chat.db");
-
-    if (process.platform !== "darwin") {
-      return { error: "iMessage is only available on macOS" };
-    }
-
-    try {
-      await fs.access(dbPath);
-    } catch {
-      return { error: "Cannot access Messages database. Grant Full Disk Access." };
-    }
-
-    // Helper to find contacts by name - returns structured contact data
-    const findContactsByName = (name) => {
-      return new Promise((resolve) => {
-        const searchName = name.toLowerCase().replace(/'/g, "''");
-        console.log(`[iMessage] Looking up contact: ${name}`);
-        
-        // Try using the 'contacts' CLI tool first (more reliable, less permissions issues)
-        // This uses Spotlight's metadata which doesn't require Automation permission
-        exec(`mdfind -onlyin ~/Library/Application\\ Support/AddressBook "kMDItemKind == 'Contact' && kMDItemDisplayName == '*${name}*'cd"`, { timeout: 5000 }, (mdError, mdStdout) => {
-          // If mdfind works and finds something, we still need AppleScript to get phone numbers
-          // So let's try a simpler AppleScript approach
-          
-          // Simpler AppleScript - searches by name property directly
-          const appleScript = `
-            set output to ""
-            tell application "Contacts"
-              try
-                set foundPeople to (every person whose name contains "${searchName}")
-                repeat with aPerson in foundPeople
-                  set personName to name of aPerson
-                  set phoneInfo to ""
-                  repeat with aPhone in phones of aPerson
-                    try
-                      set phoneInfo to phoneInfo & (label of aPhone) & ":" & (value of aPhone) & ","
-                    end try
-                  end repeat
-                  if phoneInfo is not "" then
-                    set output to output & personName & "|" & phoneInfo & ";"
-                  end if
-                end repeat
-              end try
-            end tell
-            return output
-          `;
-          
-          exec(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, { timeout: 10000 }, (error, stdout, stderr) => {
-            if (error) {
-              // Check for specific permission errors
-              const errorMsg = error.message || stderr || "";
-              console.error(`[iMessage] Contact lookup error: ${errorMsg}`);
-              
-              if (errorMsg.includes("not allowed") || errorMsg.includes("permission") || errorMsg.includes("(-1743)")) {
-                console.error(`[iMessage] Permission denied. Grant Automation permission for Contacts in System Settings > Privacy & Security > Automation`);
-              }
-              
-              resolve([]);
-              return;
-            }
-          
-            const output = stdout.trim();
-            console.log(`[iMessage] Contact lookup raw output: ${output}`);
-            
-            if (!output || output === "" || output === "{}") {
-              console.log(`[iMessage] No contacts found for "${name}"`);
-              resolve([]);
-              return;
-            }
-            
-            // Parse the output - new format: "Name|label:number,label:number,;Name2|label:number,;"
-            const contacts = [];
-            // Split by semicolon to get individual contacts
-            const entries = output.split(";").filter(e => e.trim());
-            
-            for (const entry of entries) {
-              const parts = entry.trim().split("|");
-              if (parts.length >= 2) {
-                const contactName = parts[0].trim();
-                const phonesStr = parts.slice(1).join("|");
-                
-                // Extract phone numbers - format: "label:number,"
-                const phones = [];
-                const phoneMatches = phonesStr.match(/([^:,]+):([^,]+)/g) || [];
-                for (const pm of phoneMatches) {
-                  const colonIdx = pm.indexOf(":");
-                  if (colonIdx > -1) {
-                    const label = pm.substring(0, colonIdx).trim();
-                    const number = pm.substring(colonIdx + 1).trim();
-                    if (number) {
-                      phones.push({
-                        label: label || "phone",
-                        number: number
-                      });
-                    }
-                  }
-                }
-                
-                // Also try to extract any remaining phone numbers
-                const extraPhones = phonesStr.match(/\+?\d[\d\s()-]{6,}/g) || [];
-                for (const phone of extraPhones) {
-                  const cleanPhone = phone.replace(/[\s()-]/g, "");
-                  if (!phones.some(p => p.number.replace(/[\s()-]/g, "") === cleanPhone)) {
-                    phones.push({ label: "phone", number: cleanPhone });
-                  }
-                }
-                
-                if (phones.length > 0) {
-                  contacts.push({ name: contactName, phones });
-                }
-              }
-            }
-            
-            console.log(`[iMessage] Found ${contacts.length} contacts:`, JSON.stringify(contacts));
-            resolve(contacts);
-          });
-        });
-      });
-    };
-    
-    // Legacy helper for backward compatibility
-    const findPhoneByName = async (name) => {
-      const contacts = await findContactsByName(name);
-      if (contacts.length > 0) {
-        // Return first phone number of first contact
-        return contacts.flatMap(c => c.phones.map(p => p.number));
-      }
-      return [];
-    };
-
-    try {
-      switch (toolName) {
-        case "get_recent_messages": {
-          const hours = toolInput.hours || 24;
-          const contactFilter = toolInput.contact || null;
-          const limit = toolInput.limit || 50;
-
-          const cutoffDate = new Date();
-          cutoffDate.setHours(cutoffDate.getHours() - hours);
-          const appleEpoch = new Date("2001-01-01T00:00:00Z").getTime();
-          const cutoffTimestamp = (cutoffDate.getTime() - appleEpoch) * 1000000;
-
-          let whereClause = `m.date > ${cutoffTimestamp}`;
-          
-          // If contact filter provided, try to resolve it to phone numbers
-          let contactPhones = [];
-          if (contactFilter) {
-            // Check if it's a name (contains letters) or a phone number
-            if (/[a-zA-Z]/.test(contactFilter)) {
-              contactPhones = await findPhoneByName(contactFilter);
-            }
-            
-            if (contactPhones.length > 0) {
-              // Match any of the found phone numbers
-              const phoneConditions = contactPhones.map(phone => {
-                const digits = phone.replace(/\D/g, "");
-                return `h.id LIKE '%${digits.slice(-10)}%'`;
-              }).join(" OR ");
-              whereClause += ` AND (${phoneConditions})`;
-            } else {
-              // Fall back to direct matching
-              const cleanContact = contactFilter.replace(/'/g, "''").replace(/\D/g, "");
-              whereClause += ` AND (h.id LIKE '%${cleanContact}%' OR h.id LIKE '%${contactFilter.replace(/'/g, "''")}%')`;
-            }
-          }
-
-          const query = `SELECT m.text, m.is_from_me, datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date, h.id as contact FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID WHERE ${whereClause} ORDER BY m.date DESC LIMIT ${limit};`;
-
-          return new Promise((resolve) => {
-            exec(`sqlite3 -json "${dbPath}" "${query.replace(/"/g, '\\"')}"`, { maxBuffer: 10 * 1024 * 1024 }, async (error, stdout) => {
-              if (error) {
-                resolve({ error: `Query failed: ${error.message}` });
-                return;
-              }
-              try {
-                const rows = stdout.trim() ? JSON.parse(stdout) : [];
-                
-                // Get unique contact identifiers and resolve names
-                const contactIds = rows.filter(r => !r.is_from_me && r.contact).map(r => r.contact);
-                const contactNames = await lookupContactNames(contactIds);
-                
-                const messages = rows.map(row => {
-                  const contactName = row.contact ? contactNames.get(row.contact) : null;
-                  return {
-                    text: row.text || "(attachment)",
-                    from: row.is_from_me ? "Me" : (contactName || row.contact || "Unknown"),
-                    phone: row.is_from_me ? null : row.contact,
-                    date: row.date,
-                    direction: row.is_from_me ? "sent" : "received"
-                  };
-                });
-                resolve({ messages, count: messages.length });
-              } catch (e) {
-                resolve({ error: "Failed to parse results: " + e.message });
-              }
-            });
-          });
-        }
-
-        case "search_messages": {
-          const searchQuery = toolInput.query.replace(/'/g, "''");
-          const contactFilter = toolInput.contact || null;
-          const limit = toolInput.limit || 20;
-
-          let whereClause = `m.text LIKE '%${searchQuery}%'`;
-          
-          // Handle contact filter
-          if (contactFilter) {
-            let contactPhones = [];
-            if (/[a-zA-Z]/.test(contactFilter)) {
-              contactPhones = await findPhoneByName(contactFilter);
-            }
-            
-            if (contactPhones.length > 0) {
-              const phoneConditions = contactPhones.map(phone => {
-                const digits = phone.replace(/\D/g, "");
-                return `h.id LIKE '%${digits.slice(-10)}%'`;
-              }).join(" OR ");
-              whereClause += ` AND (${phoneConditions})`;
-            } else {
-              const cleanContact = contactFilter.replace(/'/g, "''").replace(/\D/g, "");
-              whereClause += ` AND (h.id LIKE '%${cleanContact}%')`;
-            }
-          }
-
-          const query = `SELECT m.text, m.is_from_me, datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date, h.id as contact FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID WHERE ${whereClause} ORDER BY m.date DESC LIMIT ${limit};`;
-
-          return new Promise((resolve) => {
-            exec(`sqlite3 -json "${dbPath}" "${query.replace(/"/g, '\\"')}"`, { maxBuffer: 10 * 1024 * 1024 }, async (error, stdout) => {
-              if (error) {
-                resolve({ error: `Search failed: ${error.message}` });
-                return;
-              }
-              try {
-                const rows = stdout.trim() ? JSON.parse(stdout) : [];
-                
-                // Resolve contact names
-                const contactIds = rows.filter(r => !r.is_from_me && r.contact).map(r => r.contact);
-                const contactNames = await lookupContactNames(contactIds);
-                
-                const messages = rows.map(row => {
-                  const contactName = row.contact ? contactNames.get(row.contact) : null;
-                  return {
-                    text: row.text,
-                    from: row.is_from_me ? "Me" : (contactName || row.contact || "Unknown"),
-                    phone: row.is_from_me ? null : row.contact,
-                    date: row.date,
-                    direction: row.is_from_me ? "sent" : "received"
-                  };
-                });
-                resolve({ messages, count: messages.length, searchQuery: toolInput.query });
-              } catch (e) {
-                resolve({ error: "Failed to parse results: " + e.message });
-              }
-            });
-          });
-        }
-
-        case "lookup_contact": {
-          const { name } = toolInput;
-          console.log(`[iMessage] lookup_contact called for: ${name}`);
-          
-          const contacts = await findContactsByName(name);
-          
-          if (contacts.length === 0) {
-            return { 
-              found: false, 
-              message: `No contacts found matching "${name}"`,
-              suggestion: "Try a different spelling or partial name"
-            };
-          }
-          
-          return {
-            found: true,
-            searchedFor: name,
-            contacts: contacts.map(c => ({
-              name: c.name,
-              phones: c.phones
-            })),
-            hint: "Use the phone number to send a message with send_imessage"
-          };
-        }
-
-        case "send_imessage": {
-          let { recipient, message } = toolInput;
-          const originalRecipient = recipient;
-          
-          console.log(`[iMessage] send_imessage called - recipient: ${recipient}, message: ${message}`);
-
-          // If recipient looks like a name (has letters and no @ or +), try to find their phone number
-          if (/[a-zA-Z]/.test(recipient) && !/[@+]/.test(recipient)) {
-            console.log(`[iMessage] Recipient looks like a name, looking up contact...`);
-            const contacts = await findContactsByName(recipient);
-            
-            if (contacts.length > 0 && contacts[0].phones.length > 0) {
-              // Use the first phone number found (prefer mobile)
-              const mobilePhone = contacts[0].phones.find(p => 
-                p.label.toLowerCase().includes('mobile') || 
-                p.label.toLowerCase().includes('iphone') ||
-                p.label.toLowerCase().includes('cell')
-              );
-              recipient = mobilePhone ? mobilePhone.number : contacts[0].phones[0].number;
-              console.log(`[iMessage] Resolved "${originalRecipient}" to ${recipient} (${contacts[0].name})`);
-            } else {
-              console.log(`[iMessage] Could not find phone number for "${recipient}"`);
-              return { 
-                error: `Could not find a phone number for "${recipient}". Please use lookup_contact first to find their number.`,
-                suggestion: "Try using lookup_contact to find the correct contact and phone number"
-              };
-            }
-          }
-
-          // Clean up phone number - remove spaces, dashes, parentheses
-          if (/^\+?\d/.test(recipient)) {
-            recipient = recipient.replace(/[\s()-]/g, "");
-          }
-
-          return new Promise((resolve) => {
-            const escapedMessage = message.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-            const escapedRecipient = recipient.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-
-            // Try multiple approaches for sending
-            const appleScript = `
-              tell application "Messages"
-                -- Try to find existing conversation first
-                set targetBuddy to null
-                try
-                  set targetService to 1st service whose service type = iMessage
-                  set targetBuddy to buddy "${escapedRecipient}" of targetService
-                on error
-                  -- Try SMS service if iMessage fails
-                  try
-                    set targetService to 1st service whose service type = SMS
-                    set targetBuddy to buddy "${escapedRecipient}" of targetService
-                  end try
-                end try
-                
-                if targetBuddy is not null then
-                  send "${escapedMessage}" to targetBuddy
-                  return "sent"
-                else
-                  return "no buddy found"
-                end if
-              end tell
-            `;
-
-            exec(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, { timeout: 15000 }, async (error, stdout) => {
-              if (error) {
-                console.error(`[iMessage] Send failed: ${error.message}`);
-                resolve({ error: `Failed to send message: ${error.message}` });
-              } else if (stdout.trim() === "no buddy found") {
-                resolve({ error: `Could not find a conversation with "${recipient}". They may not be in your Messages contacts.` });
-              } else {
-                console.log(`[iMessage] Message sent successfully to ${recipient}`);
-                
-                // Capture the chat_id for this conversation so we can track replies in THIS thread only
-                const chatId = await getIMessageChatId(recipient);
-                if (chatId) {
-                  console.log(`[iMessage] Captured chat_id ${chatId} for conversation with ${recipient}`);
-                }
-                
-                resolve({ 
-                  success: true, 
-                  message: `Message sent to ${originalRecipient}${originalRecipient !== recipient ? ` (${recipient})` : ""}`,
-                  sentTo: recipient,
-                  chatId: chatId  // Include chat_id for thread-specific reply tracking
-                });
-              }
-            });
-          });
-        }
-
-        default:
-          return { error: `Unknown tool: ${toolName}` };
-      }
-    } catch (err) {
-      return { error: err.message };
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Full Task Executor (with access to all tools)
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  setTaskExecutor(async (taskId) => {
-    console.log(`[Tasks] Executing step for task: ${taskId}`);
-    
-    const task = await getTask(taskId, currentUser?.username);
-    if (!task) {
-      console.error(`[Tasks] Task ${taskId} not found`);
-      return { error: "Task not found" };
-    }
-
-    // Skip if task is not in an executable state
-    if (task.status !== "active" && task.status !== "waiting") {
-      console.log(`[Tasks] Task ${taskId} is not in executable state: ${task.status}`);
-      return { skipped: true, reason: `Task status is ${task.status}` };
-    }
-
-    // Get settings for API keys
-    const settingsPath = await getSettingsPath(currentUser?.username);
-    let apiKeys = {};
-    try {
-      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
-      apiKeys = settings.apiKeys || {};
-    } catch {
-      console.error("[Tasks] No API keys configured");
-      await updateTask(taskId, {
-        status: "failed",
-        logEntry: "No API keys configured"
-      }, currentUser?.username);
-      return { error: "No API keys configured" };
-    }
-
-    if (!apiKeys.anthropic) {
-      await updateTask(taskId, {
-        status: "failed",
-        logEntry: "Anthropic API key required for task execution"
-      }, currentUser?.username);
-      return { error: "Anthropic API key required" };
-    }
-
-    // ────────────────────────────────────────────────────────────────────────────
-    // WAIT_FOR_REPLY FOLLOW-UP MODE - When needs_followup is set
-    // ────────────────────────────────────────────────────────────────────────────
-    
-    if (task.contextMemory?.needs_followup && task.contextMemory?.wait_for_reply_active) {
-      console.log(`[Tasks] Handling wait_for_reply follow-up for task ${taskId}`);
-      
-      const ctx = task.contextMemory;
-      const isTimeout = ctx.followup_is_timeout || false;
-      const currentFollowupCount = ctx.followup_count || 0;
-      
-      try {
-        // Generate the follow-up message using LLM
-        const followupMessage = await generateFollowupMessage({
-          originalRequest: ctx.original_request,
-          previousReply: ctx.last_reply_content || "",
-          reason: ctx.followup_reason || "No specific information provided",
-          followupCount: currentFollowupCount,
-          isTimeout: isTimeout
-        }, apiKeys);
-        
-        console.log(`[Tasks] Generated follow-up message: "${followupMessage.substring(0, 100)}..."`);
-        
-        // Send the follow-up message
-        const sendResult = await sendFollowupMessage({
-          platform: ctx.waiting_via,
-          contact: ctx.waiting_for_contact,
-          message: followupMessage,
-          conversationId: ctx.conversation_id,
-          task: task
-        }, currentUser?.username);
-        
-        if (sendResult.success) {
-          console.log(`[Tasks] Follow-up sent successfully to ${ctx.waiting_for_contact}`);
-          
-          // Update task - clear needs_followup, update timing, increment counter
-          const pollIntervalMs = (ctx.poll_interval_minutes || 5) * 60000;
-          await updateTask(taskId, {
-            status: "waiting",
-            nextCheck: Date.now() + pollIntervalMs,
-            contextMemory: {
-              ...ctx,
-              needs_followup: false,
-              followup_is_timeout: false,
-              followup_count: currentFollowupCount + 1,
-              last_followup_time: new Date().toISOString(),
-              last_followup_message: followupMessage
-            },
-            logEntry: `Sent follow-up #${currentFollowupCount + 1} to ${ctx.waiting_for_contact}: "${followupMessage.substring(0, 100)}..."`
-          }, currentUser?.username);
-          
-          // Notify user
-          if (mainWindow && !task.notificationsDisabled) {
-            mainWindow.webContents.send("chat:newMessage", {
-              role: "assistant",
-              content: `📨 **Task: ${task.title}**\n\nSent follow-up #${currentFollowupCount + 1} to ${ctx.waiting_for_contact} via ${ctx.waiting_via}:\n\n> ${followupMessage}\n\nContinuing to wait for reply...`,
-              source: "task"
-            });
-          }
-          
-          return { success: true, action: "followup_sent", contact: ctx.waiting_for_contact };
-        } else {
-          console.error(`[Tasks] Failed to send follow-up: ${sendResult.error}`);
-          
-          await updateTask(taskId, {
-            contextMemory: {
-              ...ctx,
-              needs_followup: false,
-              followup_send_error: sendResult.error
-            },
-            logEntry: `Failed to send follow-up: ${sendResult.error}`
-          }, currentUser?.username);
-          
-          return { error: sendResult.error };
-        }
-        
-      } catch (err) {
-        console.error(`[Tasks] Error handling follow-up: ${err.message}`);
-        await updateTask(taskId, {
-          contextMemory: {
-            ...task.contextMemory,
-            needs_followup: false,
-            followup_error: err.message
-          },
-          logEntry: `Error handling follow-up: ${err.message}`
-        }, currentUser?.username);
-        return { error: err.message };
-      }
-    }
-
-    // ────────────────────────────────────────────────────────────────────────────
-    // DIRECT EXECUTION MODE - When structured plan with tool calls is available
-    // ────────────────────────────────────────────────────────────────────────────
-    
-    if (task.structuredPlan && task.structuredPlan.length > 0 && task.structuredPlan[0].tool) {
-      console.log(`[Tasks] Using DIRECT EXECUTION mode for task ${taskId}`);
-      console.log(`[Tasks] Structured plan has ${task.structuredPlan.length} steps`);
-      
-      // Use shared tool builder - ensures tasks have same tools as chat
-      const { tools: directExecTools, executeTool: directExecExecuteTool } = await loadIntegrationsAndBuildTools({
-        includeProfileTools: false,
-        includeTaskTools: false,
-        includeMemoryTools: false
-      });
-      
-      const toolsByName = {};
-      for (const t of directExecTools) {
-        toolsByName[t.name] = t;
-      }
-      
-      const results = {};
-      let lastResult = null;
-      let lastScreenshot = null;
-      
-      try {
-        // Determine which step to resume from (skip already-completed steps)
-        const resumeFromStep = task.currentStep?.step || 1;
-        const isResuming = resumeFromStep > 1;
-        if (isResuming) {
-          console.log(`[Tasks] Resuming direct execution from step ${resumeFromStep}`);
-        }
-        
-        // Execute each step in the structured plan
-        for (const planStep of task.structuredPlan) {
-          const { step_id, tool, args, output_var, description } = planStep;
-          
-          // Skip already-completed steps when resuming
-          if (step_id < resumeFromStep) {
-            console.log(`[Tasks] Skipping already-completed step ${step_id}`);
-            continue;
-          }
-          
-          console.log(`[Tasks] Direct exec step ${step_id}: [${tool}] ${description}`);
-          
-          // Log step to task
-          await updateTask(taskId, {
-            currentStep: { step: step_id, description, state: "executing" },
-            logEntry: `Executing step ${step_id}: ${description}`
-          }, currentUser?.username);
-          
-          // Skip internal control tools for tasks (they don't make sense in direct mode)
-          if (tool === "complete_task" || tool === "goto_step" || tool === "update_task_state") {
-            console.log(`[Tasks] Skipping control tool: ${tool}`);
-            continue;
-          }
-          
-          // Check if tool exists
-          if (!toolsByName[tool]) {
-            console.log(`[Tasks] Unknown tool: ${tool}, skipping step`);
-            results[`step_${step_id}`] = { error: `Unknown tool: ${tool}` };
-            continue;
-          }
-          
-          // Substitute variables from previous results
-          let resolvedArgs = { ...args };
-          if (args) {
-            const argsStr = JSON.stringify(args);
-            const substituted = argsStr.replace(/\{\{step_(\d+)\.(\w+)\}\}/g, (match, stepNum, field) => {
-              const prevResult = results[`step_${stepNum}`];
-              if (prevResult && prevResult[field] !== undefined) {
-                const value = prevResult[field];
-                // Handle arrays and objects by stringifying them nicely
-                if (Array.isArray(value)) {
-                  // For message arrays, format them readably
-                  if (value.length > 0 && typeof value[0] === 'object') {
-                    return value.map(item => {
-                      if (item.text && item.from && item.date) {
-                        // Format message objects
-                        return `[${item.date}] ${item.from}: ${item.text}`;
-                      }
-                      return JSON.stringify(item);
-                    }).join('\\n');
-                  }
-                  return value.join(', ');
-                } else if (typeof value === 'object' && value !== null) {
-                  return JSON.stringify(value);
-                }
-                return String(value);
-              }
-              // Try common field name variations (messages vs recent_messages, etc.)
-              // This handles LLM generating templates with slightly different field names
-              const fieldVariations = {
-                'recent_messages': 'messages',
-                'imessages': 'messages',
-                'slack_messages': 'messages',
-                'email_messages': 'messages',
-                'telegram_messages': 'messages',
-                'discord_messages': 'messages',
-                'text_messages': 'messages',
-                'sms_messages': 'messages',
-                'messages': 'recent_messages',
-                'formatted_messages': 'formatted',
-                'formatted': 'formatted_messages',
-                'result': 'message',
-                'message': 'result',
-                'content': 'text',
-                'text': 'content',
-                'body': 'text',
-                'data': 'result'
-              };
-              
-              // Helper to format value for string substitution
-              const formatValueForSubstitution = (value) => {
-                if (Array.isArray(value)) {
-                  if (value.length > 0 && typeof value[0] === 'object') {
-                    return value.map(item => {
-                      if (item.text && item.from && item.date) {
-                        return `[${item.date}] ${item.from}: ${item.text}`;
-                      }
-                      return JSON.stringify(item);
-                    }).join('\\n');
-                  }
-                  return value.join(', ');
-                } else if (typeof value === 'object' && value !== null) {
-                  return JSON.stringify(value);
-                }
-                return String(value);
-              };
-              
-              // Try direct variation mapping first
-              if (prevResult && fieldVariations[field] && prevResult[fieldVariations[field]] !== undefined) {
-                const value = prevResult[fieldVariations[field]];
-                console.log(`[Tasks] Using field variation: ${field} -> ${fieldVariations[field]}`);
-                return formatValueForSubstitution(value);
-              }
-              
-              // Fallback: if field ends with "_messages" or "messages", try just "messages"
-              if (prevResult && (field.endsWith('_messages') || field.endsWith('messages')) && prevResult.messages !== undefined) {
-                console.log(`[Tasks] Using fallback: ${field} -> messages`);
-                return formatValueForSubstitution(prevResult.messages);
-              }
-              
-              // Last resort: try the first array field in the result
-              if (prevResult) {
-                const arrayField = Object.entries(prevResult).find(([k, v]) => Array.isArray(v));
-                if (arrayField) {
-                  console.log(`[Tasks] Using first array field: ${field} -> ${arrayField[0]}`);
-                  return formatValueForSubstitution(arrayField[1]);
-                }
-              }
-
-              // Generic fallback for ANY unknown field name (like custom output_var names)
-              // Try standard output fields that tools typically return
-              if (prevResult) {
-                const standardFields = ['formatted', 'result', 'analysis', 'message', 'data', 'output', 'content', 'text'];
-                for (const tryField of standardFields) {
-                  if (prevResult[tryField] !== undefined) {
-                    console.log(`[Tasks] Using standard field fallback: ${field} -> ${tryField} (custom output_var not found)`);
-                    return formatValueForSubstitution(prevResult[tryField]);
-                  }
-                }
-              }
-
-              console.log(`[Tasks] Template variable not found: step_${stepNum}.${field}, available:`, prevResult ? Object.keys(prevResult) : 'no result');
-              return match;
-            });
-            try {
-              resolvedArgs = JSON.parse(substituted);
-            } catch (e) {
-              console.log(`[Tasks] Failed to parse substituted args: ${e.message}`);
-              console.log(`[Tasks] Substituted string was: ${substituted.slice(0, 500)}`);
-            }
-          }
-          
-          console.log(`[Tasks] Direct exec tool ${tool} with args:`, JSON.stringify(resolvedArgs).slice(0, 200));
-          
-          // Execute the tool
-          const taskContext = { 
-            taskId, 
-            autoSend: task.autoSend || false,
-            contextMemory: task.contextMemory || {}
-          };
-          
-          const toolResult = await directExecExecuteTool(tool, resolvedArgs, taskContext);
-          
-          // Store result
-          if (output_var) {
-            results[output_var] = toolResult;
-          }
-          results[`step_${step_id}`] = toolResult;
-          lastResult = toolResult;
-          
-          // Capture screenshot if browser tool returned one
-          if (toolResult && toolResult.screenshot) {
-            lastScreenshot = toolResult.screenshot;
-          }
-          
-          // Capture conversation_id from ANY messaging tool for later use by wait_for_reply
-          // Each platform returns its own identifier: threadId (email), chatId (iMessage), channel (Slack), chat_id (Telegram), channel_id (Discord)
-          const conversationIdFromResult = toolResult?.threadId || toolResult?.chatId || toolResult?.channel || toolResult?.chat_id || toolResult?.channel_id;
-          const isMessagingTool = ["send_email", "send_imessage", "send_slack_message", "send_telegram_message", "send_discord_message"].includes(tool);
-          
-          // Debug logging for messaging tools
-          if (isMessagingTool) {
-            console.log(`[Tasks] DEBUG: ${tool} result:`, JSON.stringify(toolResult).slice(0, 300));
-            console.log(`[Tasks] DEBUG: conversationIdFromResult = ${conversationIdFromResult}`);
-          }
-          
-          if (toolResult && conversationIdFromResult && isMessagingTool) {
-            console.log(`[Tasks] Captured conversation_id from ${tool}: ${conversationIdFromResult}`);
-            task.contextMemory = {
-              ...task.contextMemory,
-              conversation_id: conversationIdFromResult,
-              // Also store platform-specific fields for debugging
-              [`last_${tool.replace('send_', '')}_conversation_id`]: conversationIdFromResult,
-              last_message_id: toolResult.messageId || toolResult.message_id,
-              // Store original subject for email threading (strip "Re: " prefix if present)
-              ...(tool === 'send_email' && resolvedArgs?.subject ? { 
-                original_subject: resolvedArgs.subject.replace(/^Re:\s*/i, '') 
-              } : {})
-            };
-            // Persist to database immediately so it's available for wait_for_reply
-            await updateTask(taskId, {
-              contextMemory: task.contextMemory
-            }, currentUser?.username);
-          }
-          
-          // Handle special tool results
-          if (toolResult && toolResult.pending) {
-            console.log(`[Tasks] Message pending approval in task ${taskId}`);
-            return { success: true, pendingMessage: true, message: toolResult.message };
-          }
-          
-          if (toolResult && toolResult.action === "wait_for_user_input") {
-            console.log(`[Tasks] Task ${taskId} waiting for user input: ${toolResult.question}`);
-            await updateTask(taskId, {
-              status: "waiting_for_input",
-              contextMemory: {
-                ...task.contextMemory,
-                pendingClarification: toolResult.question,
-                clarificationTimestamp: new Date().toISOString(),
-                saveResponseAs: toolResult.save_response_as || null
-              },
-              logEntry: `Asked user: "${toolResult.question}" - waiting for response`
-            }, currentUser?.username);
-            return { success: true, waitingForInput: true, question: toolResult.question };
-          }
-          
-          // Handle wait_for_reply action - sets up polling for message replies
-          if (toolResult && toolResult.action === "wait_for_reply") {
-            const pollIntervalMs = (toolResult.poll_interval_minutes || 5) * 60000;
-            
-            // Helper to check if a value is an unresolved template
-            const isUnresolvedTemplate = (val) => 
-              typeof val === 'string' && val.startsWith('{{') && val.endsWith('}}');
-            
-            // Check if conversation_id is an unresolved template variable (e.g., "{{step_1.threadId}}")
-            // If so, fall back to the captured value in contextMemory (also checking if THAT is valid)
-            let effectiveConversationId = toolResult.conversation_id;
-            
-            if (!effectiveConversationId || isUnresolvedTemplate(effectiveConversationId)) {
-              // Fall back to contextMemory, but ONLY if contextMemory value is also valid
-              const ctxConvId = task.contextMemory?.conversation_id;
-              if (ctxConvId && !isUnresolvedTemplate(ctxConvId)) {
-                effectiveConversationId = ctxConvId;
-                console.log(`[Tasks] conversation_id "${toolResult.conversation_id}" not valid, using captured value: ${effectiveConversationId}`);
-              } else {
-                // Both are invalid - use null (will match any message from contact)
-                effectiveConversationId = null;
-                console.log(`[Tasks] No valid conversation_id available (from tool: "${toolResult.conversation_id}", from context: "${ctxConvId}") - will match any message from contact`);
-              }
-            }
-            
-            console.log(`[Tasks] Task ${taskId} waiting for reply from ${toolResult.contact} via ${toolResult.platform}`);
-            console.log(`[Tasks] Poll interval: ${pollIntervalMs}ms, Followup after: ${toolResult.followup_after_hours}h, Max: ${toolResult.max_followups}`);
-            console.log(`[Tasks] Using conversation_id: ${effectiveConversationId || '(none - will match any email from contact)'}`);
-            
-            
-            await updateTask(taskId, {
-              status: "waiting",
-              nextCheck: Date.now() + pollIntervalMs,
-              currentStep: { 
-                step: step_id, 
-                description: `Waiting for reply from ${toolResult.contact}`,
-                state: "waiting" 
-              },
-              contextMemory: {
-                ...task.contextMemory,
-                // Core wait_for_reply context
-                wait_for_reply_active: true,
-                waiting_via: toolResult.platform,
-                waiting_for_contact: toolResult.contact,
-                original_request: toolResult.original_request,
-                success_criteria: toolResult.success_criteria,
-                conversation_id: effectiveConversationId,
-                // Timing
-                first_message_time: task.contextMemory?.first_message_time || new Date().toISOString(),
-                last_message_time: new Date().toISOString(),
-                poll_interval_minutes: toolResult.poll_interval_minutes || 5,
-                followup_after_hours: toolResult.followup_after_hours || 24,
-                last_followup_time: null,
-                // Follow-up tracking
-                max_followups: toolResult.max_followups || 3,
-                followup_count: task.contextMemory?.followup_count || 0,
-                // Reply tracking
-                new_reply_detected: false
-              },
-              logEntry: `Waiting for reply from ${toolResult.contact} via ${toolResult.platform} (poll: ${toolResult.poll_interval_minutes || 5}min, followup: ${toolResult.followup_after_hours || 24}h)`
-            }, currentUser?.username);
-            
-            return { success: true, waitingForReply: true, contact: toolResult.contact, platform: toolResult.platform };
-          }
-          
-          // Small delay between browser operations to let pages render
-          if (tool.startsWith("browser_")) {
-            await new Promise(resolve => setTimeout(resolve, 500));
-          }
-        }
-        
-        // All steps completed - mark task as done
-        console.log(`[Tasks] Direct execution completed for task ${taskId}`);
-        
-        await updateTask(taskId, {
-          status: "completed",
-          currentStep: { step: task.structuredPlan.length, state: "completed" },
-          logEntry: `Task completed via direct execution (${task.structuredPlan.length} steps)`
-        }, currentUser?.username);
-        
-        // Notify user
-        if (win && !win.isDestroyed() && !task.notificationsDisabled) {
-          addTaskUpdate(taskId, `✅ Task completed!`, {
-            toChat: true,
-            emoji: "✅",
-            taskTitle: task.title
-          });
-        }
-        
-        return { success: true, completed: true, directExecution: true };
-        
-      } catch (err) {
-        console.error(`[Tasks] Direct execution error for ${taskId}:`, err.message);
-        await updateTask(taskId, {
-          status: "failed",
-          logEntry: `Direct execution failed: ${err.message}`
-        }, currentUser?.username);
-        return { error: err.message };
-      }
-    }
-    
-    // ────────────────────────────────────────────────────────────────────────────
-    // STANDARD LLM-BASED EXECUTION - Fallback when no structured plan
-    // ────────────────────────────────────────────────────────────────────────────
-
-    // Task state management tool (specific to task executor)
-    const taskStateManagementTool = {
-      name: "update_task_state",
-      description: "Update the task state after completing actions. ALWAYS call this at the end of execution to report what happened and set the next state.",
-      input_schema: {
-        type: "object",
-        properties: {
-          logMessage: { type: "string", description: "What happened during this execution (be specific)" },
-          nextStatus: { 
-            type: "string", 
-            enum: ["active", "waiting", "waiting_for_input", "completed", "failed"],
-            description: "active=continue to next step now, waiting=wait for external event (set pollIntervalMs), waiting_for_input=need user clarification (ask in logMessage), completed=all done, failed=error" 
-          },
-          nextStep: { type: "number", description: "The next step number (current step + 1 if advancing)" },
-          pollIntervalMs: { type: "number", description: "If waiting, milliseconds until next check. Use 3600000 for 1 hour, 86400000 for 1 day" },
-          contextUpdates: { type: "object", description: "Key-value pairs to remember for future steps" },
-          notifyUser: { type: "string", description: "Message to show the user in chat (optional)" },
-          clarificationQuestion: { type: "string", description: "If waiting_for_input, the specific question to ask the user" },
-          modifyPlan: { type: "array", items: { type: "string" }, description: "Optional: New steps to replace the remaining plan based on new information" }
-        },
-        required: ["logMessage", "nextStatus"]
-      }
-    };
-
-    // Use shared tool builder - ensures tasks have same tools as chat
-    const { tools: integrationTools, executeTool, googleAccessToken, slackAccessToken, weatherEnabled } = await loadIntegrationsAndBuildTools({
-      includeProfileTools: false,  // Tasks don't need profile tools
-      includeTaskTools: false,     // Tasks don't create other tasks
-      includeMemoryTools: false    // Tasks don't need memory search
-    });
-    
-    // Combine task-specific tool with integration tools
-    const executorTools = [taskStateManagementTool, ...integrationTools];
-
-    // Build system prompt with current date
-    const now = new Date();
-    const currentDateStr = now.toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
-    
-    // Determine messaging channel for this task
-    const taskMessagingChannel = task.messagingChannel || task.contextMemory?.messaging_channel;
-    const channelTools = {
-      imessage: "send_imessage (for text/SMS)",
-      email: "send_email (for email/Gmail)",
-      slack: "send_slack_message (for Slack)",
-      telegram: "send_telegram_message (for Telegram)",
-      discord: "send_discord_message (for Discord)",
-      x: "post_tweet or send_x_dm (for X/Twitter)"
-    };
-    
-    // Check for skill constraints
-    const skillName = task.contextMemory?.skill_name;
-    const skillConstraints = task.contextMemory?.skill_constraints;
-    
-    const systemPrompt = `You are an autonomous Task Executor Agent. You execute tasks step by step on behalf of the user.
-
-CURRENT DATE/TIME: ${currentDateStr} at ${now.toLocaleTimeString()}
-(Use this date for all scheduling - do NOT use dates from old context data)
-
-TASK INFORMATION:
-- Task ID: ${task.id}
-- Title: ${task.title}
-- Original Request: "${task.originalRequest}"
-- Current Step: ${task.currentStep.step} of ${task.plan.length}
-${taskMessagingChannel ? `\n*** MESSAGING CHANNEL: ${taskMessagingChannel.toUpperCase()} ***
-YOU MUST USE: ${channelTools[taskMessagingChannel] || taskMessagingChannel}
-DO NOT USE email if the channel is imessage. DO NOT USE imessage if the channel is email.` : ""}
-${skillName ? `\n*** SKILL: ${skillName} ***
-CONSTRAINTS YOU MUST FOLLOW:
-${skillConstraints ? skillConstraints.split("; ").map(c => `- ${c}`).join("\n") : "None"}` : ""}
-
-PLAN:
-${task.plan.map((step, i) => `${i + 1}. ${step}${i + 1 === task.currentStep.step ? " ← CURRENT STEP" : ""}`).join("\n")}
-
-SAVED CONTEXT:
-${Object.entries(task.contextMemory).map(([k, v]) => `- ${k}: ${v}`).join("\n") || "None yet"}
-
-RECENT LOG:
-${task.executionLog.slice(-3).map(e => `- ${e.message}`).join("\n") || "Task just started"}
-
-INSTRUCTIONS:
-1. Execute the CURRENT STEP using the available tools
-2. ***MANDATORY*** After completing the step's action, you MUST call update_task_state with:
-   - logMessage: A DETAILED summary of what you found/did. This is shown to the user!
-   - nextStatus: "waiting" if waiting for a response, "active" to continue, "completed" if all done
-   - nextStep: current step + 1 if advancing
-   - pollIntervalMs: if waiting (e.g., 60000 = 1 minute)
-   - contextUpdates: Save any important info for later steps
-
-*** YOU MUST ALWAYS CALL update_task_state - DO NOT END WITHOUT IT ***
-
-CRITICAL - User Notifications:
-- The logMessage you provide in update_task_state is shown directly to the user in the chat
-- ALWAYS write logMessage as if speaking to the user: "I sent an email to X asking about Y" or "I found the calendar link in Chris's message: [link]"
-- Include relevant details, quotes from messages, or findings that the user would want to know
-- If you have a question for the user or need their input, include it in the logMessage
-
-CRITICAL - ANALYSIS STEPS (filtering, checking, analyzing):
-- When analyzing emails/messages: Report what you found! "I reviewed 5 emails: 2 were spam (newsletter, promotion), 3 were legitimate (from Alice about project X, from Bob asking about Y, from Carol with meeting request)"
-- When filtering: Explain your decisions! "Filtered out 3 spam emails. Kept 2 that need attention: Email from John about deadline, Email from Sarah requesting feedback"
-- DO NOT just read content and move on - SUMMARIZE your findings for the user
-- Save important findings in contextUpdates for later steps
-
-3. CRITICAL - When SENDING a message and waiting for a reply:
-   - Set contextUpdates.waiting_via = the messaging channel you used:
-     * "email" if you used send_email
-     * "imessage" if you used send_imessage
-     * "slack" if you used send_slack_message
-   - Set contextUpdates.waiting_for_contact = the contact identifier (email address, phone/name, or Slack user)
-   - Set contextUpdates.last_message_time = current ISO date ("${new Date().toISOString()}")
-   - Use pollIntervalMs: 60000 (1 minute) - all lightweight checks are free
-   - Set nextStatus: "waiting" to wait for the reply
-
-4. IMPORTANT - Use the MESSAGING CHANNEL specified above (if any):
-   - If MESSAGING CHANNEL says IMESSAGE → use send_imessage (NEVER send_email or send_slack_message)
-   - If MESSAGING CHANNEL says EMAIL → use send_email (NEVER send_imessage or send_slack_message)
-   - If MESSAGING CHANNEL says SLACK → use send_slack_message (NEVER send_imessage or send_email)
-   - If MESSAGING CHANNEL says TELEGRAM → use send_telegram_message
-   - If MESSAGING CHANNEL says DISCORD → use send_discord_message
-   - If MESSAGING CHANNEL says X → use send_x_dm for DMs or post_tweet for public tweets
-   - Use the SAME channel throughout the entire task - NEVER switch channels
-   - IGNORE any defaults - strictly follow the MESSAGING CHANNEL
-   - CRITICAL: Even if you know the contact on another platform, DO NOT use it. Stay on the specified channel.
-
-5. CRITICAL - REPLY DETECTED: If the SAVED CONTEXT shows "new_reply_detected: true":
-   *** A REPLY HAS BEEN RECEIVED - YOU MUST PROCESS IT NOW ***
-   - First, use list_emails or get_recent_messages to READ the new message content
-   - Process the reply content to determine if it SATISFIES THE CURRENT STEP'S REQUIREMENTS
-   - Clear the reply flag: contextUpdates.new_reply_detected = false
-   - DECISION POINT:
-     a) If the reply SATISFIES the step's requirement (e.g., definitive answer received):
-        → Advance: nextStatus: "active", nextStep = current step + 1
-     b) If the reply DOES NOT satisfy the requirement (e.g., unclear answer, needs follow-up):
-        → STAY on current step: nextStep = current step (same number)
-        → Take the appropriate action (send follow-up, ask for clarification)
-        → Set nextStatus: "waiting" to wait for the next reply
-
-6. CONDITIONAL STEP HANDLING:
-   - Many steps have CONDITIONS that must be met before advancing (e.g., "wait for definitive answer", "until confirmed")
-   - DO NOT advance just because you received a reply - evaluate if the CONDITION is satisfied
-   - Example: Step "Follow up until definitive answer" → if answer is vague, send follow-up and STAY on this step
-   - Example: Step "Wait for confirmation" → if response is "maybe", don't advance, ask for clear yes/no
-   - Save evaluation reasoning in logMessage so user understands why you're staying or advancing
-
-7. AUTO-PROGRESSION: After completing each step that doesn't require waiting:
-   - ONLY advance to next step if the current step's requirement is FULLY SATISFIED
-   - This ensures the task continues immediately without waiting for the scheduler
-   - Only use nextStatus: "waiting" when you need to wait for an external response
-
-7. TASK TYPE HANDLING:
-   ${task.taskType === "continuous" || task.contextMemory?.task_type === "continuous" ? `
-   *** THIS IS A CONTINUOUS/MONITORING TASK ***
-   - Monitoring condition: ${task.contextMemory?.monitoring_condition || "Check context for details"}
-   - Trigger action: ${task.contextMemory?.trigger_action || "Alert user when condition is met"}
-   
-   CONTINUOUS TASK RULES:
-   - This task runs INDEFINITELY - it should NEVER be marked as "completed"
-   - After completing the final step, LOOP BACK to step 1 by setting nextStep: 1
-   - Use nextStatus: "waiting" with pollIntervalMs to wait before the next monitoring cycle
-   - Recommended poll intervals: weather (3600000 = 1 hour), emails (60000 = 1 minute), prices (300000 = 5 min)
-   - ONLY notify user when the monitoring condition is actually triggered (e.g., rain detected, email received)
-   - Keep logMessage brief for routine checks: "Checked weather - no rain expected"
-   ` : `
-   *** THIS IS A DISCRETE TASK ***
-   - Success criteria: ${task.contextMemory?.success_criteria || "Complete all steps in the plan"}
-   
-   DISCRETE TASK RULES:
-   - This task has a clear end goal
-   - EACH STEP may have its own success condition - evaluate before advancing
-   - Common step conditions to watch for:
-     * "until definitive answer" → stay on step until clear answer received
-     * "follow up if not responded" → stay on step if no clear response
-     * "confirm" → stay until explicit confirmation received
-     * "if X then Y" → only advance after condition X is satisfied
-   - Mark as "completed" ONLY when all steps are done AND success criteria is met
-   - The final step should verify the success criteria before marking complete
-   `}
-
-8. CREDENTIAL SECURITY (CRITICAL):
-   - NEVER include actual passwords or credentials in logMessage or any output
-   - When using browser automation to log into websites, use secure placeholders:
-     * Username: {{credential:domain.com:username}}
-     * Password: {{credential:domain.com:password}}
-   - The actual credentials are injected locally and NEVER pass through this task log
-   - If login fails, inform user to check their credentials in the Credentials page
-   - NEVER ask users for their password or store passwords in task context
-
-9. MID-TASK CLARIFICATION:
-   - If a step cannot be completed without user input, use nextStatus: "waiting_for_input"
-   - Set clarificationQuestion to the SPECIFIC question you need answered
-   - Examples: "Which Igor do you mean? I found: Igor Petrov (work), Igor Santos (personal)", "Which messaging platform should I use: iMessage, Slack, or email?"
-   - The user will respond in chat, and the task will resume with their answer
-   - After receiving user input, you may need to MODIFY the remaining plan using modifyPlan
-
-10. DYNAMIC PLAN MODIFICATION:
-   - If information learned during execution changes what needs to be done, use modifyPlan
-   - modifyPlan replaces ALL remaining steps from the current step onwards
-   - Example: If step 1 discovers the contact is only on Slack (not iMessage), update remaining steps accordingly
-   - Include clear, actionable step descriptions just like the original plan
-
-IMPORTANT: You MUST call update_task_state before finishing. Always advance to the next step after completing the current one.`;
-
-    // Build user message - make it clear if a reply was received or user provided input
-    const replyDetected = task.contextMemory?.new_reply_detected;
-    const waitingVia = task.contextMemory?.waiting_via;
-    const waitingFor = task.contextMemory?.waiting_for_contact;
-    const userResponse = task.contextMemory?.userResponse;
-    
-    let userPrompt;
-    
-    // Case 1: User just responded to a clarification question
-    if (userResponse) {
-      userPrompt = `📝 USER PROVIDED INPUT IN RESPONSE TO YOUR QUESTION!
-
-The user responded: "${userResponse}"
-
-Your current step is ${task.currentStep.step}: "${task.plan[task.currentStep.step - 1]}"
-
-ACTION REQUIRED:
-1. Use the user's response to continue with the current step
-2. If the response changes what needs to be done, use modifyPlan to update remaining steps
-3. Execute the action(s) needed for this step using the new information
-4. Call update_task_state with:
-   - logMessage describing what you did with the user's input
-   - contextUpdates.userResponse = null (clear the response after using it)
-   - Set nextStatus and nextStep appropriately
-
-IMPORTANT: The user took the time to respond, so make good use of their input!`;
-    }
-    // Case 2: External reply detected (email, slack, etc.)
-    else if (replyDetected && waitingVia && waitingFor) {
-      userPrompt = `🔔 A REPLY HAS BEEN RECEIVED from ${waitingFor} via ${waitingVia}!
-
-Your current step is ${task.currentStep.step}: "${task.plan[task.currentStep.step - 1]}"
-
-ACTION REQUIRED:
-1. First, READ the reply using ${waitingVia === "email" ? "list_emails with from:" + waitingFor : waitingVia === "slack" ? "list_slack_messages" : "get_recent_messages"}
-2. EVALUATE: Does this reply SATISFY the current step's requirements?
-   - If step asks for "definitive answer" - is the answer clear and specific?
-   - If step asks for "confirmation" - did they clearly confirm?
-   - If step asks to "follow up until X" - has X been achieved?
-3. Call update_task_state with:
-   - logMessage describing what they replied AND your evaluation
-   - IF reply SATISFIES step requirement:
-     → nextStatus: "active", nextStep: ${task.currentStep.step + 1}
-   - IF reply DOES NOT satisfy (vague, unclear, needs follow-up):
-     → Send follow-up message
-     → nextStatus: "waiting", nextStep: ${task.currentStep.step} (STAY on same step)
-   - contextUpdates.new_reply_detected = false
-
-IMPORTANT: Only advance if the step's condition is truly met. A reply alone doesn't mean success.`;
-    } 
-    // Case 3: Normal step execution
-    else {
-      userPrompt = `Execute step ${task.currentStep.step}: "${task.plan[task.currentStep.step - 1]}"\n\nDo the action required for this step, then call update_task_state with the results.`;
-    }
-    
-    const messages = [
-      { 
-        role: "user", 
-        content: userPrompt
-      }
-    ];
-
-    try {
-      let currentMessages = [...messages];
-      
-      // Agentic loop - up to 15 iterations (enough for complex multi-step actions)
-      for (let iteration = 0; iteration < 15; iteration++) {
-        console.log(`[Tasks] Executor iteration ${iteration + 1} for task ${taskId}`);
-        
-        const response = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": apiKeys.anthropic,
-            "anthropic-version": "2023-06-01"
-          },
-          body: JSON.stringify({
-            model: "claude-sonnet-4-20250514",
-            max_tokens: 4096,
-            system: systemPrompt,
-            messages: currentMessages,
-            tools: executorTools
-          })
-        });
-
-        if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(`API error: ${errText}`);
-        }
-
-        const result = await response.json();
-        
-        // Check for tool use
-        const toolUseBlocks = result.content.filter(b => b.type === "tool_use");
-        
-        // Log any text content (LLM reasoning) - this helps debug what the LLM is thinking
-        const textContent = result.content.find(b => b.type === "text")?.text || "";
-        if (textContent) {
-          console.log(`[Tasks] LLM reasoning: ${textContent.slice(0, 300)}${textContent.length > 300 ? '...' : ''}`);
-        }
-        
-        if (toolUseBlocks.length === 0) {
-          // No tools called - check if we got a text response
-          console.log(`[Tasks] No tools called, LLM response: ${textContent.slice(0, 200)}`);
-          
-          // If the LLM gave a meaningful response without calling update_task_state,
-          // save it to the execution log so the user can see it
-          if (textContent.length > 10) {
-            await updateTask(taskId, {
-              logEntry: `Analysis: ${textContent.slice(0, 500)}`
-            }, currentUser?.username);
-          }
-          break;
-        }
-
-        // Process tool calls
-        const toolResults = [];
-        
-        for (const toolUse of toolUseBlocks) {
-          console.log(`[Tasks] Tool call: ${toolUse.name}`, JSON.stringify(toolUse.input).slice(0, 200));
-          let toolResult;
-
-          if (toolUse.name === "update_task_state") {
-            // Apply state update
-            const input = toolUse.input;
-            const updates = {
-              status: input.nextStatus,
-              logEntry: input.logMessage
-            };
-
-            if (input.nextStep) {
-              updates.currentStep = {
-                step: input.nextStep,
-                description: task.plan[input.nextStep - 1] || "",
-                state: input.nextStatus,
-                pollInterval: input.pollIntervalMs || null
-              };
-            }
-
-            if (input.pollIntervalMs && input.nextStatus === "waiting") {
-              updates.nextCheck = Date.now() + input.pollIntervalMs;
-            }
-
-            if (input.contextUpdates) {
-              updates.contextMemory = { ...task.contextMemory, ...input.contextUpdates };
-              
-              // Check if the LLM drafted a message ready for approval
-              // This happens when contextUpdates includes ready_for_user_approval: true and drafted_reply
-              if (input.contextUpdates.ready_for_user_approval && input.contextUpdates.drafted_reply) {
-                console.log(`[Tasks] LLM drafted a message ready for approval, creating pendingMessage`);
-                
-                // Determine the platform and recipient from context
-                // IMPORTANT: Use task.messagingChannel as primary source (set at task creation)
-                const platform = task.messagingChannel || input.contextUpdates.messaging_channel || task.contextMemory?.messaging_channel || 'imessage';
-                const recipient = input.contextUpdates.actionable_message_from || task.contextMemory?.actionable_message_from || 'recipient';
-                
-                // Map platform to tool name
-                const platformToTool = {
-                  imessage: 'send_imessage',
-                  email: 'send_email',
-                  slack: 'send_slack_message',
-                  telegram: 'send_telegram_message',
-                  discord: 'send_discord_message',
-                  x: 'send_x_dm'
-                };
-                
-                // Create pending message entry
-                const pendingMessage = {
-                  id: `pending-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-                  toolName: platformToTool[platform] || 'send_imessage',
-                  platform: platform === 'imessage' ? 'iMessage' : platform.charAt(0).toUpperCase() + platform.slice(1),
-                  recipient: recipient,
-                  subject: '',
-                  message: input.contextUpdates.drafted_reply,
-                  created: new Date().toISOString(),
-                  toolInput: JSON.stringify({
-                    recipient: recipient,
-                    message: input.contextUpdates.drafted_reply
-                  })
-                };
-                
-                // Initialize pendingMessages if needed
-                if (!task.pendingMessages) {
-                  task.pendingMessages = [];
-                }
-                
-                // Add to pending messages
-                task.pendingMessages.push(pendingMessage);
-                updates.pendingMessages = task.pendingMessages;
-                updates.status = "waiting_approval";
-                
-                // Clear the context flags so we don't create duplicate pending messages
-                updates.contextMemory.ready_for_user_approval = false;
-                updates.contextMemory.draft_pending_id = pendingMessage.id;
-                
-                console.log(`[Tasks] Created pending message: ${pendingMessage.id} for ${recipient} via ${platform}`);
-                
-                // Notify UI about the pending message
-                if (win && !win.isDestroyed()) {
-                  win.webContents.send('task:pendingMessage', {
-                    taskId,
-                    message: pendingMessage
-                  });
-                }
-              }
-            }
-
-            // Handle plan modification if provided
-            if (input.modifyPlan && Array.isArray(input.modifyPlan) && input.modifyPlan.length > 0) {
-              // Keep steps before current step, replace the rest with new plan
-              const currentStepIndex = task.currentStep.step - 1;
-              const existingSteps = task.plan.slice(0, currentStepIndex);
-              updates.plan = [...existingSteps, ...input.modifyPlan];
-              console.log(`[Tasks] Plan modified: ${existingSteps.length} existing steps + ${input.modifyPlan.length} new steps`);
-            }
-
-            // Handle clarification question
-            if (input.clarificationQuestion && input.nextStatus === "waiting_for_input") {
-              updates.contextMemory = {
-                ...(updates.contextMemory || task.contextMemory),
-                pendingClarification: input.clarificationQuestion,
-                clarificationTimestamp: new Date().toISOString()
-              };
-            }
-
-            await updateTask(taskId, updates, currentUser?.username);
-
-            // NOTIFICATIONS - Only alert on final states (completed, failed) unless disabled
-            console.log(`[Tasks] Notification check: win=${!!win}, status=${input.nextStatus}, notificationsDisabled=${task.notificationsDisabled}`);
-            
-            // Check if notifications are disabled for this task
-            if (win && !task.notificationsDisabled) {
-              let notificationMessage = null;
-              let notificationEmoji = "📋";
-              
-              // Only send chat notifications for FINAL states
-              if (input.nextStatus === "completed") {
-                notificationEmoji = "✅";
-                notificationMessage = `Task completed!\n\n${input.logMessage}`;
-              }
-              else if (input.nextStatus === "failed") {
-                notificationEmoji = "❌";
-                notificationMessage = `Task failed: ${input.logMessage}`;
-              }
-              // Waiting for user input still needs notification (user action required)
-              else if (input.nextStatus === "waiting_for_input") {
-                notificationEmoji = "❓";
-                const question = input.clarificationQuestion || "I need more information to continue.";
-                notificationMessage = `${input.logMessage}\n\n**Question:** ${question}\n\nPlease reply in the chat to continue the task.`;
-              }
-              // Waiting for user approval still needs notification (user action required)
-              else if (input.nextStatus === "waiting_approval" || updates.status === "waiting_approval") {
-                notificationEmoji = "📨";
-                const recipient = input.contextUpdates?.actionable_message_from || task.contextMemory?.actionable_message_from || "contact";
-                notificationMessage = `${input.logMessage}\n\n**Action Required:** I've drafted a reply to ${recipient}. Please review and approve or edit the message in the Tasks panel.`;
-              }
-              
-              // Send notification to chat only for important states
-              if (notificationMessage) {
-                console.log(`[Tasks] Notification message: ${notificationMessage.slice(0, 50)}...`);
-                addTaskUpdate(taskId, notificationMessage);
-                win.webContents.send("chat:newMessage", {
-                  role: "assistant",
-                  content: `${notificationEmoji} **Task: ${task.title}**\n\n${notificationMessage}`,
-                  source: "task"
-                });
-                console.log(`[Tasks] Notification SENT to chat`);
-              } else {
-                // Still log the update for the task panel, just don't send to chat
-                if (input.logMessage) {
-                  addTaskUpdate(taskId, input.logMessage);
-                }
-              }
-            } else if (win && task.notificationsDisabled && input.logMessage) {
-              // Notifications disabled but still add to task panel log
-              addTaskUpdate(taskId, input.logMessage);
-              console.log(`[Tasks] Notification SKIPPED - notifications disabled for task`);
-            } else {
-              console.log(`[Tasks] Notification SKIPPED - no window`);
-            }
-
-            console.log(`[Tasks] Task ${taskId} state updated: status=${input.nextStatus}, step=${input.nextStep || task.currentStep.step}`);
-            toolResult = { success: true, message: "Task state updated" };
-            
-            // If status is "active", immediately continue to next step (don't wait for scheduler)
-            if (input.nextStatus === "active" && input.nextStep && input.nextStep <= task.plan.length) {
-              console.log(`[Tasks] Auto-continuing to step ${input.nextStep} for task ${taskId}`);
-              // Schedule immediate continuation (use setTimeout to avoid deep recursion)
-              setTimeout(() => executeTaskStep(taskId, currentUser?.username), 100);
-            }
-            
-            // State was updated, we can exit the loop
-            return { success: true, stateUpdate: input };
-            
-          } else {
-            // Use shared tool executor for all other tools
-            // Pass task context so message confirmations can be stored in the task
-            const taskContext = { 
-              taskId, 
-              autoSend: task.autoSend || false,
-              contextMemory: task.contextMemory || {}  // Include for name lookups in message previews
-            };
-            toolResult = await executeTool(toolUse.name, toolUse.input, taskContext);
-            
-            // Capture conversation_id from ANY messaging tool for later use by wait_for_reply
-            const conversationIdFromResult = toolResult?.threadId || toolResult?.chatId || toolResult?.channel || toolResult?.chat_id || toolResult?.channel_id;
-            const isMessagingTool = ["send_email", "send_imessage", "send_slack_message", "send_telegram_message", "send_discord_message"].includes(toolUse.name);
-            
-            if (toolResult && conversationIdFromResult && isMessagingTool) {
-              console.log(`[Tasks] Captured conversation_id from ${toolUse.name}: ${conversationIdFromResult}`);
-              task.contextMemory = {
-                ...task.contextMemory,
-                conversation_id: conversationIdFromResult,
-                [`last_${toolUse.name.replace('send_', '')}_conversation_id`]: conversationIdFromResult,
-                last_message_id: toolResult.messageId || toolResult.message_id,
-                // Store original subject for email threading (strip "Re: " prefix if present)
-                ...(toolUse.name === 'send_email' && toolUse.input?.subject ? { 
-                  original_subject: toolUse.input.subject.replace(/^Re:\s*/i, '') 
-                } : {})
-              };
-              await updateTask(taskId, {
-                contextMemory: task.contextMemory
-              }, currentUser?.username);
-            }
-            
-            // If a message is pending approval, update task status and return
-            if (toolResult && toolResult.pending) {
-              console.log(`[Tasks] Message pending approval in task ${taskId}`);
-              return { success: true, pendingMessage: true, message: toolResult.message };
-            }
-            
-            // Handle special actions from task primitive tools
-            if (toolResult && toolResult.action === "wait_for_user_input") {
-              // Tool asked a question and wants to wait for user response
-              console.log(`[Tasks] Task ${taskId} waiting for user input: ${toolResult.question}`);
-              
-              await updateTask(taskId, {
-                status: "waiting_for_input",
-                contextMemory: {
-                  ...task.contextMemory,
-                  pendingClarification: toolResult.question,
-                  clarificationTimestamp: new Date().toISOString(),
-                  saveResponseAs: toolResult.save_response_as || null
-                },
-                logEntry: `Asked user: "${toolResult.question}" - waiting for response`
-              }, currentUser?.username);
-              
-              return { success: true, waitingForInput: true, question: toolResult.question };
-            }
-            
-            // Handle wait_for_reply action - sets up polling for message replies
-            if (toolResult && toolResult.action === "wait_for_reply") {
-              const pollIntervalMs = (toolResult.poll_interval_minutes || 5) * 60000;
-              
-              // Helper to check if a value is an unresolved template
-              const isUnresolvedTemplate = (val) => 
-                typeof val === 'string' && val.startsWith('{{') && val.endsWith('}}');
-              
-              // Check if conversation_id is an unresolved template variable (e.g., "{{step_1.threadId}}")
-              // If so, fall back to the captured value in contextMemory (also checking if THAT is valid)
-              let effectiveConversationId = toolResult.conversation_id;
-              
-              if (!effectiveConversationId || isUnresolvedTemplate(effectiveConversationId)) {
-                // Fall back to contextMemory, but ONLY if contextMemory value is also valid
-                const ctxConvId = task.contextMemory?.conversation_id;
-                if (ctxConvId && !isUnresolvedTemplate(ctxConvId)) {
-                  effectiveConversationId = ctxConvId;
-                  console.log(`[Tasks] conversation_id "${toolResult.conversation_id}" not valid, using captured value: ${effectiveConversationId}`);
-                } else {
-                  // Both are invalid - use null (will match any message from contact)
-                  effectiveConversationId = null;
-                  console.log(`[Tasks] No valid conversation_id available (from tool: "${toolResult.conversation_id}", from context: "${ctxConvId}") - will match any message from contact`);
-                }
-              }
-              
-              console.log(`[Tasks] Task ${taskId} waiting for reply from ${toolResult.contact} via ${toolResult.platform}`);
-              console.log(`[Tasks] Poll interval: ${pollIntervalMs}ms, Followup after: ${toolResult.followup_after_hours}h, Max: ${toolResult.max_followups}`);
-              console.log(`[Tasks] Using conversation_id: ${effectiveConversationId || '(none - will match any email from contact)'}`);
-              
-              await updateTask(taskId, {
-                status: "waiting",
-                nextCheck: Date.now() + pollIntervalMs,
-                currentStep: { 
-                  step: task.currentStep.step, 
-                  description: `Waiting for reply from ${toolResult.contact}`,
-                  state: "waiting" 
-                },
-                contextMemory: {
-                  ...task.contextMemory,
-                  wait_for_reply_active: true,
-                  waiting_via: toolResult.platform,
-                  waiting_for_contact: toolResult.contact,
-                  original_request: toolResult.original_request,
-                  success_criteria: toolResult.success_criteria,
-                  conversation_id: effectiveConversationId,
-                  first_message_time: task.contextMemory?.first_message_time || new Date().toISOString(),
-                  last_message_time: new Date().toISOString(),
-                  poll_interval_minutes: toolResult.poll_interval_minutes || 5,
-                  followup_after_hours: toolResult.followup_after_hours || 24,
-                  last_followup_time: null,
-                  max_followups: toolResult.max_followups || 3,
-                  followup_count: task.contextMemory?.followup_count || 0,
-                  new_reply_detected: false
-                },
-                logEntry: `Waiting for reply from ${toolResult.contact} via ${toolResult.platform}`
-              }, currentUser?.username);
-              
-              return { success: true, waitingForReply: true, contact: toolResult.contact, platform: toolResult.platform };
-            }
-            
-            // Handle save_variable action - update task context memory
-            if (toolResult && toolResult.action === "save_variable") {
-              console.log(`[Tasks] Saving variable ${toolResult.name} = ${toolResult.value}`);
-              await updateTask(taskId, {
-                contextMemory: {
-                  ...task.contextMemory,
-                  [toolResult.name]: toolResult.value
-                }
-              }, currentUser?.username);
-              // Refresh task for next iteration
-              task = await getTask(taskId, currentUser?.username);
-            }
-            
-            // Handle complete_task action
-            if (toolResult && toolResult.action === "complete_task") {
-              console.log(`[Tasks] Task ${taskId} completed: ${toolResult.summary}`);
-              await updateTask(taskId, {
-                status: "completed",
-                currentStep: { ...task.currentStep, state: "completed" },
-                logEntry: `Task completed: ${toolResult.summary}`
-              }, currentUser?.username);
-              
-              // Notify user
-              if (win && !win.isDestroyed()) {
-                addTaskUpdate(taskId, `✅ ${toolResult.summary}`, {
-                  toChat: true,
-                  emoji: "✅",
-                  taskTitle: task.title
-                });
-              }
-              
-              return { success: true, completed: true, summary: toolResult.summary };
-            }
-            
-            // Handle goto_step action
-            if (toolResult && toolResult.action === "goto_step") {
-              console.log(`[Tasks] Task ${taskId} jumping to step ${toolResult.step_number}`);
-              await updateTask(taskId, {
-                currentStep: { step: toolResult.step_number, state: "executing" },
-                logEntry: `Jumped to step ${toolResult.step_number}${toolResult.reason ? `: ${toolResult.reason}` : ''}`
-              }, currentUser?.username);
-              // Continue execution at new step
-              setTimeout(() => executeTaskStep(taskId, currentUser?.username), 100);
-              return { success: true, jumpedToStep: toolResult.step_number };
-            }
-          }
-
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: toolUse.id,
-            content: JSON.stringify(toolResult)
-          });
-        }
-
-        // Continue the conversation with tool results
-        currentMessages.push({ role: "assistant", content: result.content });
-        currentMessages.push({ role: "user", content: toolResults });
-      }
-
-      // If we exited without updating state, the LLM completed the step but forgot to call update_task_state
-      // Auto-advance to the next step to keep the task moving
-      console.log(`[Tasks] LLM completed without calling update_task_state - auto-advancing task ${taskId}`);
-      
-      const currentStep = task.currentStep.step;
-      const nextStep = currentStep + 1;
-      
-      if (nextStep <= task.plan.length) {
-        // Advance to next step
-        await updateTask(taskId, {
-          currentStep: { step: nextStep, state: "executing" },
-          status: "active",
-          logEntry: `Step ${currentStep} completed (auto-advanced). Moving to step ${nextStep}: ${task.plan[nextStep - 1]}`
-        }, currentUser?.username);
-        
-        console.log(`[Tasks] Auto-advanced from step ${currentStep} to step ${nextStep}`);
-        
-        // Log update to task panel (no chat notification for step progress)
-        if (win && !win.isDestroyed()) {
-          const notificationMessage = `Step ${currentStep} completed. Moving to step ${nextStep}: ${task.plan[nextStep - 1]}`;
-          addTaskUpdate(taskId, notificationMessage);
-        }
-        
-        // Continue to next step after a short delay
-        setTimeout(() => executeTaskStep(taskId, currentUser?.username), 500);
-        return { success: true, autoAdvanced: true };
-      } else {
-        // This was the last step - mark task as completed
-        await updateTask(taskId, {
-          status: "completed",
-          currentStep: { ...task.currentStep, state: "completed" },
-          logEntry: `Task completed (all ${task.plan.length} steps finished)`
-        }, currentUser?.username);
-        
-        console.log(`[Tasks] Task ${taskId} completed (auto-completed after last step)`);
-        
-        // Notify user of completion
-        if (win && !win.isDestroyed()) {
-          addTaskUpdate(taskId, `Task completed! All ${task.plan.length} steps finished.`, {
-            toChat: true,
-            emoji: "✅",
-            taskTitle: task.title
-          });
-        }
-        
-        return { success: true, completed: true };
-      }
-
-    } catch (err) {
-      console.error(`[Tasks] Execution error for ${taskId}:`, err.message);
-      await updateTask(taskId, {
-        status: "failed",
-        logEntry: `Execution failed: ${err.message}`
-      }, currentUser?.username);
-      return { error: err.message };
-    }
-  });
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Query Decomposition System - For Complex Multi-Step Queries
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  // Fast models for classification (cheaper/faster)
-  const CLASSIFIER_MODELS = {
-    anthropic: "claude-3-5-haiku-20241022",
-    openai: "gpt-4o-mini",
-    google: "gemini-1.5-flash"
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Skill Generation - Create skills from natural language descriptions
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  /**
-   * Generate a skill from a natural language description
-   * @param {string} userRequest - User's request describing the skill
-   * @param {Object} apiKeys - Available API keys
-   * @param {string} activeProvider - The active LLM provider
-   * @returns {Object} Skill object with name, description, keywords, procedure, constraints
-   */
-  async function generateSkillFromDescription(userRequest, apiKeys, activeProvider) {
-    const prompt = `You are helping create a skill (a reusable procedure) for an AI assistant called Wovly.
-
-USER REQUEST:
-"${userRequest}"
-
-Based on this request, generate a skill with the following structure. Be specific and actionable.
-
-A skill provides:
-1. Domain knowledge to guide the AI when decomposing tasks (procedure)
-2. Constraints the AI must follow when executing the task
-
-Respond with ONLY valid JSON (no markdown, no backticks):
-{
-  "name": "Short descriptive name (e.g., 'Email Thread Monitoring', 'Daily Standup Reminder')",
-  "description": "2-3 sentence description of what this skill does and when it should be triggered",
-  "keywords": ["keyword1", "keyword2", "keyword3", "keyword4"],
-  "procedure": [
-    "Step 1: Specific action to take",
-    "Step 2: Another specific action",
-    "Step 3: Continue with the workflow",
-    "Step 4: Handle outcomes/responses",
-    "Step 5: Complete or repeat as needed"
-  ],
-  "constraints": [
-    "Important rule or limitation",
-    "Another constraint to follow"
-  ]
-}`;
-
-    try {
-      let response;
-      
-      if (activeProvider === "anthropic" && apiKeys.anthropic) {
-        response = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": apiKeys.anthropic,
-            "anthropic-version": "2023-06-01"
-          },
-          body: JSON.stringify({
-            model: "claude-sonnet-4-20250514",
-            max_tokens: 1024,
-            messages: [{ role: "user", content: prompt }]
-          })
-        });
-        
-        if (!response.ok) {
-          throw new Error(`Anthropic API error: ${await response.text()}`);
-        }
-        
-        const data = await response.json();
-        const text = data.content[0]?.text || "";
-        return JSON.parse(text);
-        
-      } else if (apiKeys.openai) {
-        response = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKeys.openai}`
-          },
-          body: JSON.stringify({
-            model: "gpt-4o",
-            messages: [{ role: "user", content: prompt }],
-            response_format: { type: "json_object" }
-          })
-        });
-        
-        if (!response.ok) {
-          throw new Error(`OpenAI API error: ${await response.text()}`);
-        }
-        
-        const data = await response.json();
-        const text = data.choices[0]?.message?.content || "";
-        return JSON.parse(text);
-        
-      } else if (apiKeys.google) {
-        response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKeys.google}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { responseMimeType: "application/json" }
-          })
-        });
-        
-        if (!response.ok) {
-          throw new Error(`Google API error: ${await response.text()}`);
-        }
-        
-        const data = await response.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-        return JSON.parse(text);
-        
-      } else {
-        return { error: "No API key available for skill generation" };
-      }
-    } catch (err) {
-      console.error("[Skills] Error generating skill:", err.message);
-      return { error: err.message };
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Input Type Detection - Classify input as query/command/information
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  /**
-   * Detects if user input is a query, command, or informational statement
-   * @param {string} input - User's message
-   * @param {Object} apiKeys - Available API keys
-   * @param {string} activeProvider - The active LLM provider
-   * @returns {Object} { type: "query"|"command"|"information", confidence: number, reason: string }
-   */
-  async function detectInputType(input, apiKeys, activeProvider) {
-    const prompt = `Classify this user input into one of three types:
-"${input}"
-
-Types:
-- "query": User is asking a question or requesting information (e.g., "What's the weather?", "What's on my calendar?")
-- "command": User wants to perform an action or task (e.g., "Send email to John", "Schedule a meeting", "Find flights to London")
-- "information": User is sharing personal facts, relationships, or context they want remembered for future conversations
-
-Examples of "information" (statements of fact to remember):
-- "Igor is my contractor working on the house" → contact/relationship info
-- "Connie is my mother. Daddee is my father" → family relationships
-- "Curly is the name of my children's school" → place info
-- "My wife's birthday is March 15" → date/personal info
-- "Brightwheel is the app for my daughter's daycare" → context info
-- "I'm allergic to peanuts" → preference/health info
-- "The house renovation is currently on hold due to permits" → situation update
-
-Key indicators of "information":
-- Declarative statements (not questions)
-- Defines relationships ("X is my...")
-- Shares personal facts, dates, preferences
-- Provides context about people, places, or situations
-- Does NOT ask for action or information
-
-Respond with ONLY JSON (no markdown):
-{
-  "type": "query" | "command" | "information",
-  "confidence": 0.0-1.0,
-  "reason": "brief explanation"
-}`;
-
-    try {
-      if (apiKeys.anthropic) {
-        const response = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": apiKeys.anthropic,
-            "anthropic-version": "2023-06-01"
-          },
-          body: JSON.stringify({
-            model: CLASSIFIER_MODELS.anthropic,
-            max_tokens: 256,
-            messages: [{ role: "user", content: prompt }]
-          })
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          const text = data.content?.[0]?.text || "{}";
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const result = JSON.parse(jsonMatch[0]);
-            console.log(`[InputType] Classified as: ${result.type} (confidence: ${result.confidence})`);
-            return result;
-          }
-        }
-      }
-
-      if (apiKeys.openai) {
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKeys.openai}`
-          },
-          body: JSON.stringify({
-            model: CLASSIFIER_MODELS.openai,
-            max_tokens: 256,
-            messages: [
-              { role: "system", content: "You classify user input. Respond with only JSON." },
-              { role: "user", content: prompt }
-            ]
-          })
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          const text = data.choices?.[0]?.message?.content || "{}";
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const result = JSON.parse(jsonMatch[0]);
-            console.log(`[InputType] Classified as: ${result.type} (confidence: ${result.confidence})`);
-            return result;
-          }
-        }
-      }
-
-      // Default to command if classification fails
-      return { type: "command", confidence: 0.5, reason: "Classification failed, defaulting to command" };
-    } catch (err) {
-      console.error("[InputType] Error:", err.message);
-      return { type: "command", confidence: 0.5, reason: "Error during classification" };
-    }
-  }
-
-  /**
-   * Extracts structured facts from an informational statement
-   * @param {string} input - User's informational statement
-   * @param {Object} apiKeys - Available API keys
-   * @param {string} activeProvider - The active LLM provider
-   * @returns {Object} { facts: [{ category, summary, entities, subject }] }
-   */
-  async function extractFacts(input, apiKeys, activeProvider) {
-    const prompt = `Extract facts from this statement to save to a user profile:
-"${input}"
-
-Categories:
-- contact_info: Info about a person (name, role, relationship to user)
-- place_info: Info about locations, schools, workplaces, businesses
-- date_info: Birthdays, anniversaries, important dates
-- preference_info: Likes, dislikes, allergies, preferences
-- context_info: Project status, ongoing situations, current events in user's life
-
-For each fact, provide:
-- category: One of the above
-- summary: A clear one-line note suitable for a profile (e.g., "Igor is my contractor working on house renovation")
-- entities: Key entities extracted (name, relationship, date, etc.)
-- subject: The main subject this fact is about (for conflict detection)
-
-Respond with ONLY JSON (no markdown):
-{
-  "facts": [
-    {
-      "category": "contact_info",
-      "summary": "Igor is my contractor working on the house renovation",
-      "entities": { "name": "Igor", "role": "contractor", "project": "house renovation" },
-      "subject": "Igor"
-    }
-  ]
-}`;
-
-    try {
-      if (apiKeys.anthropic) {
-        const response = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": apiKeys.anthropic,
-            "anthropic-version": "2023-06-01"
-          },
-          body: JSON.stringify({
-            model: CLASSIFIER_MODELS.anthropic,
-            max_tokens: 1024,
-            messages: [{ role: "user", content: prompt }]
-          })
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          const text = data.content?.[0]?.text || "{}";
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const result = JSON.parse(jsonMatch[0]);
-            console.log(`[ExtractFacts] Extracted ${result.facts?.length || 0} facts`);
-            return result;
-          }
-        }
-      }
-
-      if (apiKeys.openai) {
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKeys.openai}`
-          },
-          body: JSON.stringify({
-            model: CLASSIFIER_MODELS.openai,
-            max_tokens: 1024,
-            messages: [
-              { role: "system", content: "You extract facts from statements. Respond with only JSON." },
-              { role: "user", content: prompt }
-            ]
-          })
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          const text = data.choices?.[0]?.message?.content || "{}";
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const result = JSON.parse(jsonMatch[0]);
-            console.log(`[ExtractFacts] Extracted ${result.facts?.length || 0} facts`);
-            return result;
-          }
-        }
-      }
-
-      return { facts: [] };
-    } catch (err) {
-      console.error("[ExtractFacts] Error:", err.message);
-      return { facts: [] };
-    }
-  }
-
-  /**
-   * Detects conflicts between new facts and existing profile notes
-   * @param {Array} newFacts - Array of new facts to save
-   * @param {Array} existingNotes - Array of existing profile notes
-   * @param {Object} apiKeys - Available API keys
-   * @param {string} activeProvider - The active LLM provider
-   * @returns {Object} { conflicts: [...], nonConflictingFactIndexes: [...] }
-   */
-  async function detectFactConflicts(newFacts, existingNotes, apiKeys, activeProvider) {
-    if (!existingNotes || existingNotes.length === 0) {
-      return { 
-        conflicts: [], 
-        nonConflictingFactIndexes: newFacts.map((_, i) => i) 
-      };
-    }
-
-    if (!newFacts || newFacts.length === 0) {
-      return { conflicts: [], nonConflictingFactIndexes: [] };
-    }
-
-    const prompt = `Compare these NEW facts against EXISTING profile notes and identify conflicts.
-
-NEW FACTS:
-${newFacts.map((f, i) => `${i + 1}. ${f.summary}`).join('\n')}
-
-EXISTING PROFILE NOTES:
-${existingNotes.map((n, i) => `${i + 1}. ${n}`).join('\n')}
-
-A CONFLICT exists when:
-- Same subject (person, place, thing) has CONTRADICTORY information
-- Example CONFLICT: "Wife's birthday is March 3rd" vs "Wife's birthday is April 10th" (different dates for same event)
-- Example CONFLICT: "Igor is my contractor" vs "Igor is my neighbor" (different relationships)
-- Example CONFLICT: "Connie is my mother" vs "Connie is my aunt" (different relationships)
-
-NOT a conflict (complementary info):
-- "Igor is my contractor" and "Igor is working on the house renovation" (adds detail, doesn't contradict)
-- "Wife's birthday is March 3rd" and "Wife's name is Sarah" (different attributes)
-
-Respond with ONLY JSON (no markdown):
-{
-  "conflicts": [
-    {
-      "newFactIndex": 0,
-      "existingNoteIndex": 2,
-      "newFact": "the new fact text",
-      "existingNote": "the existing note text",
-      "subject": "what/who the conflict is about",
-      "conflictDescription": "You previously said X, but now you're saying Y. Which is correct?"
-    }
-  ],
-  "nonConflictingFactIndexes": [1, 3]
-}
-
-If no conflicts found, return empty conflicts array and all fact indexes in nonConflictingFactIndexes.`;
-
-    try {
-      if (apiKeys.anthropic) {
-        const response = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": apiKeys.anthropic,
-            "anthropic-version": "2023-06-01"
-          },
-          body: JSON.stringify({
-            model: CLASSIFIER_MODELS.anthropic,
-            max_tokens: 1024,
-            messages: [{ role: "user", content: prompt }]
-          })
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          const text = data.content?.[0]?.text || "{}";
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const result = JSON.parse(jsonMatch[0]);
-            console.log(`[ConflictDetect] Found ${result.conflicts?.length || 0} conflicts`);
-            return result;
-          }
-        }
-      }
-
-      if (apiKeys.openai) {
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKeys.openai}`
-          },
-          body: JSON.stringify({
-            model: CLASSIFIER_MODELS.openai,
-            max_tokens: 1024,
-            messages: [
-              { role: "system", content: "You detect conflicts in user profile information. Respond with only JSON." },
-              { role: "user", content: prompt }
-            ]
-          })
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          const text = data.choices?.[0]?.message?.content || "{}";
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const result = JSON.parse(jsonMatch[0]);
-            console.log(`[ConflictDetect] Found ${result.conflicts?.length || 0} conflicts`);
-            return result;
-          }
-        }
-      }
-
-      // Default: no conflicts
-      return { 
-        conflicts: [], 
-        nonConflictingFactIndexes: newFacts.map((_, i) => i) 
-      };
-    } catch (err) {
-      console.error("[ConflictDetect] Error:", err.message);
-      return { 
-        conflicts: [], 
-        nonConflictingFactIndexes: newFacts.map((_, i) => i) 
-      };
-    }
-  }
-
-  /**
-   * Intelligent Query Understanding - Pre-decomposition phase
-   * Extracts entities, resolves ambiguities using context, and enriches the query
-   * 
-   * @param {string} query - The raw user query
-   * @param {Object} context - Context for understanding
-   * @param {Object} context.profile - User profile (city, name, preferences)
-   * @param {Object} context.conversationContext - Recent conversation history
-   * @param {Array} context.calendarEvents - Today's calendar events
-   * @param {Date} context.currentDate - Current date/time
-   * @param {Object} apiKeys - Available API keys
-   * @param {string} activeProvider - The active LLM provider
-   * @returns {Object} Understanding result with enriched query and extracted entities
-   */
-  async function understandQuery(query, context, apiKeys, activeProvider) {
-    const { profile, conversationContext, calendarEvents, currentDate, sessionMessages } = context;
-    
-    // Get available credentials for security context
-    const availableCredentials = await getAvailableCredentialDomains();
-    
-    // Format current date for the prompt
-    const dateStr = currentDate.toLocaleDateString('en-US', { 
-      weekday: 'long', 
-      year: 'numeric', 
-      month: 'long', 
-      day: 'numeric' 
-    });
-    
-    // Format calendar events for context
-    let calendarStr = "No events today";
-    if (calendarEvents && calendarEvents.length > 0) {
-      calendarStr = calendarEvents.map(e => {
-        const startTime = e.start ? new Date(e.start).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : 'All day';
-        return `- ${startTime}: ${e.title}${e.location ? ` at ${e.location}` : ''}`;
-      }).join("\n");
-    }
-    
-    // Format profile notes/preferences
-    let preferencesStr = "";
-    if (profile?.notes && profile.notes.length > 0) {
-      preferencesStr = profile.notes.map(n => `- ${n}`).join("\n");
-    }
-    
-    // Format immediate context from current session (last 2-3 exchanges)
-    // This is critical for resolving follow-up questions and references like "those", "that", etc.
-    let immediateContext = "";
-    if (sessionMessages && sessionMessages.length > 0) {
-      // Get the last 6 messages (up to 3 user-assistant pairs) excluding the current query
-      const previousMessages = sessionMessages.slice(-7, -1); // Exclude the current message
-      if (previousMessages.length > 0) {
-        immediateContext = previousMessages.map(m => {
-          const role = m.role === 'assistant' ? 'Assistant' : 'User';
-          // Truncate very long messages but keep enough context
-          const content = m.content.length > 1500 ? m.content.slice(0, 1500) + '...[truncated]' : m.content;
-          return `${role}: ${content}`;
-        }).join("\n\n");
-      }
-    }
-    
-    // Format recent conversation for additional context (from memory files)
-    let recentConversation = "";
-    if (conversationContext?.todayMessages) {
-      // Get last 500 chars of today's messages for context
-      const messages = conversationContext.todayMessages;
-      recentConversation = messages.length > 500 ? messages.slice(-500) : messages;
-    }
-
-    const understandingPrompt = `You are a query understanding system. Your job is to extract entities, resolve ambiguities, and enrich the user's query using available context.
-
-## CRITICAL SECURITY RULES - READ FIRST
-**NEVER ask for login credentials, passwords, usernames, or API keys.** This is a major security violation.
-- If a website/service needs login, check if credentials exist (listed below)
-- If credentials exist for the domain → proceed without asking
-- If credentials DON'T exist → the enriched query should note the user needs to add credentials in the Credentials page
-- ABSOLUTELY NO clarification questions about passwords, usernames, or login details
-
-## Saved Credentials Available
-${availableCredentials.length > 0 ? `The user has saved credentials for: ${availableCredentials.join(', ')}` : 'No saved credentials'}
-If the query involves logging into one of these sites, proceed - credentials are available.
-
-## Current Context
-Today is ${dateStr}.
-Current time: ${currentDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}.
-
-## User Profile
-- Name: ${profile?.firstName || 'Unknown'} ${profile?.lastName || ''}
-- Location/City: ${profile?.city || 'Unknown'}
-- Occupation: ${profile?.occupation || 'Unknown'}
-${preferencesStr ? `\nUser Preferences/Notes:\n${preferencesStr}` : ''}
-
-## Today's Calendar
-${calendarStr}
-
-## Immediate Conversation Context (MOST IMPORTANT FOR FOLLOW-UPS)
-${immediateContext || 'This is the first message in this conversation'}
-
-**CRITICAL: Use this context to resolve ANY references in the user's query:**
-- "those messages" / "these messages" → messages the assistant just mentioned
-- "that" / "those" / "these" / "it" → items/entities from assistant's last response
-- "the dates" / "the times" → dates/times of items just discussed
-- "him" / "her" / "them" → people mentioned in recent exchange
-- "that person" / "the person" → the person just mentioned
-
-## Earlier Conversation (for additional context)
-${recentConversation || 'No earlier messages'}
-
-## User Query
-"${query}"
-
-## Your Task
-Analyze the query and extract/resolve the following:
-
-1. **DATES**: Any date/time references
-   - Relative dates ("Monday", "tomorrow", "next week") → exact dates
-   - Relative times ("after my meeting", "in 2 hours") → exact times
-   - Calculate based on today being ${dateStr}
-
-2. **LOCATIONS**: Any location references
-   - If travel query and no origin specified → use user's city as default origin
-   - Resolve vague references ("home", "work", "there")
-   - Include airport codes when relevant for travel
-
-3. **PEOPLE**: Any person references
-   - Resolve pronouns ("him", "her", "them") using conversation context
-   - Identify names mentioned
-
-4. **QUANTITIES**: Numbers and amounts
-   - Number of travelers (default to 1 if not specified for travel)
-   - Number of items, tickets, etc.
-
-5. **MISSING PARAMETERS**: What's needed but not provided
-   - For travel: return date (suggest default if one-way not explicit)
-   - For meetings: duration, attendees
-   - For messages: recipients
-
-6. **REFERENCES** (CRITICAL for follow-up questions):
-   - "those", "these", "that", "it", "the [noun]" → resolve to specific entities from immediate conversation
-   - "those messages" → identify which specific messages were just discussed by the assistant
-   - "that person" / "him" / "her" → identify who was just mentioned
-   - "the dates" / "the times" → dates/times of items the assistant just mentioned
-   - If the assistant just mentioned specific items/messages/people/data, assume demonstrative references point to those
-   - This is the MOST IMPORTANT resolution for follow-up questions
-
-7. **ENRICHED QUERY**: Rewrite the query with all ambiguities resolved, especially references
-
-Respond with ONLY a JSON object (no markdown, no explanation):
-{
-  "original_query": "the original query",
-  "enriched_query": "fully resolved query with specific dates, locations, references resolved, etc.",
-  "entities": {
-    "dates": [
-      { "raw": "original text", "resolved": "YYYY-MM-DD", "type": "departure|return|meeting|deadline", "reasoning": "how you resolved it" }
-    ],
-    "times": [
-      { "raw": "original text", "resolved": "HH:MM", "type": "start|end", "reasoning": "how you resolved it" }
-    ],
-    "locations": {
-      "origin": { "raw": "original or null", "resolved": "city name", "code": "airport code if travel", "source": "query|profile|context" },
-      "destination": { "raw": "original", "resolved": "city name", "code": "airport code if travel" }
-    },
-    "people": [
-      { "raw": "original reference", "resolved": "full name", "source": "query|context" }
-    ],
-    "quantities": [
-      { "type": "travelers|items|etc", "value": number, "inferred": true/false }
-    ],
-    "references": [
-      { "raw": "those messages", "resolved": "the 3 messages from Igor about house access", "type": "messages|items|data", "source": "immediate_context" }
-    ]
-  },
-  "ambiguities_resolved": [
-    { "type": "date|location|person|quantity|reference", "raw": "original", "resolved": "resolved value", "reasoning": "explanation" }
-  ],
-  "missing_parameters": [
-    { "param": "parameter name", "handling": "default_value|ask_user", "suggested_value": "value if defaulting", "question": "question if asking user" }
-  ],
-  "context_applied": [
-    "description of context used"
-  ],
-  "clarification_needed": false,
-  "clarification_questions": []
-}
-
-IMPORTANT RULES:
-
-## ACTION-FIRST PRINCIPLE (CRITICAL)
-- DEFAULT TO ACTION, NOT CLARIFICATION. If you can make a reasonable assumption, MAKE IT and proceed.
-- Only set clarification_needed=true when execution is IMPOSSIBLE without user input.
-- NEVER ask generic questions like "what specific details are you looking for?" - be specific or don't ask at all.
-
-## SECURITY: FORBIDDEN CLARIFICATION QUESTIONS
-NEVER, UNDER ANY CIRCUMSTANCES, ask for:
-- Passwords or login credentials
-- Usernames or email addresses for login
-- API keys or tokens
-- Any authentication information
-If login is needed: check Saved Credentials above. If credentials exist, proceed. If not, mention the Credentials page.
-
-## When to NOT ask for clarification:
-- **Login/credential requests** → NEVER ask, use saved credentials or mention Credentials page
-- Message retrieval queries (e.g., "messages from Igor") → proceed with available platforms
-- Contact lookups → just look up the contact
-- Calendar queries → just fetch the calendar
-- Search queries → just search
-- Any query where you can take meaningful action → TAKE ACTION
-
-## When clarification IS appropriate (rare):
-- Multiple people with same name AND it affects results significantly
-- Travel queries where origin is truly unknown AND not inferable from profile
-- Ambiguous time references that could mean very different things
-
-## Specific Query Type Guidance:
-- "messages from [person]" → enrich to: "Retrieve latest messages from [person] across available messaging platforms (iMessage, Slack, WhatsApp)"
-- "what did [person] say about X" → enrich to: "Search messages from [person] for content about X"
-- "[person]'s contact" → enrich to: "Look up contact information for [person]"
-
-## Reference Resolution:
-- FOLLOW-UP QUESTIONS: If the query uses "those", "these", "that", "it", ALWAYS check the Immediate Conversation Context to resolve the reference. Do NOT ask for clarification.
-- Example: If assistant just listed "3 messages from Igor about house access" and user asks "what were the dates of those messages?", resolve to "What are the dates of the 3 messages from Igor about house access that were just discussed?"
-
-## Other Rules:
-- For travel queries without return date, default to round-trip with 1-week return unless "one-way" is mentioned
-- Always resolve relative dates to exact dates based on today's date
-- Be specific in the enriched_query - include dates, times, and all resolved entities`;
-
-    try {
-      // Use Anthropic if available (preferred)
-      if (apiKeys.anthropic) {
-        const response = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": apiKeys.anthropic,
-            "anthropic-version": "2023-06-01"
-          },
-          body: JSON.stringify({
-            model: CLASSIFIER_MODELS.anthropic,
-            max_tokens: 2048,
-            messages: [{ role: "user", content: understandingPrompt }]
-          })
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          const text = data.content?.[0]?.text || "{}";
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const result = JSON.parse(jsonMatch[0]);
-            console.log(`[QueryUnderstanding] Enriched query: "${result.enriched_query}"`);
-            console.log(`[QueryUnderstanding] Entities:`, JSON.stringify(result.entities, null, 2));
-            console.log(`[QueryUnderstanding] Context applied:`, result.context_applied);
-            if (result.clarification_needed) {
-              console.log(`[QueryUnderstanding] Clarification needed:`, result.clarification_questions);
-            }
-            return result;
-          }
-        }
-      }
-      
-      // Fallback to OpenAI
-      if (apiKeys.openai) {
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKeys.openai}`
-          },
-          body: JSON.stringify({
-            model: CLASSIFIER_MODELS.openai,
-            max_tokens: 2048,
-            messages: [
-              { role: "system", content: "You are a query understanding assistant. Respond with only JSON." },
-              { role: "user", content: understandingPrompt }
-            ]
-          })
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          const text = data.choices?.[0]?.message?.content || "{}";
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const result = JSON.parse(jsonMatch[0]);
-            console.log(`[QueryUnderstanding] Enriched query: "${result.enriched_query}"`);
-            return result;
-          }
-        }
-      }
-
-      // Default passthrough if understanding fails
-      console.log("[QueryUnderstanding] Understanding failed, using original query");
-      return {
-        original_query: query,
-        enriched_query: query,
-        entities: { dates: [], times: [], locations: {}, people: [], quantities: [] },
-        ambiguities_resolved: [],
-        missing_parameters: [],
-        context_applied: [],
-        clarification_needed: false,
-        clarification_questions: []
-      };
-
-    } catch (err) {
-      console.error("[QueryUnderstanding] Error:", err.message);
-      return {
-        original_query: query,
-        enriched_query: query,
-        entities: { dates: [], times: [], locations: {}, people: [], quantities: [] },
-        ambiguities_resolved: [],
-        missing_parameters: [],
-        context_applied: [],
-        clarification_needed: false,
-        clarification_questions: []
-      };
-    }
-  }
-
-  /**
-   * Classifies query complexity using a fast LLM call
-   * @param {string} query - The user's query
-   * @param {Object} apiKeys - Available API keys
-   * @param {string} activeProvider - The active LLM provider
-   * @returns {Object} Classification result with complexity, requires_waiting, estimated_steps
-   */
-  async function classifyQueryComplexity(query, apiKeys, activeProvider) {
-    const classificationPrompt = `Classify this user query for complexity:
-"${query}"
-
-Respond with ONLY a JSON object (no markdown, no explanation):
-{
-  "complexity": "simple" or "multi_step" or "complex_async",
-  "reason": "brief 5-10 word explanation",
-  "requires_waiting": true/false,
-  "estimated_steps": number
-}
-
-Classification rules:
-- "simple": ONLY truly single actions with NO data dependencies. Examples: "what's the weather?", "what time is it?", "what's on my calendar today?"
-- "multi_step": ANY query that involves:
-  * Looking up a contact AND then doing something with that contact (messages, email, etc.)
-  * Searching/retrieving data AND then filtering or analyzing it
-  * Multiple sequential actions where output of one step informs the next
-  * Message retrieval from a person (requires: lookup contact → search messages → filter results)
-  * Examples: "messages from Igor", "find Chris's email and reply", "what did John say about the project?"
-- "complex_async": Requires waiting for external events, human responses, or monitoring. Examples: "wait for John's reply", "monitor Slack for messages"
-
-IMPORTANT - These are ALWAYS multi_step:
-- "messages from [person]" - requires contact lookup + message search + filtering
-- "what did [person] say about X" - requires contact lookup + message search + content analysis
-- "[person]'s latest messages" - requires contact lookup + message retrieval
-- "find [something] and [do action with it]" - two dependent steps
-
-Set requires_waiting=true ONLY if the task needs to wait for: email replies, message responses, external API callbacks, or human input between steps.
-
-IMPORTANT: Browser automation (page loads, clicking buttons, form submissions) is NOT waiting. These are immediate automated actions.`;
-
-    try {
-      // Use Anthropic if available (preferred)
-      if (apiKeys.anthropic) {
-        const response = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": apiKeys.anthropic,
-            "anthropic-version": "2023-06-01"
-          },
-          body: JSON.stringify({
-            model: CLASSIFIER_MODELS.anthropic,
-            max_tokens: 256,
-            messages: [{ role: "user", content: classificationPrompt }]
-          })
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          const text = data.content?.[0]?.text || "{}";
-          // Extract JSON from response (handle potential markdown wrapping)
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const result = JSON.parse(jsonMatch[0]);
-            console.log(`[QueryDecomposition] Classified as: ${result.complexity} (${result.estimated_steps} steps, waiting: ${result.requires_waiting})`);
-            return result;
-          }
-        }
-      }
-      
-      // Fallback to OpenAI if available
-      if (apiKeys.openai) {
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKeys.openai}`
-          },
-          body: JSON.stringify({
-            model: CLASSIFIER_MODELS.openai,
-            max_tokens: 256,
-            messages: [
-              { role: "system", content: "You are a query classifier. Respond with only JSON." },
-              { role: "user", content: classificationPrompt }
-            ]
-          })
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          const text = data.choices?.[0]?.message?.content || "{}";
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const result = JSON.parse(jsonMatch[0]);
-            console.log(`[QueryDecomposition] Classified as: ${result.complexity} (${result.estimated_steps} steps, waiting: ${result.requires_waiting})`);
-            return result;
-          }
-        }
-      }
-
-      // Default to simple if classification fails
-      console.log("[QueryDecomposition] Classification failed, defaulting to simple");
-      return { complexity: "simple", reason: "classification failed", requires_waiting: false, estimated_steps: 1 };
-
-    } catch (err) {
-      console.error("[QueryDecomposition] Classification error:", err.message);
-      return { complexity: "simple", reason: "error occurred", requires_waiting: false, estimated_steps: 1 };
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Query Decomposition Functions
-  // ─────────────────────────────────────────────────────────────────────────────
-  // NOTE: decomposeQuery, architectDecompose, builderMapToTools, validateDecomposition,
-  // formatDecomposedSteps, and related functions are now imported from ./src/llm/decomposition.js
-  // They use the Architect-Builder pattern for more reliable task decomposition.
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  /**
-   * Executes decomposed steps inline with context passing
-   * @param {Object} decomposition - The decomposition result
-   * @param {Array} messages - Chat message history
-   * @param {Object} toolExecutor - Object with executeTool function
-   * @param {Object} apiKeys - Available API keys
-   * @param {Object} models - Model configuration
-   * @param {string} activeProvider - The active LLM provider
-   * @param {string} systemPrompt - The system prompt to use
-   * @param {Function} sendProgress - Optional callback to send progress updates
-   * @returns {Object} Result with ok, response, and step results
-   */
-  async function executeDecomposedSteps(decomposition, messages, toolExecutor, apiKeys, models, activeProvider, systemPrompt, sendProgress) {
-    const { steps, title } = decomposition;
-    const stepResults = [];
-    let accumulatedContext = {};
-    
-    console.log(`[QueryDecomposition] ========== EXECUTE DECOMPOSED STEPS ==========`);
-    console.log(`[QueryDecomposition] Title: "${title}"`);
-    console.log(`[QueryDecomposition] Steps count: ${steps?.length || 0}`);
-    console.log(`[QueryDecomposition] Active provider: ${activeProvider}`);
-    console.log(`[QueryDecomposition] Has Anthropic key: ${!!apiKeys?.anthropic}`);
-    console.log(`[QueryDecomposition] Has OpenAI key: ${!!apiKeys?.openai}`);
-    console.log(`[QueryDecomposition] Tools count: ${toolExecutor?.tools?.length || 0}`);
-
-    // Enhanced system prompt for step execution
-    const stepSystemPrompt = `${systemPrompt}
-
-## EXECUTION CONTEXT
-You are executing a multi-step plan. Current plan: "${title}"
-
-Steps:
-${formatDecomposedSteps(steps)}
-
-## INSTRUCTIONS
-- Execute ONLY the current step indicated
-- Use the tools specified for that step
-- Be concise in your responses
-- After completing a step, summarize what you found/did
-- Pass relevant information to the next step via your response`;
-
-    // Build conversation with accumulated context
-    let currentMessages = [...messages];
-    
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i];
-      const stepNum = i + 1;
-      
-      console.log(`[QueryDecomposition] Executing step ${stepNum}/${steps.length}: ${step.action}`);
-      
-      // Send progress update if callback provided
-      if (sendProgress) {
-        sendProgress({
-          type: "step_progress",
-          currentStep: stepNum,
-          totalSteps: steps.length,
-          stepAction: step.action,
-          status: "executing"
-        });
-      }
-
-      // Add step instruction to messages
-      const stepInstruction = stepNum === 1 
-        ? `Execute step ${stepNum}: ${step.action}`
-        : `Continue with step ${stepNum}: ${step.action}\n\nContext from previous steps:\n${JSON.stringify(accumulatedContext, null, 2)}`;
-
-      const stepMessages = [
-        ...currentMessages,
-        { role: "user", content: stepInstruction }
-      ];
-
-      // Execute this step using the main chat flow (with tool calling)
-      try {
-        let stepResponse = null;
-        
-        console.log(`[QueryDecomposition] Step ${stepNum}: Provider=${activeProvider}, HasKey=${!!apiKeys[activeProvider]}`);
-        
-        // Use Anthropic
-        if (activeProvider === "anthropic" && apiKeys.anthropic) {
-          const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
-          let iterationMessages = stepMessages.map(m => ({ role: m.role, content: m.content }));
-          
-          console.log(`[QueryDecomposition] Step ${stepNum}: Calling Anthropic API with model ${anthropicModel}...`);
-          
-          for (let iteration = 0; iteration < 5; iteration++) {
-            console.log(`[QueryDecomposition] Step ${stepNum}: API iteration ${iteration + 1}`);
-            const response = await fetch("https://api.anthropic.com/v1/messages", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "x-api-key": apiKeys.anthropic,
-                "anthropic-version": "2023-06-01"
-              },
-              body: JSON.stringify({
-                model: anthropicModel,
-                max_tokens: 4096,
-                system: stepSystemPrompt,
-                tools: toolExecutor.tools,
-                messages: iterationMessages
-              })
-            });
-
-            if (!response.ok) {
-              const error = await response.text();
-              console.error(`[QueryDecomposition] Step ${stepNum}: API error - ${error}`);
-              throw new Error(`API error: ${error}`);
-            }
-
-            const data = await response.json();
-            console.log(`[QueryDecomposition] Step ${stepNum}: API response stop_reason=${data.stop_reason}`);
-
-            if (data.stop_reason === "end_turn" || !data.content.some(b => b.type === "tool_use")) {
-              const textBlock = data.content.find(b => b.type === "text");
-              stepResponse = textBlock?.text || "";
-              console.log(`[QueryDecomposition] Step ${stepNum}: Got text response (${stepResponse?.length || 0} chars)`);
-              break;
-            }
-
-            // Handle tool calls
-            const toolUseBlocks = data.content.filter(b => b.type === "tool_use");
-            const toolResults = [];
-
-            for (const toolUse of toolUseBlocks) {
-              console.log(`[QueryDecomposition] Step ${stepNum} tool: ${toolUse.name}`);
-              const result = await toolExecutor.executeTool(toolUse.name, toolUse.input);
-              // Remove screenshotDataUrl to prevent token explosion
-              const { screenshotDataUrl, ...resultForLLM } = result;
-              
-              // Store tool results in accumulated context
-              accumulatedContext[`step${stepNum}_${toolUse.name}`] = resultForLLM;
-              
-              toolResults.push({
-                type: "tool_result",
-                tool_use_id: toolUse.id,
-                content: JSON.stringify(resultForLLM)
-              });
-            }
-
-            iterationMessages.push({ role: "assistant", content: data.content });
-            iterationMessages.push({ role: "user", content: toolResults });
-          }
-        }
-        // Use OpenAI
-        else if (activeProvider === "openai" && apiKeys.openai) {
-          const openaiModel = models.openai || "gpt-4o";
-          const openaiTools = toolExecutor.tools.map(t => ({
-            type: "function",
-            function: { name: t.name, description: t.description, parameters: t.input_schema }
-          }));
-
-          let iterationMessages = [
-            { role: "system", content: stepSystemPrompt },
-            ...stepMessages.map(m => ({ role: m.role, content: m.content }))
-          ];
-
-          for (let iteration = 0; iteration < 5; iteration++) {
-            const response = await fetch("https://api.openai.com/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${apiKeys.openai}`
-              },
-              body: JSON.stringify({
-                model: openaiModel,
-                messages: iterationMessages,
-                tools: openaiTools
-              })
-            });
-
-            if (!response.ok) {
-              const error = await response.text();
-              throw new Error(`API error: ${error}`);
-            }
-
-            const data = await response.json();
-            const choice = data.choices[0];
-
-            if (choice.finish_reason === "stop" || !choice.message.tool_calls) {
-              stepResponse = choice.message.content || "";
-              break;
-            }
-
-            iterationMessages.push(choice.message);
-
-            for (const toolCall of choice.message.tool_calls) {
-              const toolInput = JSON.parse(toolCall.function.arguments);
-              console.log(`[QueryDecomposition] Step ${stepNum} tool: ${toolCall.function.name}`);
-              const result = await toolExecutor.executeTool(toolCall.function.name, toolInput);
-              // Remove screenshotDataUrl to prevent token explosion
-              const { screenshotDataUrl, ...resultForLLM } = result;
-              
-              accumulatedContext[`step${stepNum}_${toolCall.function.name}`] = resultForLLM;
-
-              iterationMessages.push({
-                role: "tool",
-                tool_call_id: toolCall.id,
-                content: JSON.stringify(resultForLLM)
-              });
-            }
-          }
-        }
-        // Fallback for Google (no tool support yet)
-        else if (apiKeys.google) {
-          console.log(`[QueryDecomposition] Step ${stepNum}: Using Google (no tool support)`);
-          stepResponse = "Google Gemini does not yet support tool calling for decomposed execution.";
-        }
-        // No provider available
-        else {
-          console.error(`[QueryDecomposition] Step ${stepNum}: NO PROVIDER AVAILABLE!`);
-          console.error(`[QueryDecomposition] Provider: ${activeProvider}, Keys: anthropic=${!!apiKeys.anthropic}, openai=${!!apiKeys.openai}, google=${!!apiKeys.google}`);
-          stepResponse = "Error: No LLM provider available for this step.";
-        }
-
-        console.log(`[QueryDecomposition] Step ${stepNum}: Final response = "${stepResponse?.substring(0, 100) || 'null'}..."`);
-        
-        stepResults.push({
-          step: stepNum,
-          action: step.action,
-          response: stepResponse,
-          success: true
-        });
-
-        // Add step result to accumulated context
-        accumulatedContext[`step${stepNum}_result`] = stepResponse;
-
-        // Update current messages for next step
-        currentMessages.push({ role: "user", content: stepInstruction });
-        currentMessages.push({ role: "assistant", content: stepResponse || "" });
-
-        // Send progress update
-        if (sendProgress) {
-          sendProgress({
-            type: "step_progress",
-            currentStep: stepNum,
-            totalSteps: steps.length,
-            stepAction: step.action,
-            status: "completed",
-            result: stepResponse
-          });
-        }
-
-      } catch (err) {
-        console.error(`[QueryDecomposition] Step ${stepNum} error:`, err.message);
-        stepResults.push({
-          step: stepNum,
-          action: step.action,
-          response: null,
-          error: err.message,
-          success: false
-        });
-
-        if (sendProgress) {
-          sendProgress({
-            type: "step_progress",
-            currentStep: stepNum,
-            totalSteps: steps.length,
-            stepAction: step.action,
-            status: "error",
-            error: err.message
-          });
-        }
-
-        // Continue to next step or fail? For now, continue
-      }
-    }
-
-    // Generate final summary
-    const successfulSteps = stepResults.filter(r => r.success).length;
-    const lastResult = stepResults[stepResults.length - 1];
-    
-    let finalResponse = `## Task Complete: ${title}\n\n`;
-    finalResponse += `Completed ${successfulSteps}/${steps.length} steps.\n\n`;
-    
-    if (lastResult?.response) {
-      finalResponse += `**Final Result:**\n${lastResult.response}`;
-    }
-
-    console.log(`[QueryDecomposition] Execution complete: ${successfulSteps}/${steps.length} steps successful`);
-
-    return {
-      ok: true,
-      response: finalResponse,
-      stepResults,
-      decomposition
-    };
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // CDP Browser Tools - Direct Chrome DevTools Protocol control
-  // ─────────────────────────────────────────────────────────────────────────────
-  
-  const cdpBrowserTools = [
-    {
-      name: "browser_navigate",
-      description: "Navigate to a URL in the browser. Returns a visual snapshot with clickable element refs. Use this to open websites, search pages, etc.",
-      input_schema: {
-        type: "object",
-        properties: {
-          url: { 
-            type: "string", 
-            description: "The URL to navigate to (e.g., 'https://google.com' or 'https://zillow.com/homes/palo-alto')" 
-          }
-        },
-        required: ["url"]
-      }
-    },
-    {
-      name: "browser_click",
-      description: "Click an element on the page by its ref (e.g., 'e23'). Get refs from browser_snapshot. After clicking, a new snapshot is returned.",
-      input_schema: {
-        type: "object",
-        properties: {
-          ref: { 
-            type: "string", 
-            description: "Element ref from the snapshot (e.g., 'e5', 'e23')" 
-          }
-        },
-        required: ["ref"]
-      }
-    },
-    {
-      name: "browser_type",
-      description: "Type text into an input field. Optionally specify a ref to focus that element first. If no ref, types into the currently focused element.",
-      input_schema: {
-        type: "object",
-        properties: {
-          text: { 
-            type: "string", 
-            description: "The text to type" 
-          },
-          ref: { 
-            type: "string", 
-            description: "Optional: Element ref to focus first before typing" 
-          }
-        },
-        required: ["text"]
-      }
-    },
-    {
-      name: "browser_press",
-      description: "Press a keyboard key (e.g., 'Enter', 'Tab', 'Escape', 'ArrowDown'). Use after typing to submit forms.",
-      input_schema: {
-        type: "object",
-        properties: {
-          key: { 
-            type: "string", 
-            description: "Key to press (e.g., 'Enter', 'Tab', 'Escape', 'ArrowDown', 'ArrowUp')" 
-          }
-        },
-        required: ["key"]
-      }
-    },
-    {
-      name: "browser_snapshot",
-      description: "Get a visual snapshot of the current page. Returns a screenshot and list of clickable elements with refs. Use this to see what's on the page and get element refs for clicking/typing.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        required: []
-      }
-    },
-    {
-      name: "browser_scroll",
-      description: "Scroll the page up or down to see more content.",
-      input_schema: {
-        type: "object",
-        properties: {
-          direction: { 
-            type: "string", 
-            enum: ["up", "down"],
-            description: "Direction to scroll" 
-          },
-          amount: { 
-            type: "number", 
-            description: "Pixels to scroll (default: 500)" 
-          }
-        },
-        required: ["direction"]
-      }
-    },
-    {
-      name: "browser_back",
-      description: "Go back to the previous page in browser history.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        required: []
-      }
-    },
-    {
-      name: "browser_fill_credential",
-      description: "Securely fill a login form field with a saved credential. Use this for login forms when the user has saved credentials for the domain. The actual credential value is never exposed.",
-      input_schema: {
-        type: "object",
-        properties: {
-          domain: {
-            type: "string",
-            description: "The domain to get credentials for (e.g., 'mybrightwheel.com', 'amazon.com')"
-          },
-          field: {
-            type: "string",
-            enum: ["username", "password"],
-            description: "Which credential field to fill: 'username' or 'password'"
-          },
-          ref: {
-            type: "string",
-            description: "Element ref of the input field to fill (e.g., 'e5')"
-          }
-        },
-        required: ["domain", "field", "ref"]
-      }
-    }
-  ];
-
-  /**
-   * Execute CDP browser tool
-   */
-  const executeCdpBrowserTool = async (toolName, toolInput) => {
-    try {
-      if (!currentUser?.username) {
-        return { error: "Not logged in - browser automation requires authentication" };
-      }
-      const controller = await getBrowserController(currentUser.username);
-      const sessionId = toolInput.sessionId || "default";
-      
-      switch (toolName) {
-        case "browser_navigate": {
-          if (!toolInput.url) {
-            return { error: "URL is required" };
-          }
-          const snapshot = await controller.navigate(sessionId, toolInput.url);
-          return {
-            success: true,
-            url: snapshot.url,
-            title: snapshot.title,
-            elementCount: snapshot.elementCount,
-            elements: snapshot.elements.slice(0, 50), // Limit elements to save tokens
-            screenshotDataUrl: snapshot.screenshot,
-            message: `Navigated to ${snapshot.url}. Found ${snapshot.elementCount} interactive elements. A screenshot is attached.`
-          };
-        }
-        
-        case "browser_click": {
-          if (!toolInput.ref) {
-            return { error: "Element ref is required (e.g., 'e5')" };
-          }
-          await controller.click(sessionId, toolInput.ref);
-          // Wait for any navigation/updates
-          await new Promise(resolve => setTimeout(resolve, 500));
-          // Return new snapshot
-          const snapshot = await controller.snapshot(sessionId);
-          return {
-            success: true,
-            clicked: toolInput.ref,
-            url: snapshot.url,
-            title: snapshot.title,
-            elementCount: snapshot.elementCount,
-            elements: snapshot.elements.slice(0, 50),
-            screenshotDataUrl: snapshot.screenshot,
-            message: `Clicked ${toolInput.ref}. Page updated. Screenshot attached.`
-          };
-        }
-        
-        case "browser_type": {
-          if (!toolInput.text) {
-            return { error: "Text is required" };
-          }
-          const typeResult = await controller.type(sessionId, toolInput.text, toolInput.ref);
-          
-          // Get a snapshot to verify typing worked
-          await new Promise(resolve => setTimeout(resolve, 300));
-          const snapshot = await controller.snapshot(sessionId);
-          
-          return {
-            success: true,
-            typed: toolInput.text.substring(0, 50) + (toolInput.text.length > 50 ? '...' : ''),
-            focused: typeResult.focused,
-            url: snapshot.url,
-            elements: snapshot.elements.slice(0, 50),
-            screenshotDataUrl: snapshot.screenshot,
-            message: typeResult.focused 
-              ? `Typed "${toolInput.text.substring(0, 30)}..." into the input. Screenshot shows current state. Use browser_press with 'Enter' to submit.`
-              : `Warning: Could not confirm focus on input element. Text may not have been typed. Check the screenshot and try clicking the input field first with browser_click.`
-          };
-        }
-        
-        case "browser_press": {
-          if (!toolInput.key) {
-            return { error: "Key is required (e.g., 'Enter')" };
-          }
-          await controller.press(sessionId, toolInput.key);
-          // Wait for any updates after key press
-          await new Promise(resolve => setTimeout(resolve, 500));
-          // Return snapshot if Enter was pressed (likely form submission)
-          if (toolInput.key === 'Enter') {
-            const snapshot = await controller.snapshot(sessionId);
-            return {
-              success: true,
-              pressed: toolInput.key,
-              url: snapshot.url,
-              title: snapshot.title,
-              elementCount: snapshot.elementCount,
-              elements: snapshot.elements.slice(0, 50),
-              screenshotDataUrl: snapshot.screenshot,
-              message: `Pressed ${toolInput.key}. Page may have updated. Screenshot attached.`
-            };
-          }
-          return {
-            success: true,
-            pressed: toolInput.key,
-            message: `Pressed ${toolInput.key}`
-          };
-        }
-        
-        case "browser_snapshot": {
-          const snapshot = await controller.snapshot(sessionId);
-          return {
-            success: true,
-            url: snapshot.url,
-            title: snapshot.title,
-            elementCount: snapshot.elementCount,
-            elements: snapshot.elements.slice(0, 50),
-            screenshotDataUrl: snapshot.screenshot,
-            message: `Current page: ${snapshot.title}. Found ${snapshot.elementCount} interactive elements. Screenshot attached.`
-          };
-        }
-        
-        case "browser_scroll": {
-          const direction = toolInput.direction || 'down';
-          const amount = toolInput.amount || 500;
-          await controller.scroll(sessionId, direction, amount);
-          // Return snapshot after scroll
-          const snapshot = await controller.snapshot(sessionId);
-          return {
-            success: true,
-            scrolled: direction,
-            url: snapshot.url,
-            elementCount: snapshot.elementCount,
-            elements: snapshot.elements.slice(0, 50),
-            screenshotDataUrl: snapshot.screenshot,
-            message: `Scrolled ${direction}. Screenshot attached.`
-          };
-        }
-        
-        case "browser_back": {
-          const snapshot = await controller.goBack(sessionId);
-          return {
-            success: true,
-            url: snapshot.url,
-            title: snapshot.title,
-            elementCount: snapshot.elementCount,
-            elements: snapshot.elements.slice(0, 50),
-            screenshotDataUrl: snapshot.screenshot,
-            message: `Went back to ${snapshot.url}. Screenshot attached.`
-          };
-        }
-        
-        case "browser_fill_credential": {
-          const { domain, field, ref } = toolInput;
-          if (!domain || !field || !ref) {
-            return { error: "domain, field, and ref are all required" };
-          }
-          
-          // Load credentials for this domain
-          const credentials = await loadCredentials();
-          const cred = credentials[domain];
-          
-          if (!cred) {
-            return { 
-              error: `No credentials found for domain: ${domain}`,
-              suggestion: `The user needs to add credentials for ${domain} in the Credentials page of the app.`
-            };
-          }
-          
-          let valueToFill;
-          if (field === 'username') {
-            valueToFill = cred.username;
-            if (!valueToFill) {
-              return { error: `No username saved for ${domain}` };
-            }
-          } else if (field === 'password') {
-            valueToFill = cred.password;
-            if (!valueToFill) {
-              return { error: `No password saved for ${domain}` };
-            }
-          } else {
-            return { error: `Invalid field: ${field}. Must be 'username' or 'password'` };
-          }
-          
-          // Use the controller to type the credential value
-          // First click the ref to focus, then type
-          // Pass sensitive=true for passwords to mask in logs
-          await controller.click(sessionId, ref);
-          await controller.type(sessionId, valueToFill, null, field === 'password');
-          
-          console.log(`[BrowserController] Filled ${field} credential for ${domain} into ${ref}`);
-          
-          return {
-            success: true,
-            message: `Securely filled ${field} for ${domain} into field ${ref}. The actual credential value is not shown for security.`,
-            // Note: Don't include the value or screenshot here - just confirm it worked
-          };
-        }
-        
-        default:
-          return { error: `Unknown browser tool: ${toolName}` };
-      }
-    } catch (err) {
-      console.error(`[BrowserController] Error executing ${toolName}:`, err.message);
-      return { 
-        error: err.message,
-        suggestion: "Try browser_snapshot to see the current page state, or browser_navigate to a new URL."
-      };
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
   // Shared Tool Builder - Used by both Chat and Task Executor
   // ─────────────────────────────────────────────────────────────────────────────
   
@@ -11683,7 +3175,7 @@ ${formatDecomposedSteps(steps)}
    * @param {Array} options.additionalTools - Extra tools to include
    * @returns {Object} { tools: Array, executeTool: Function }
    */
-  const buildToolsAndExecutor = (options = {}) => {
+  const buildToolsAndExecutor = async (options = {}) => {
     const {
       googleAccessToken = null,
       slackAccessToken = null,
@@ -11707,48 +3199,45 @@ ${formatDecomposedSteps(steps)}
       additionalTools = []
     } = options;
 
-    // Build tools list
-    const tools = [];
-    
-    if (includeProfileTools) tools.push(...profileTools);
-    if (includeTaskTools) tools.push(...taskTools);
-    if (includeMemoryTools) tools.push(...memoryTools);
-    
-    // Time tools - always available (get_current_time, parse_time, etc.)
-    tools.push(...timeTools);
-    
-    // Task primitive tools - always available for task execution (save_variable, evaluate_condition, notify_user, etc.)
+    // Build tools list using new integration registry
+    const integrationContext = {
+      currentUser,
+      mainWindow: win,
+      settings: {
+        weatherEnabled,
+        iMessageEnabled,
+        browserEnabled,
+        customWebEnabled
+      },
+      accessTokens: {
+        google: googleAccessToken,
+        slack: slackAccessToken,
+        telegram: telegramToken,
+        discord: discordAccessToken,
+        x: xAccessToken,
+        notion: notionAccessToken,
+        github: githubAccessToken,
+        asana: asanaAccessToken,
+        reddit: redditAccessToken,
+        spotify: spotifyAccessToken
+      },
+      apiKeys,
+      includeProfile: includeProfileTools,
+      includeTask: includeTaskTools,
+      includeMemory: includeMemoryTools,
+      whatsappConnector,
+      browserController: async () => await _getBrowserController(currentUser?.username),
+      loadCredentials: async (domain) => await loadCredentials(domain, currentUser?.username),
+      executeTaskStep: null // Will be set by task executor if needed
+    };
+
+    // Get tools from integration registry (async call)
+    const tools = await getIntegrationTools(integrationContext);
+
+    // Add task primitive tools (always available for task execution)
     tools.push(...taskPrimitiveTools);
-    
-    // Documentation tools - always available for help questions
-    tools.push(...documentationTools);
-    if (googleAccessToken) tools.push(...googleWorkspaceTools);
-    if (iMessageEnabled) tools.push(...iMessageTools);
-    if (weatherEnabled) tools.push(...weatherTools);
-    if (slackAccessToken) tools.push(...slackTools);
-    
-    // New integrations
-    if (telegramToken) tools.push(...telegramTools);
-    if (discordAccessToken) tools.push(...discordTools);
-    if (xAccessToken) tools.push(...xTools);
-    if (notionAccessToken) tools.push(...notionTools);
-    if (githubAccessToken) tools.push(...githubTools);
-    if (asanaAccessToken) tools.push(...asanaTools);
-    if (redditAccessToken) tools.push(...redditTools);
-    if (spotifyAccessToken) tools.push(...spotifyTools);
 
-    // Custom Web Integration tools
-    if (customWebEnabled) {
-      tools.push(...customWebTools);
-      console.log("[Tools] Custom web integration tools enabled");
-    }
-
-    // Browser tools (CDP-based direct control)
-    if (browserEnabled) {
-      tools.push(...cdpBrowserTools);
-      console.log("[Tools] Browser tools enabled");
-    }
-
+    // Add any additional custom tools
     if (additionalTools.length > 0) tools.push(...additionalTools);
 
     // Tool execution router
@@ -11789,113 +3278,14 @@ ${formatDecomposedSteps(steps)}
         }
       }
       
-      // Profile tools
-      if (profileTools.find(t => t.name === toolName)) {
-        return await executeProfileTool(toolName, toolInput);
-      }
-      // Task tools
-      if (taskTools.find(t => t.name === toolName)) {
-        return await executeTaskTool(toolName, toolInput);
-      }
-      // Memory tools
-      if (memoryTools.find(t => t.name === toolName)) {
-        console.log(`[Memory] Tool used: ${toolName} with input:`, JSON.stringify(toolInput));
-        let result;
-        switch (toolName) {
-          case "search_memory":
-            result = await executeMemorySearch(toolInput.query, toolInput.date_range);
-            break;
-          case "get_conversations_for_date":
-            result = await executeGetConversationsForDate(toolInput.date);
-            break;
-          case "search_memory_between_dates":
-            result = await executeSearchMemoryBetweenDates(toolInput.query, toolInput.start_date, toolInput.end_date);
-            break;
-          case "list_memory_dates":
-            result = await executeListMemoryDates(toolInput.limit);
-            break;
-          case "get_conversation_summary":
-            result = await executeGetConversationSummary(toolInput.date);
-            break;
-          default:
-            result = { error: `Unknown memory tool: ${toolName}` };
-        }
-        console.log(`[Memory] Tool ${toolName} result:`, result.found !== undefined ? `found=${result.found}` : 'completed');
-        return result;
-      }
-      // Documentation tools
-      if (documentationTools.find(t => t.name === toolName)) {
-        return await executeDocumentationFetch(toolInput.topic);
-      }
-      // Google tools
-      if (googleAccessToken && googleWorkspaceTools.find(t => t.name === toolName)) {
-        return await executeGoogleTool(toolName, toolInput, googleAccessToken, apiKeys);
-      }
-      // iMessage tools
-      if (iMessageEnabled && iMessageTools.find(t => t.name === toolName)) {
-        return await executeIMessageTool(toolName, toolInput);
-      }
-      // Weather tools
-      if (weatherEnabled && weatherTools.find(t => t.name === toolName)) {
-        return await executeWeatherTool(toolName, toolInput);
-      }
-      // Time tools (always available)
-      if (timeTools.find(t => t.name === toolName)) {
-        return await executeTimeTool(toolName, toolInput, { mainWindow: win });
-      }
       // Task primitive tools (always available - variables, control flow, etc.)
+      // These are NOT in the integration registry as they're task-specific
       if (taskPrimitiveTools.find(t => t.name === toolName)) {
         return await executeTaskPrimitiveTool(toolName, toolInput, { taskContext, mainWindow: win });
       }
-      // Slack tools
-      if (slackAccessToken && slackTools.find(t => t.name === toolName)) {
-        return await executeSlackTool(toolName, toolInput, slackAccessToken);
-      }
-      
-      // Telegram tools
-      if (telegramToken && telegramTools.find(t => t.name === toolName)) {
-        return await executeTelegramTool(toolName, toolInput);
-      }
-      // Discord tools
-      if (discordAccessToken && discordTools.find(t => t.name === toolName)) {
-        return await executeDiscordTool(toolName, toolInput, discordAccessToken);
-      }
-      // X (Twitter) tools
-      if (xAccessToken && xTools.find(t => t.name === toolName)) {
-        return await executeXTool(toolName, toolInput, xAccessToken);
-      }
-      // Notion tools
-      if (notionAccessToken && notionTools.find(t => t.name === toolName)) {
-        return await executeNotionTool(toolName, toolInput, notionAccessToken);
-      }
-      // GitHub tools
-      if (githubAccessToken && githubTools.find(t => t.name === toolName)) {
-        return await executeGitHubTool(toolName, toolInput, githubAccessToken);
-      }
-      // Asana tools
-      if (asanaAccessToken && asanaTools.find(t => t.name === toolName)) {
-        return await executeAsanaTool(toolName, toolInput, asanaAccessToken);
-      }
-      // Reddit tools
-      if (redditAccessToken && redditTools.find(t => t.name === toolName)) {
-        return await executeRedditTool(toolName, toolInput, redditAccessToken);
-      }
-      // Spotify tools
-      if (spotifyAccessToken && spotifyTools.find(t => t.name === toolName)) {
-        return await executeSpotifyTool(toolName, toolInput, spotifyAccessToken);
-      }
 
-      // Custom Web Integration tools
-      if (customWebEnabled && customWebTools.find(t => t.name === toolName)) {
-        return await executeCustomWebTool(toolName, toolInput);
-      }
-
-      // Browser tools (CDP-based)
-      if (browserEnabled && cdpBrowserTools.find(t => t.name === toolName)) {
-        return await executeCdpBrowserTool(toolName, toolInput);
-      }
-
-      return { error: `Tool ${toolName} not available` };
+      // All other tools are handled by the integration registry
+      return await executeIntegrationTool(toolName, toolInput, integrationContext);
     };
 
     return { tools, executeTool };
@@ -12010,7 +3400,7 @@ ${formatDecomposedSteps(steps)}
       console.log('[Integrations] No custom web integrations configured');
     }
 
-    const { tools, executeTool } = buildToolsAndExecutor({
+    const { tools, executeTool } = await buildToolsAndExecutor({
       googleAccessToken,
       slackAccessToken,
       weatherEnabled,
@@ -12285,10 +3675,34 @@ ${formatDecomposedSteps(steps)}
 
   console.log(`[Messaging] Registered ${Object.keys(messagingIntegrations).length} messaging integrations`);
 
+  console.log("[DEBUG] Checkpoint 2: Before processChatQuery definition");
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Set up TaskExecutionEngine (moved here to avoid temporal dead zone error)
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Set up TaskExecutionEngine with dependency injection
+  TaskExecutionEngine.setGetTaskCallback(getTask);
+  TaskExecutionEngine.setUpdateTaskCallback(updateTask);
+  TaskExecutionEngine.setLoadIntegrationsCallback(loadIntegrationsAndBuildTools);
+  TaskExecutionEngine.setAddTaskUpdateCallback(addTaskUpdate);
+  TaskExecutionEngine.setGetSettingsPathCallback(getSettingsPath);
+  // NOTE: executeTool is obtained from loadIntegrationsAndBuildTools(), not passed directly
+  TaskExecutionEngine.setExecuteTaskStepCallback(executeTaskStep);
+  TaskExecutionEngine.setMainWindow(win);
+  TaskExecutionEngine.setCurrentUser(currentUser);
+
+  // Use TaskExecutionEngine for task execution
+  setTaskExecutor(async (taskId) => {
+    return await TaskExecutionEngine.executeTaskStep(taskId);
+  });
+
+  console.log("[DEBUG] TaskExecutionEngine configured successfully");
+
   // ─────────────────────────────────────────────────────────────────────────────
   // Core Chat Processing Function (shared by IPC handler and inline execution)
   // ─────────────────────────────────────────────────────────────────────────────
-  
+
   /**
    * Process a chat query through the full pipeline
    * @param {Array} messages - Chat messages array
@@ -12421,20 +3835,8 @@ ${formatDecomposedSteps(steps)}
         const procedure = Array.isArray(generatedSkill.procedure) ? generatedSkill.procedure : [];
         const constraints = Array.isArray(generatedSkill.constraints) ? generatedSkill.constraints : [];
         
-        // Check if this is the skill_demo stage and advance onboarding
-        let onboardingAdvancedMessage = "";
-        try {
-          const profilePath = await getUserProfilePath(currentUser?.username);
-          const profileMarkdown = await fs.readFile(profilePath, "utf8");
-          const userProfile = parseUserProfile(profileMarkdown);
-          if (userProfile.onboardingStage === "skill_demo") {
-            console.log("[Onboarding] Skill created during skill_demo, prompting to test it");
-            // Don't advance yet - wait for them to test the skill
-            onboardingAdvancedMessage = `\n\nYour skill is ready! Now test it by saying **"Marco"** and see what happens.`;
-          }
-        } catch (err) {
-          console.error("[Onboarding] Error checking skill_demo stage:", err.message);
-        }
+        // Check if this is the skill_demo stage
+        const onboardingAdvancedMessage = await TutorialService.checkSkillCreationMessage(currentUser?.username);
         
         // Format response with skill details
         const response = `I've created a new skill: **${generatedSkill.name}**\n\n` +
@@ -12859,16 +4261,15 @@ ${formatDecomposedSteps(steps)}
           } catch { return false; }
         })();
         
-        const toolsForDecomposition = [
-          ...profileTools, ...taskTools, ...memoryTools,
-          ...timeTools, // Time tools for get_current_time and send_reminder
-          ...taskPrimitiveTools, // Fundamental tools: variables, control flow, time comparison
-          ...(accessToken ? googleWorkspaceTools : []),
-          ...(process.platform === "darwin" ? iMessageTools : []),
-          ...weatherTools,
-          ...(slackToken ? slackTools : []),
-          ...(hasBrowser ? cdpBrowserTools : [])
-        ];
+        // Get tools from integration registry
+        const integrationContext = {
+          currentUser,
+          mainWindow: win,
+          settings: { weatherEnabled: true, iMessageEnabled: process.platform === "darwin", browserEnabled: hasBrowser },
+          accessTokens: { google: accessToken, slack: slackToken }
+        };
+        const integrationTools = await getIntegrationTools(integrationContext);
+        const toolsForDecomposition = [...integrationTools, ...taskPrimitiveTools];
         
         // Debug: Log available tools
         console.log(`[QueryDecomposition] Available tools (${toolsForDecomposition.length}): ${toolsForDecomposition.map(t => t.name).join(', ')}`);
@@ -13255,6 +4656,8 @@ No prior message history found with "${conversationStyleContext.recipient}". Usi
     };
   }
 
+  console.log("[DEBUG] Checkpoint 3: After processChatQuery definition");
+
   // ─────────────────────────────────────────────────────────────────────────────
   // Message Confirmation IPC Handlers
   // ─────────────────────────────────────────────────────────────────────────────
@@ -13380,7 +4783,7 @@ You have FULL access to the user's tools including calendar, email, contacts, et
 
       // Process with tool calls (up to 6 iterations)
       if (useProvider === "anthropic" && apiKeys.anthropic) {
-        const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
+        const anthropicModel = models.anthropic || "claude-sonnet-4-5-20250929";
         let currentMessages = [...messages];
         
         for (let iteration = 0; iteration < 20; iteration++) {
@@ -13500,6 +4903,133 @@ You have FULL access to the user's tools including calendar, email, contacts, et
   });
 
   // Chat handler with agentic workflow
+  /**
+   * Extract facts from user's response to a profile question
+   * @param {string} userResponse - User's answer
+   * @param {object} profileQuestion - The question that was asked
+   * @param {object} apiKeys - API keys for LLM
+   * @param {string} activeProvider - Active LLM provider
+   * @param {object} models - Model configurations
+   * @returns {Promise<Array>} Extracted facts
+   */
+  async function extractFactsFromProfileResponse(userResponse, profileQuestion, apiKeys, activeProvider, models) {
+    try {
+      const extractionPrompt = `You are extracting structured facts from a user's response to a profile question.
+
+**Question Asked:** ${profileQuestion.question}
+**Question Category:** ${profileQuestion.category}
+**User's Response:** ${userResponse}
+
+**Your Task:**
+Extract concrete, factual information from the user's response. Return facts in this format:
+
+FACT_COUNT: [number of facts, or 0 if no clear facts]
+FACT_1: [structured fact statement]
+FACT_2: [structured fact statement]
+...
+
+**Guidelines:**
+- Only extract clear, concrete facts (not assumptions or interpretations)
+- Format facts as complete statements
+- For contact info: "Contact: [Name] ([Relationship]) - [Phone/Email]"
+- For activities: "Activity: [Name] - [Description] ([Schedule])"
+- For goals: "Goal: [Goal description]"
+- For preferences: "Preference: [Type] - [Value]"
+- For relationships: "Relationship: [Name] is [user's relationship to them]"
+- If user declined to answer or gave vague response, return FACT_COUNT: 0
+
+**Examples:**
+
+Question: "Is 183-840-8240 your co-worker Dan?"
+Response: "Yes, that's Dan from accounting"
+Output:
+FACT_COUNT: 1
+FACT_1: Contact: Dan (Accounting colleague) - 183-840-8240
+
+Question: "What are your RSM classes?"
+Response: "It's a math program for my kids Essa and Nova"
+Output:
+FACT_COUNT: 2
+FACT_1: Family: Children - Essa, Nova
+FACT_2: Activity: RSM math enrichment program
+
+Response: "I don't want to share that"
+Output:
+FACT_COUNT: 0
+
+Your output:`;
+
+      let llmResponse = "";
+
+      // Try Anthropic
+      if (activeProvider === "anthropic" && apiKeys.anthropic) {
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKeys.anthropic,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: models.anthropic || "claude-3-5-sonnet-20241022",
+            max_tokens: 300,
+            temperature: 0.3,
+            messages: [{ role: "user", content: extractionPrompt }]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          llmResponse = data.content[0].text.trim();
+        }
+      } else if (activeProvider === "openai" && apiKeys.openai) {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKeys.openai}`
+          },
+          body: JSON.stringify({
+            model: models.openai || "gpt-4o",
+            max_tokens: 300,
+            temperature: 0.3,
+            messages: [{ role: "user", content: extractionPrompt }]
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          llmResponse = data.choices[0].message.content.trim();
+        }
+      }
+
+      // Parse response
+      const countMatch = llmResponse.match(/FACT_COUNT:\s*(\d+)/i);
+      if (!countMatch || parseInt(countMatch[1]) === 0) {
+        return [];
+      }
+
+      const factCount = parseInt(countMatch[1]);
+      const facts = [];
+
+      for (let i = 1; i <= factCount; i++) {
+        const factMatch = llmResponse.match(new RegExp(`FACT_${i}:\\s*(.+)`, 'i'));
+        if (factMatch) {
+          facts.push({
+            content: factMatch[1].trim(),
+            source: 'profile_question',
+            category: profileQuestion.category
+          });
+        }
+      }
+
+      return facts;
+    } catch (err) {
+      console.error("[ProfileQuestion] Error extracting facts:", err);
+      return [];
+    }
+  }
+
   ipcMain.handle("chat:send", async (_event, { messages, skipDecomposition = false, stepContext = null, workflowContext = null }) => {
     // Helper to save conversation to daily memory
     const saveConversationToMemory = async (userMsg, assistantResp) => {
@@ -13511,13 +5041,7 @@ You have FULL access to the user's tools including calendar, email, contacts, et
         console.error("[Memory] Failed to save conversation:", err.message);
       }
     };
-    
-    // Helper to check for skill demo completion (Marco -> Polo test)
-    // Delegates to shared helper function
-    const checkSkillDemoCompletion = async (userMsg, assistantResp) => {
-      await checkSkillDemoCompletionShared(userMsg, assistantResp, currentUser?.username, win);
-    };
-    
+
     // Extract user's message for memory saving
     const userMessage = messages[messages.length - 1]?.content || "";
     
@@ -13526,84 +5050,93 @@ You have FULL access to the user's tools including calendar, email, contacts, et
       if (!currentUser?.username) {
         return { ok: false, error: "Please log in to use chat. Click the logout icon and log in again." };
       }
-      
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // Profile Question Response Detection
+      // ─────────────────────────────────────────────────────────────────────────
+      let profileFactConfirmation = null;
+
+      if (lastWelcomeResponse?.profileQuestion && messages.length >= 2) {
+        // The previous message might have been the welcome with the question
+        // Check if this could be a response to that question
+        const lastUserMessage = messages[messages.length - 2];
+        const isLikelyResponse = lastUserMessage?.role === "assistant" &&
+                                 lastUserMessage?.content?.includes("Quick question:");
+
+        if (isLikelyResponse) {
+          console.log("[ProfileQuestion] Detected potential response to profile question");
+
+          // Load settings for API access
+          const settingsPath = await getSettingsPath(currentUser?.username);
+          let apiKeys = {};
+          let models = {};
+          let activeProvider = "anthropic";
+          try {
+            const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+            apiKeys = settings.apiKeys || {};
+            models = settings.models || {};
+            activeProvider = settings.activeProvider || "anthropic";
+          } catch {
+            // Use defaults
+          }
+
+          // Extract facts from response
+          const extractedFacts = await extractFactsFromProfileResponse(
+            userMessage,
+            lastWelcomeResponse.profileQuestion,
+            apiKeys,
+            activeProvider,
+            models
+          );
+
+          if (extractedFacts.length > 0) {
+            console.log(`[ProfileQuestion] Extracted ${extractedFacts.length} facts:`, extractedFacts);
+
+            // Save to profile
+            try {
+              await ProfileService.addFacts(
+                currentUser.username,
+                extractedFacts,
+                {} // No conflict resolutions needed for profile questions
+              );
+
+              // Generate confirmation message
+              const factsList = extractedFacts.map(f => f.content).join('\n- ');
+              profileFactConfirmation = `✓ Got it! I've updated your profile with:\n- ${factsList}`;
+
+              console.log("[ProfileQuestion] Facts saved to profile");
+            } catch (err) {
+              console.error("[ProfileQuestion] Error saving facts:", err);
+            }
+
+            // Clear the profile question so we don't try to extract again
+            lastWelcomeResponse = null;
+          } else {
+            console.log("[ProfileQuestion] No facts extracted from response");
+          }
+        }
+      }
+
       // ─────────────────────────────────────────────────────────────────────────
       // Tutorial Mode - Handle onboarding stages with isolated processing
       // ─────────────────────────────────────────────────────────────────────────
-      
-      // Load profile to check onboarding stage
-      let profile = null;
-      try {
-        const profilePath = await getUserProfilePath(currentUser.username);
-        const markdown = await fs.readFile(profilePath, "utf8");
-        profile = parseUserProfile(markdown);
-      } catch {
-        // No profile yet
-      }
-      
-      const currentStage = profile?.onboardingStage || "completed";
-      
-      // Check if we should use tutorial mode (isolated from task decomposition)
-      if (shouldUseTutorialMode(currentStage, userMessage)) {
-        console.log(`[Tutorial] Processing message in tutorial mode (stage: ${currentStage})`);
-        
-        // Check for stage advancement triggers
-        const advancement = await checkStageAdvancement(currentStage, userMessage, {
-          lastResponse: messages[messages.length - 2]?.content
-        });
-        
-        if (advancement && advancement.shouldAdvance) {
-          console.log(`[Tutorial] Advancing from ${currentStage} to ${advancement.nextStage}`);
-          profile.onboardingStage = advancement.nextStage;
-          const profilePath = await getUserProfilePath(currentUser.username);
-          await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
-          
-          if (advancement.response) {
-            return { ok: true, response: advancement.response };
-          }
-          // If no response, will continue to show next stage welcome
+
+      const tutorialResult = await TutorialService.processTutorialMessage(
+        userMessage,
+        currentUser.username,
+        messages[messages.length - 2]?.content
+      );
+
+      if (tutorialResult.useTutorialMode && tutorialResult.response) {
+        let response = tutorialResult.response;
+
+        // Prepend profile fact confirmation if facts were extracted
+        if (profileFactConfirmation) {
+          response = profileFactConfirmation + "\n\n" + response;
         }
-        
-        // Handle profile stage - collect user info
-        if (currentStage === "profile") {
-          console.log(`[Tutorial] Processing profile collection`);
-          const result = await processProfileStageMessage(userMessage, profile, null);
-          
-          // Save the updated fields
-          if (Object.keys(result.updatedFields).length > 0) {
-            const profilePath = await getUserProfilePath(currentUser.username);
-            Object.assign(profile, result.updatedFields);
-            
-            // Check if we should advance to next stage
-            if (result.shouldAdvance) {
-              console.log(`[Tutorial] Profile complete, advancing to task_demo`);
-              profile.onboardingStage = "task_demo";
-            }
-            
-            await fs.writeFile(profilePath, serializeUserProfile(profile), "utf8");
-          }
-          
-          // Return the response (next question or completion message)
-          if (result.response) {
-            // Save to memory
-            await saveConversationToMemory(userMessage, result.response);
-            return { ok: true, response: result.response };
-          }
-          
-          // If shouldAdvance but no response, show next stage welcome
-          if (result.shouldAdvance) {
-            const welcome = getStageWelcomeMessage("task_demo", profile, "afternoon");
-            await saveConversationToMemory(userMessage, welcome.message);
-            return { ok: true, response: welcome.message };
-          }
-        }
-        
-        // For other tutorial stages, generate a guidance response
-        const tutorialResponse = generateTutorialResponse(currentStage, userMessage, profile);
-        if (tutorialResponse) {
-          await saveConversationToMemory(userMessage, tutorialResponse);
-          return { ok: true, response: tutorialResponse };
-        }
+
+        await saveConversationToMemory(userMessage, response);
+        return { ok: true, response };
       }
       
       // ─────────────────────────────────────────────────────────────────────────
@@ -13790,14 +5323,14 @@ Example: "email jeff about the meeting" → messagingChannel: "email"
 
 NEVER create a task without explicit user confirmation first. Only create ONE task per request.`;
 
-      // Combine tools
-      const allTools = [...profileTools, ...taskTools, ...memoryTools, ...timeTools];
-      if (hasGoogleTools) allTools.push(...googleWorkspaceTools);
-      if (hasIMessageTools) allTools.push(...iMessageTools);
-      if (weatherEnabled) allTools.push(...weatherTools);
-      if (hasSlackTools) allTools.push(...slackTools);
-      // Browser tools (CDP-based)
-      if (hasBrowserTools) allTools.push(...cdpBrowserTools);
+      // Get tools from integration registry
+      const integrationContext = {
+        currentUser,
+        mainWindow: win,
+        settings: { weatherEnabled, iMessageEnabled: hasIMessageTools, browserEnabled: hasBrowserTools },
+        accessTokens: { google: hasGoogleTools ? await getGoogleAccessToken(currentUser?.username) : null, slack: hasSlackTools ? await getSlackAccessToken(currentUser?.username) : null }
+      };
+      const allTools = await getIntegrationTools(integrationContext);
 
       // Determine which provider to use
       const useProvider = apiKeys[activeProvider] ? activeProvider : 
@@ -13811,7 +5344,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
 
       // Call LLM with tools
       if (useProvider === "anthropic" && apiKeys.anthropic) {
-        const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
+        const anthropicModel = models.anthropic || "claude-sonnet-4-5-20250929";
         let currentMessages = messages.map(m => ({ role: m.role, content: m.content }));
         
         for (let iteration = 0; iteration < 20; iteration++) {
@@ -13845,7 +5378,25 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             await saveConversationToMemory(userMessage, responseText);
 
             // Check for skill demo completion (Marco -> Polo test)
-            await checkSkillDemoCompletion(userMessage, responseText);
+            const skillDemoResult = await TutorialService.checkSkillDemoCompletion(
+              userMessage,
+              responseText,
+              currentUser.username
+            );
+            if (skillDemoResult.advanced && skillDemoResult.message && win && !win.isDestroyed()) {
+              setTimeout(() => {
+                win.webContents.send("chat:newMessage", {
+                  role: "assistant",
+                  content: skillDemoResult.message,
+                  source: "app"
+                });
+              }, 2000);
+            }
+
+            // Prepend profile fact confirmation if facts were extracted
+            if (profileFactConfirmation) {
+              responseText = profileFactConfirmation + "\n\n" + responseText;
+            }
 
             // Cache the response for future queries
             if (!stepContext && !workflowContext) {
@@ -13863,7 +5414,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
           const toolResults = [];
 
           // Build tool executor with current context
-          const chatToolExecutor = buildToolsAndExecutor({
+          const chatToolExecutor = await buildToolsAndExecutor({
             googleAccessToken: accessToken,
             slackAccessToken,
             weatherEnabled,
@@ -13965,7 +5516,25 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             await saveConversationToMemory(userMessage, responseText);
 
             // Check for skill demo completion (Marco -> Polo test)
-            await checkSkillDemoCompletion(userMessage, responseText);
+            const skillDemoResult = await TutorialService.checkSkillDemoCompletion(
+              userMessage,
+              responseText,
+              currentUser.username
+            );
+            if (skillDemoResult.advanced && skillDemoResult.message && win && !win.isDestroyed()) {
+              setTimeout(() => {
+                win.webContents.send("chat:newMessage", {
+                  role: "assistant",
+                  content: skillDemoResult.message,
+                  source: "app"
+                });
+              }, 2000);
+            }
+
+            // Prepend profile fact confirmation if facts were extracted
+            if (profileFactConfirmation) {
+              responseText = profileFactConfirmation + "\n\n" + responseText;
+            }
 
             // Cache the response for future queries
             if (!stepContext && !workflowContext) {
@@ -13981,7 +5550,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
           currentMessages.push(choice.message);
 
           // Build tool executor with current context
-          const openaiToolExecutor = buildToolsAndExecutor({
+          const openaiToolExecutor = await buildToolsAndExecutor({
             googleAccessToken: accessToken,
             slackAccessToken,
             weatherEnabled,
@@ -14066,11 +5635,29 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
         await saveConversationToMemory(userMessage, text);
 
         // Check for skill demo completion (Marco -> Polo test)
-        await checkSkillDemoCompletion(userMessage, text);
+        const skillDemoResult = await TutorialService.checkSkillDemoCompletion(
+          userMessage,
+          text,
+          currentUser.username
+        );
+        if (skillDemoResult.advanced && skillDemoResult.message && win && !win.isDestroyed()) {
+          setTimeout(() => {
+            win.webContents.send("chat:newMessage", {
+              role: "assistant",
+              content: skillDemoResult.message,
+              source: "app"
+            });
+          }, 2000);
+        }
 
         // Cache the response for future queries
         if (!stepContext && !workflowContext) {
           responseCache.cacheResponse(userMessage, currentUser?.username, text);
+        }
+
+        // Prepend profile fact confirmation if facts were extracted
+        if (profileFactConfirmation) {
+          text = profileFactConfirmation + "\n\n" + text;
         }
 
         // Log performance metrics
@@ -14090,6 +5677,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
   // Streaming Chat Handler - Real-time response streaming
   // ───────────────────────────────────────────────────────────────────────────
 
+  console.log("[DEBUG] About to register chat:sendStream handler");
   ipcMain.handle("chat:sendStream", async (_event, { messages, skipDecomposition = false, stepContext = null, workflowContext = null }) => {
     try {
       console.log("[StreamingChat] Starting streaming response...");
@@ -14176,13 +5764,14 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
       // Add task system prompt (simplified for streaming)
       systemPrompt += `\n\nYou can create autonomous background TASKS for scheduling, follow-ups, or multi-step coordination. Offer to create a task when requests involve waiting for responses or scheduling negotiations.`;
 
-      // Combine tools
-      const allTools = [...profileTools, ...taskTools, ...memoryTools, ...timeTools];
-      if (hasGoogleTools) allTools.push(...googleWorkspaceTools);
-      if (hasIMessageTools) allTools.push(...iMessageTools);
-      if (weatherEnabled) allTools.push(...weatherTools);
-      if (hasSlackTools) allTools.push(...slackTools);
-      if (hasBrowserTools) allTools.push(...cdpBrowserTools);
+      // Get tools from integration registry
+      const integrationContext = {
+        currentUser,
+        mainWindow: win,
+        settings: { weatherEnabled, iMessageEnabled: hasIMessageTools, browserEnabled: hasBrowserTools },
+        accessTokens: { google: hasGoogleTools ? await getGoogleAccessToken(currentUser?.username) : null, slack: hasSlackTools ? await getSlackAccessToken(currentUser?.username) : null }
+      };
+      const allTools = await getIntegrationTools(integrationContext);
 
       console.log(`[StreamingChat] Tools available: ${allTools.length}`, allTools.map(t => t.name));
 
@@ -14190,7 +5779,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
       const conversationMessages = messages.filter(m => m.role !== 'system');
 
       if (activeProvider === 'anthropic' && apiKeys.anthropic) {
-        const model = models.anthropic || 'claude-sonnet-4-20250514';
+        const model = models.anthropic || 'claude-sonnet-4-5-20250929';
 
         // Tool execution loop - continue streaming until no more tool uses
         let currentMessages = [...conversationMessages];
@@ -14258,7 +5847,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
           const toolResults = [];
 
           // Build tool executor
-          const chatToolExecutor = buildToolsAndExecutor({
+          const chatToolExecutor = await buildToolsAndExecutor({
             googleAccessToken: accessToken,
             slackAccessToken,
             weatherEnabled,
@@ -14411,7 +6000,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
             console.log('[StreamingChat] Tool call:', toolCall.function.name, toolCall.function.arguments);
 
             // Build tool executor with current context
-            const chatToolExecutor = buildToolsAndExecutor({
+            const chatToolExecutor = await buildToolsAndExecutor({
               googleAccessToken: accessToken,
               slackAccessToken,
               weatherEnabled,
@@ -14488,6 +6077,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
       return { ok: false, error: err.message };
     }
   });
+  console.log("[DEBUG] chat:sendStream handler registered successfully");
 
   // Execute decomposed steps inline (when user dismisses task suggestion)
   ipcMain.handle("chat:executeInline", async (_event, { decomposition, originalMessage }) => {
@@ -14524,7 +6114,7 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
           apiKeys = settings.apiKeys || {};
         } catch { /* default */ }
 
-        const toolExecutor = buildToolsAndExecutor({
+        const toolExecutor = await buildToolsAndExecutor({
           googleAccessToken: accessToken,
           slackAccessToken,
           weatherEnabled: true,
@@ -14790,7 +6380,20 @@ NEVER create a task without explicit user confirmation first. Only create ONE ta
         });
         
         // Check for skill demo completion (Marco/Polo test) after inline execution
-        await checkSkillDemoCompletionShared(originalMessage, response, currentUser?.username, win);
+        const skillDemoResult = await TutorialService.checkSkillDemoCompletion(
+          originalMessage,
+          response,
+          currentUser.username
+        );
+        if (skillDemoResult.advanced && skillDemoResult.message && win && !win.isDestroyed()) {
+          setTimeout(() => {
+            win.webContents.send("chat:newMessage", {
+              role: "assistant",
+              content: skillDemoResult.message,
+              source: "app"
+            });
+          }, 2000);
+        }
         
         return { ok: true, response };
       }
@@ -15055,7 +6658,7 @@ ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
           let stepResponse = null;
           
           if (activeProvider === "anthropic" && apiKeys.anthropic) {
-            const anthropicModel = models.anthropic || "claude-sonnet-4-20250514";
+            const anthropicModel = models.anthropic || "claude-sonnet-4-5-20250929";
             let iterationMessages = stepMessages.map(m => ({ role: m.role, content: m.content }));
             
             for (let iteration = 0; iteration < 20; iteration++) { // Increased for browser automation
@@ -15317,7 +6920,20 @@ ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
       }
       
       // Check for skill demo completion (Marco/Polo test) after LLM inline execution
-      await checkSkillDemoCompletionShared(originalMessage, finalResponse, currentUser?.username, win);
+      const skillDemoResult = await TutorialService.checkSkillDemoCompletion(
+        originalMessage,
+        finalResponse,
+        currentUser.username
+      );
+      if (skillDemoResult.advanced && skillDemoResult.message && win && !win.isDestroyed()) {
+        setTimeout(() => {
+          win.webContents.send("chat:newMessage", {
+            role: "assistant",
+            content: skillDemoResult.message,
+            source: "app"
+          });
+        }, 2000);
+      }
       
       return {
         ok: true,
@@ -15331,6 +6947,14 @@ ${uniqueUrls.slice(0, 5).map(url => `- ${url}`).join('\n')}
       return { ok: false, error: err.message };
     }
   });
+
+  console.log("[DEBUG] All IPC handlers registered successfully");
+
+  // Now create and show the window - handlers are ready!
+  createWindow();
+  setMainWindow(win);
+
+  console.log("[DEBUG] app.whenReady callback completed - window created");
 });
 
 app.on("window-all-closed", async () => {

@@ -10,7 +10,14 @@ import { getUserDataDir } from '../utils/helpers';
 /**
  * Valid onboarding stages
  */
-export type OnboardingStage = 'api_setup' | 'profile' | 'task_demo' | 'skill_demo' | 'integrations' | 'completed';
+export type OnboardingStage =
+  | 'api_setup'
+  | 'profile'
+  | 'goals_intro'
+  | 'task_demo'
+  | 'skill_demo'
+  | 'integrations'
+  | 'completed';
 
 /**
  * Valid onboarding stages array
@@ -18,10 +25,11 @@ export type OnboardingStage = 'api_setup' | 'profile' | 'task_demo' | 'skill_dem
 export const ONBOARDING_STAGES: readonly OnboardingStage[] = [
   'api_setup',
   'profile',
+  'goals_intro',
   'task_demo',
   'skill_demo',
   'integrations',
-  'completed'
+  'completed',
 ];
 
 /**
@@ -56,7 +64,7 @@ export const getUserProfilePath = async (username: string): Promise<string> => {
   // Look for existing profile or create one
   try {
     const files = await fs.readdir(profilesDir);
-    const profileFile = files.find(f => f.endsWith('.md'));
+    const profileFile = files.find((f) => f.endsWith('.md'));
     if (profileFile) {
       return path.join(profilesDir, profileFile);
     }
@@ -113,7 +121,7 @@ export const parseUserProfile = (markdown: string): UserProfile => {
     onboardingStage: 'api_setup', // Default to api_setup for new users
     onboardingSkippedAt: null,
     goals: [], // User goals and priorities
-    notes: [] // Custom facts and notes
+    notes: [], // Custom facts and notes
   };
 
   const lines = markdown.split('\n');
@@ -129,7 +137,11 @@ export const parseUserProfile = (markdown: string): UserProfile => {
     }
 
     // Check if we're entering the Notes section
-    if (line.match(/^##\s*Notes/i) || line.match(/^##\s*Personal Notes/i) || line.match(/^##\s*Custom Facts/i)) {
+    if (
+      line.match(/^##\s*Notes/i) ||
+      line.match(/^##\s*Personal Notes/i) ||
+      line.match(/^##\s*Custom Facts/i)
+    ) {
       inNotesSection = true;
       inGoalsSection = false;
       continue;

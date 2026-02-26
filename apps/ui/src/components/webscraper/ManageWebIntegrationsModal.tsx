@@ -3,8 +3,9 @@ import './WebIntegrationModal.css';
 
 interface ManageWebIntegrationsModalProps {
   onClose: () => void;
-  onEdit: (siteId: string) => void;
-  onDelete: (siteId: string) => void;
+  onEdit?: (siteId: string) => void;
+  onDelete?: (siteId: string) => void;
+  onUpdate?: () => Promise<void>;
 }
 
 interface Integration {
@@ -12,11 +13,26 @@ interface Integration {
   name: string;
   url: string;
   enabled: boolean;
+  authMethod?: 'oauth' | 'form' | 'none';
+  oauth?: {
+    provider?: string;
+    loginDetectionSelector?: string;
+    successDetectionSelector?: string;
+  };
+  twoFactorAuth?: {
+    enabled: boolean;
+    method: 'sms' | 'email' | 'authenticator' | 'unknown';
+    target?: string;
+    codeLength?: number;
+    requiredIntegration?: 'gmail' | 'imessage' | null;
+    selector?: string;
+  };
   status: {
     lastSuccess?: string;
     lastError?: string;
     consecutiveFailures?: number;
     paused?: boolean;
+    twoFactorMode?: 'automated' | 'manual';
   };
 }
 
@@ -279,6 +295,45 @@ export default function ManageWebIntegrationsModal({ onClose, onEdit, onDelete }
                         <span className="detail-value">{integration.status.consecutiveFailures}</span>
                       </div>
                     )}
+
+                    {integration.twoFactorAuth?.enabled && (
+                      <div className="detail-row">
+                        <span className="detail-label">2FA Mode:</span>
+                        {integration.status?.twoFactorMode === 'automated' ? (
+                          <span className="twofa-badge automated">
+                            ✓ Automated ({integration.twoFactorAuth.method})
+                          </span>
+                        ) : (
+                          <span className="twofa-badge manual">
+                            👤 Manual ({integration.twoFactorAuth.method})
+                          </span>
+                        )}
+                      </div>
+                    )}
+
+                    {integration.status?.twoFactorMode === 'manual' && integration.twoFactorAuth?.enabled && (
+                      <div className="info-box" style={{ marginTop: '8px', fontSize: '13px' }}>
+                        <strong>ℹ️ Manual 2FA:</strong>
+                        {integration.twoFactorAuth.method === 'email' && (
+                          <p>
+                            Email-based 2FA detected. Connect Gmail for automatic code retrieval,
+                            or complete 2FA manually when prompted.
+                          </p>
+                        )}
+                        {integration.twoFactorAuth.method === 'sms' && (
+                          <p>
+                            SMS-based 2FA detected. Enable iMessage for automatic code retrieval,
+                            or complete 2FA manually when prompted.
+                          </p>
+                        )}
+                        {integration.twoFactorAuth.method === 'authenticator' && (
+                          <p>
+                            Authenticator app 2FA requires manual entry. You'll be notified in chat
+                            when authentication is needed.
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   <div className="integration-item-actions">
@@ -317,7 +372,7 @@ export default function ManageWebIntegrationsModal({ onClose, onEdit, onDelete }
 
                     <button
                       className="btn btn-sm btn-ghost"
-                      onClick={() => onEdit(integration.id)}
+                      onClick={() => onEdit?.(integration.id)}
                     >
                       Edit
                     </button>

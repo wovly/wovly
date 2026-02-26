@@ -5,6 +5,9 @@ contextBridge.exposeInMainWorld("wovly", {
     get: () => ipcRenderer.invoke("settings:get"),
     set: (settings) => ipcRenderer.invoke("settings:set", { settings })
   },
+  system: {
+    openSystemPreferences: (pane) => ipcRenderer.invoke("system:openSystemPreferences", pane)
+  },
   chat: {
     send: (messages, workflowContext = null) => ipcRenderer.invoke("chat:send", { messages, workflowContext }),
     sendStream: (messages, workflowContext = null) => ipcRenderer.invoke("chat:sendStream", { messages, workflowContext }),
@@ -20,6 +23,12 @@ contextBridge.exposeInMainWorld("wovly", {
       const handler = (_event, data) => callback(data);
       ipcRenderer.on("chat:screenshot", handler);
       return () => ipcRenderer.removeListener("chat:screenshot", handler);
+    },
+    // Subscribe to system notifications (2FA auth needed, etc.)
+    onSystemNotification: (callback) => {
+      const handler = (_event, data) => callback(data);
+      ipcRenderer.on("system-notification", handler);
+      return () => ipcRenderer.removeListener("system-notification", handler);
     },
     // Streaming events
     onStreamDelta: (callback) => {
@@ -77,6 +86,7 @@ contextBridge.exposeInMainWorld("wovly", {
     testWeather: () => ipcRenderer.invoke("integrations:testWeather"),
     startGoogleOAuth: (clientId, clientSecret) => ipcRenderer.invoke("integrations:startGoogleOAuth", { clientId, clientSecret }),
     checkGoogleAuth: () => ipcRenderer.invoke("integrations:checkGoogleAuth"),
+    connectGoogle: () => ipcRenderer.invoke("integrations:connectGoogle"),
     disconnectGoogle: () => ipcRenderer.invoke("integrations:disconnectGoogle"),
     startSlackTunnel: () => ipcRenderer.invoke("integrations:startSlackTunnel"),
     stopSlackTunnel: () => ipcRenderer.invoke("integrations:stopSlackTunnel"),
@@ -261,6 +271,7 @@ contextBridge.exposeInMainWorld("wovly", {
     testConfiguration: (config) => ipcRenderer.invoke("webscraper:testConfiguration", { config }),
     testIntegration: (siteId) => ipcRenderer.invoke("webscraper:testIntegration", { siteId }),
     launchOAuthLogin: (config) => ipcRenderer.invoke("webscraper:launchOAuthLogin", config),
+    startRecording: (params) => ipcRenderer.invoke("webscraper:startRecording", params),
     // Credential management (secure, local-only storage)
     checkCredentials: (domain) => ipcRenderer.invoke("webscraper:checkCredentials", { domain }),
     saveCredentials: (request) => ipcRenderer.invoke("webscraper:saveCredentials", { request }),

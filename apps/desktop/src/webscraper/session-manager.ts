@@ -29,6 +29,11 @@ export interface SiteConfig {
       submitButton?: string;
       successIndicator?: string;
     };
+    navigation?: Array<{
+      selector: string;
+      action?: string;
+      description?: string;
+    }>;
   };
 }
 
@@ -169,7 +174,21 @@ export async function validateSession(page: Page, siteConfig: SiteConfig): Promi
       }
     }
 
-    // If no success indicator specified, assume valid if not on login page
+    // Fallback: Check if first navigation element exists (means we're logged in)
+    if (siteConfig.selectors.navigation && siteConfig.selectors.navigation.length > 0) {
+      const firstNavSelector = siteConfig.selectors.navigation[0].selector;
+      try {
+        await page.waitForSelector(firstNavSelector, { timeout: 5000 });
+        // Session valid - navigation element found
+        return true;
+      } catch {
+        // Session invalid - navigation element not found
+        return false;
+      }
+    }
+
+    // If no success indicator and no navigation specified, assume valid if not on login page
+    // This is a weak check but better than always failing
     return true;
   } catch (error) {
     console.error(`[SessionManager] Error validating session:`, error);

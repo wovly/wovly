@@ -9,7 +9,7 @@
  * 5. Integrations - Recommend connecting services
  */
 
-const ONBOARDING_STAGES = ["api_setup", "profile", "task_demo", "skill_demo", "integrations", "completed"];
+const ONBOARDING_STAGES = ["api_setup", "profile", "goals_intro", "task_demo", "skill_demo", "integrations", "completed"];
 
 /**
  * Check if user is in an active onboarding stage (not completed)

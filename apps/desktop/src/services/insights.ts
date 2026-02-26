@@ -5,7 +5,7 @@
 
 import { promises as fs } from 'fs';
 import { getSettingsPath } from '../utils/helpers';
-import { loadTodayInsights } from '../storage/insights';
+import { loadTodayInsights, loadRecentInsights } from '../storage/insights';
 
 /**
  * Service response interface
@@ -52,7 +52,7 @@ export class InsightsService {
   }
 
   /**
-   * Get today's insights with limit
+   * Get today's insights with limit (or most recent if today is empty)
    * @param username - Current username
    * @param limit - Number of insights to return (default 5)
    * @returns Array of insights
@@ -66,14 +66,23 @@ export class InsightsService {
         return { ok: false, error: 'Not logged in', insights: [] };
       }
 
-      const allInsights = await loadTodayInsights(username);
-      // Apply limit to returned insights
-      const insights = allInsights.slice(0, limit);
+      // First try to load today's insights
+      const todayInsights = await loadTodayInsights(username);
+
+      // If today has insights, use those
+      if (todayInsights.length > 0) {
+        const insights = todayInsights.slice(0, limit);
+        return { ok: true, insights };
+      }
+
+      // Otherwise, fall back to most recent insights from the last 7 days
+      const recentInsights = await loadRecentInsights(username, 7);
+      const insights = recentInsights.slice(0, limit);
 
       return { ok: true, insights };
     } catch (err) {
       const error = err instanceof Error ? err.message : 'Unknown error';
-      console.error('[Insights] Error loading today\'s insights:', error);
+      console.error('[Insights] Error loading insights:', error);
       return { ok: false, error, insights: [] };
     }
   }

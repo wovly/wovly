@@ -18,6 +18,7 @@ import {
   ErrorType,
 } from './error-detector';
 import { getSettingsPath } from '../utils/helpers';
+import { fetch2FACodeFromIMessage, fetch2FACodeFromGmail } from './twofa-helper';
 
 // ─────────────────────────────────────────────────────────────────────────
 // Type Definitions
@@ -240,24 +241,172 @@ export class WebScraper {
     // Get credentials
     const credentials = await this.getCredentials(siteConfig);
 
-    console.warn(`[WebScraper] Filling login form`);
+    // Check if we have a recorded login sequence - if so, replay it exactly
+    if (siteConfig.selectors.login.sequence && siteConfig.selectors.login.sequence.length > 0) {
+      console.warn(
+        `[WebScraper] Replaying recorded login sequence (${siteConfig.selectors.login.sequence.length} steps)`
+      );
 
-    // Fill username
-    await page.waitForSelector(siteConfig.selectors.login.usernameField, { timeout: 10000 });
-    await page.click(siteConfig.selectors.login.usernameField);
-    await page.type(siteConfig.selectors.login.usernameField, credentials.username);
+      for (const step of siteConfig.selectors.login.sequence) {
+        console.warn(
+          `[WebScraper]   Step: ${step.type} ${step.selector} ${step.description || ''}`
+        );
 
-    // Fill password
-    if (siteConfig.selectors.login.passwordField) {
-      await page.waitForSelector(siteConfig.selectors.login.passwordField, { timeout: 10000 });
-      await page.click(siteConfig.selectors.login.passwordField);
-      await page.type(siteConfig.selectors.login.passwordField, credentials.password);
+        try {
+          // Wait for element
+          await page.waitForSelector(step.selector, { timeout: 10000 });
+
+          if (step.type === 'type') {
+            await page.click(step.selector);
+
+            // Use actual credentials
+            if (step.isUsernameField) {
+              await page.type(step.selector, credentials.username);
+              console.warn('[WebScraper]   ✓ Entered username');
+            } else if (step.isPasswordField) {
+              await page.type(step.selector, credentials.password);
+              console.warn('[WebScraper]   ✓ Entered password');
+            } else if (step.is2FAField) {
+              // Automatic 2FA code retrieval
+              const method = siteConfig.twoFactorAuth?.method || 'unknown';
+              console.warn(
+                `[WebScraper]   2FA field detected (${method}) - attempting automatic code retrieval`
+              );
+
+              // Get site name from config for searching
+              const siteName = siteConfig.name.toLowerCase();
+              const searchTerm = siteName.replace(/\s+/g, ''); // Remove spaces: "My Chart" → "mychart"
+
+              // Get API key for LLM extraction
+              const apiKey = await this.getApiKey();
+
+              let code: string | null = null;
+
+              if (!apiKey) {
+                console.warn('[WebScraper]   ⚠ No API key available for 2FA code extraction');
+              } else if (method === 'email') {
+                // Email-based 2FA - use Gmail
+                console.warn('[WebScraper]   Using Gmail for email-based 2FA');
+                const googleToken = await this.getGoogleAccessToken();
+
+                if (googleToken) {
+                  code = await fetch2FACodeFromGmail(googleToken, searchTerm, apiKey, 10);
+                } else {
+                  console.warn(
+                    '[WebScraper]   ⚠ Gmail not connected - cannot retrieve email 2FA code'
+                  );
+                }
+              } else if (method === 'sms') {
+                // SMS-based 2FA - use iMessage
+                console.warn('[WebScraper]   Using iMessage for SMS-based 2FA');
+                code = await fetch2FACodeFromIMessage(searchTerm, apiKey, 10);
+              } else {
+                console.warn(
+                  `[WebScraper]   ⚠ Unknown 2FA method (${method}) - cannot auto-retrieve code`
+                );
+              }
+
+              if (code) {
+                await page.type(step.selector, code);
+                console.warn(`[WebScraper]   ✓ Automatically entered 2FA code: ${code}`);
+              } else {
+                console.warn(
+                  '[WebScraper]   ⚠ Could not retrieve 2FA code automatically - manual entry required'
+                );
+                // Don't fail - just skip this step and let user handle manually
+              }
+            }
+          } else if (step.type === 'click' && !step.is2FAField) {
+            await page.click(step.selector);
+            console.warn('[WebScraper]   ✓ Clicked');
+
+            // Wait for potential navigation after clicks
+            await page
+              .waitForNavigation({ waitUntil: 'networkidle0', timeout: 5000 })
+              .catch(() => {});
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        } catch (err: any) {
+          console.warn(`[WebScraper]   ⚠ Step failed: ${err.message}`);
+          // Continue to next step
+        }
+      }
+
+      console.warn('[WebScraper] Login sequence replay complete');
+
+      // Skip handle2FA below - sequence already handled 2FA if needed
+      const sequenceHandled2FA = siteConfig.selectors.login.sequence.some(
+        (step) => step.is2FAField
+      );
+      if (sequenceHandled2FA) {
+        console.warn(
+          '[WebScraper] 2FA already handled in login sequence, skipping duplicate check'
+        );
+        // Jump to success check
+        if (siteConfig.selectors.login.successIndicator) {
+          await page.waitForSelector(siteConfig.selectors.login.successIndicator, {
+            timeout: 15000,
+          });
+        } else {
+          await page
+            .waitForNavigation({ waitUntil: 'networkidle0', timeout: 15000 })
+            .catch(() => {});
+        }
+        console.warn(`[WebScraper] Login successful`);
+        return;
+      }
+    } else {
+      // Fallback to old method if no sequence recorded
+      console.warn(`[WebScraper] No login sequence found, using legacy login method`);
+
+      // Fill username
+      await page.waitForSelector(siteConfig.selectors.login.usernameField, { timeout: 10000 });
+      await page.click(siteConfig.selectors.login.usernameField);
+      await page.type(siteConfig.selectors.login.usernameField, credentials.username);
+
+      // Check if password field exists on current page
+      let passwordFieldExists = false;
+      if (siteConfig.selectors.login.passwordField) {
+        try {
+          await page.waitForSelector(siteConfig.selectors.login.passwordField, { timeout: 2000 });
+          passwordFieldExists = true;
+        } catch {
+          passwordFieldExists = false;
+        }
+      }
+
+      // If password field doesn't exist, click submit first
+      if (!passwordFieldExists && siteConfig.selectors.login.submitButton) {
+        await page.click(siteConfig.selectors.login.submitButton);
+        await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 15000 }).catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+
+      // Fill password
+      if (siteConfig.selectors.login.passwordField) {
+        await page.waitForSelector(siteConfig.selectors.login.passwordField, { timeout: 10000 });
+        await page.click(siteConfig.selectors.login.passwordField);
+        await page.type(siteConfig.selectors.login.passwordField, credentials.password);
+      }
+
+      // Click submit button
+      if (siteConfig.selectors.login.submitButton) {
+        console.warn(`[WebScraper] Submitting login form`);
+        await page.click(siteConfig.selectors.login.submitButton);
+      }
     }
 
-    // Click submit button
-    if (siteConfig.selectors.login.submitButton) {
-      console.warn(`[WebScraper] Submitting login form`);
-      await page.click(siteConfig.selectors.login.submitButton);
+    // Handle 2FA if enabled (hybrid approach)
+    if (siteConfig.twoFactorAuth?.enabled && siteConfig.selectors.login.twoFactorField) {
+      console.warn(`[WebScraper] 2FA detected, attempting hybrid authentication`);
+
+      const sessionId = `webscraper-${siteConfig.id}`;
+      const success = await this.handle2FA(page, siteConfig, sessionId);
+
+      if (!success) {
+        // Don't throw - manual fallback is always available
+        console.warn('[WebScraper] 2FA automation failed, user completed manually');
+      }
     }
 
     // Wait for navigation or success indicator
@@ -280,6 +429,188 @@ export class WebScraper {
     // Wait for page to fully render after login (important for SPAs)
     console.warn(`[WebScraper] Waiting for page to stabilize after login...`);
     await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+
+  /**
+   * Handle 2FA code entry during login (HYBRID APPROACH)
+   * @param page - Puppeteer page
+   * @param siteConfig - Site configuration
+   * @param sessionId - Session ID for browser window management
+   * @returns true if automated, false if manual fallback used
+   */
+  private async handle2FA(page: Page, siteConfig: SiteConfig, sessionId: string): Promise<boolean> {
+    const twoFA = siteConfig.twoFactorAuth;
+    if (!twoFA || !siteConfig.selectors.login.twoFactorField) {
+      return false;
+    }
+
+    try {
+      // Wait for 2FA field to appear
+      await page.waitForSelector(siteConfig.selectors.login.twoFactorField, { timeout: 10000 });
+      console.warn(`[WebScraper] 2FA field detected`);
+
+      // STEP 1: Attempt automated code retrieval
+      let code: string | null = null;
+
+      if (twoFA.method === 'email' && twoFA.requiredIntegration === 'gmail') {
+        const googleToken = await this.getGoogleAccessToken();
+        if (googleToken) {
+          console.warn('[WebScraper] Attempting automated 2FA via Gmail');
+          const senderDomain = new URL(siteConfig.url).hostname;
+          code = await fetch2FACodeFromGmail(googleToken, senderDomain, await this.getApiKey());
+        }
+      }
+
+      if (twoFA.method === 'sms' && twoFA.requiredIntegration === 'imessage') {
+        const iMessageEnabled = await this.getIMessageEnabled();
+        if (iMessageEnabled) {
+          console.warn('[WebScraper] Attempting automated 2FA via iMessage');
+          const phonePattern = twoFA.target?.split('-').pop() || '';
+          code = await fetch2FACodeFromIMessage(phonePattern, await this.getApiKey());
+        }
+      }
+
+      // STEP 2: If automation succeeded, enter code
+      if (code) {
+        console.warn(`[WebScraper] Automated 2FA: Entering code ${code}`);
+        await page.click(siteConfig.selectors.login.twoFactorField);
+        await page.type(siteConfig.selectors.login.twoFactorField, code);
+
+        // Submit if button exists
+        const submitButton = await page.$('button[type="submit"]').catch(() => null);
+        if (submitButton) {
+          await submitButton.click();
+        }
+
+        // Wait for 2FA to complete
+        await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 15000 }).catch(() => {});
+        console.warn('[WebScraper] ✅ Automated 2FA completed successfully');
+        return true;
+      }
+
+      // STEP 3: Fallback to manual 2FA
+      console.warn('[WebScraper] Automated 2FA not available, falling back to manual');
+
+      // Show browser window to user (make headful if headless)
+      await this.showBrowserForManual2FA(sessionId, siteConfig.name);
+
+      // Wait for user to complete 2FA (with timeout and notification)
+      const completed = await this.waitForManual2FA(
+        page,
+        siteConfig.name,
+        siteConfig.selectors.login.twoFactorField
+      );
+
+      if (completed) {
+        console.warn('[WebScraper] ✅ Manual 2FA completed by user');
+        return false; // Indicate manual completion
+      } else {
+        throw new Error('2FA timeout - user did not complete authentication');
+      }
+    } catch (err: any) {
+      console.error('[WebScraper] 2FA handling error:', err.message);
+      throw err; // Re-throw so scraper can handle
+    }
+  }
+
+  /**
+   * Show browser window for manual 2FA
+   */
+  private async showBrowserForManual2FA(sessionId: string, siteName: string): Promise<void> {
+    // This will be implemented in browser controller
+    // For now, just log
+    console.warn(`[WebScraper] Browser window should be shown for manual 2FA: ${siteName}`);
+  }
+
+  /**
+   * Wait for user to complete manual 2FA (with timeout and chat notification)
+   * @returns true if completed, false if timeout
+   */
+  private async waitForManual2FA(
+    page: Page,
+    siteName: string,
+    twoFactorSelector: string
+  ): Promise<boolean> {
+    console.warn('[WebScraper] Waiting for user to complete manual 2FA...');
+
+    const timeout = 300000; // 5 minutes
+    const startTime = Date.now();
+    let notificationSent = false;
+
+    return new Promise((resolve) => {
+      const checkInterval = setInterval(async () => {
+        const elapsed = Date.now() - startTime;
+
+        // Send chat notification after 5 minutes
+        if (elapsed >= timeout && !notificationSent) {
+          notificationSent = true;
+          await this.sendChatNotification(
+            `Your authentication is needed for ${siteName} to fetch the latest messages`
+          );
+          console.warn('[WebScraper] Chat notification sent to user');
+        }
+
+        // Check if page has changed (2FA completed)
+        const has2FAField = await page.$(twoFactorSelector).catch(() => null);
+
+        if (!has2FAField) {
+          // 2FA field gone = user completed it
+          clearInterval(checkInterval);
+          resolve(true);
+        }
+
+        // Continue waiting indefinitely after notification
+        // (user might take longer than 5 min)
+      }, 2000); // Check every 2 seconds
+    });
+  }
+
+  /**
+   * Send notification to chat window
+   */
+  private async sendChatNotification(message: string): Promise<void> {
+    // This will be implemented to send IPC to main window
+    // For now, just log
+    console.warn(`[WebScraper] Would send notification: ${message}`);
+  }
+
+  /**
+   * Get Google access token for Gmail API
+   */
+  private async getGoogleAccessToken(): Promise<string | null> {
+    try {
+      // This will be replaced with actual implementation
+      // For now, return null to force manual fallback
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Check if iMessage is enabled
+   */
+  private async getIMessageEnabled(): Promise<boolean> {
+    try {
+      const { SettingsService } = await import('../services/settings');
+      return await SettingsService.getIMessageEnabled(this.username);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Get API key for LLM calls
+   */
+  private async getApiKey(): Promise<string> {
+    try {
+      const settingsPath = await getSettingsPath(this.username);
+      const settingsData = await fs.readFile(settingsPath, 'utf-8');
+      const settings: Settings = JSON.parse(settingsData);
+      return settings.apiKeys?.anthropic || '';
+    } catch {
+      return '';
+    }
   }
 
   /**
@@ -332,39 +663,96 @@ export class WebScraper {
               JSON.stringify(availableElements, null, 2)
             );
 
-            // Try text-based fallback if we have a description
+            // Try multiple fallback strategies
             if (step.description) {
-              console.warn(`[WebScraper] Trying text-based fallback for: "${step.description}"`);
+              console.warn(`[WebScraper] Trying fallback strategies for: "${step.description}"`);
 
-              // Extract the likely text from description (e.g., "Click Messaging" -> "Messaging")
-              const textMatch = step.description.match(/(?:click|select|tap)\s+(.+)/i);
-              let searchText = textMatch ? textMatch[1].trim() : step.description;
+              // Strategy 1: If targeting SVG, try parent clickable element
+              if (step.selector.includes('svg')) {
+                console.warn(`[WebScraper] SVG detected, trying parent clickable element`);
+                const foundSvgParent = await page.evaluate((selector: string) => {
+                  const doc = (globalThis as any).document;
+                  try {
+                    const svgElement = doc.querySelector(selector.replace(/\s*>\s*svg$/, ''));
+                    if (svgElement) {
+                      // Look for parent button, link, or clickable element
+                      let parent = svgElement.closest('button, a, [role="button"], [onclick]');
+                      if (parent) {
+                        return true;
+                      }
+                    }
+                  } catch (e) {
+                    // Ignore selector errors
+                  }
+                  return false;
+                }, step.selector);
 
-              // Clean up search text - remove extra content after special chars
-              // "Roma ChouParent ⇆ Admin..." -> "Roma Chou"
-              searchText = searchText.split(/[⇆→←↔|]/)[0].trim(); // Split on arrows/pipes
-              searchText = searchText.split(/\s{2,}/)[0].trim(); // Split on double spaces
-              searchText = searchText.substring(0, 100); // Limit length
+                if (foundSvgParent) {
+                  console.warn(`[WebScraper] Found parent clickable element for SVG`);
+                  elementFound = true;
+                }
+              }
 
-              console.warn(`[WebScraper] Cleaned search text: "${searchText}"`);
+              // Strategy 2: Text-based fallback (skip if description is just "svg" or contains only "svg")
+              if (!elementFound && step.description) {
+                const textMatch = step.description.match(/(?:click|select|tap)\s+(.+)/i);
+                let searchText = textMatch ? textMatch[1].trim() : step.description;
 
-              const foundByText = (await page.evaluate((text: any) => {
-                // @ts-expect-error - document available in browser context
-                const elements = Array.from(
-                  document.querySelectorAll('a, button, [role="button"]')
+                // Skip if search text is just "svg" or icon-related
+                if (!['svg', 'icon', 'button'].includes(searchText.toLowerCase())) {
+                  // Clean up search text
+                  searchText = searchText.split(/[⇆→←↔|]/)[0].trim();
+                  searchText = searchText.split(/\s{2,}/)[0].trim();
+                  searchText = searchText.substring(0, 100);
+
+                  console.warn(`[WebScraper] Trying text search: "${searchText}"`);
+
+                  const foundByText = (await page.evaluate((text: string) => {
+                    const doc = (globalThis as any).document;
+                    const elements = Array.from(
+                      doc.querySelectorAll('a, button, [role="button"], [onclick]')
+                    );
+
+                    const match = elements.find((el: any) => {
+                      const elText = el.textContent?.trim() || '';
+                      const ariaLabel = el.getAttribute('aria-label') || '';
+                      const title = el.getAttribute('title') || '';
+
+                      return (
+                        elText.toLowerCase().includes(text.toLowerCase()) ||
+                        ariaLabel.toLowerCase().includes(text.toLowerCase()) ||
+                        title.toLowerCase().includes(text.toLowerCase())
+                      );
+                    });
+                    return match !== undefined;
+                  }, searchText)) as boolean;
+
+                  if (foundByText) {
+                    console.warn(
+                      `[WebScraper] Found element by text/aria-label/title: "${searchText}"`
+                    );
+                    elementFound = true;
+                  }
+                }
+              }
+
+              // Strategy 3: Try more flexible selector (remove nth-child)
+              if (!elementFound && step.selector.includes('nth-child')) {
+                console.warn(`[WebScraper] Trying selector without nth-child constraints`);
+                const flexibleSelector = step.selector.replace(
+                  /:(nth-child|nth-of-type)\(\d+\)\s*>\s*/g,
+                  ' '
                 );
+                try {
+                  await page.waitForSelector(flexibleSelector, { timeout: 5000 });
+                  console.warn(`[WebScraper] Found with flexible selector: ${flexibleSelector}`);
+                  elementFound = true;
+                } catch {
+                  // Continue to next strategy
+                }
+              }
 
-                const match = elements.find((el: any) => {
-                  const elText = el.textContent?.trim() || '';
-                  return elText.toLowerCase().includes(text.toLowerCase());
-                });
-                return match !== undefined;
-              }, searchText)) as boolean;
-
-              if (foundByText) {
-                console.warn(`[WebScraper] Found element by text: "${searchText}"`);
-                elementFound = true;
-              } else {
+              if (!elementFound) {
                 throw selectorError;
               }
             } else {
@@ -372,59 +760,114 @@ export class WebScraper {
             }
           }
 
-          // Click the element (either by CSS selector or by text)
+          // Click the element using appropriate strategy
           if (elementFound) {
-            try {
-              // Try clicking with navigation handling (in case click triggers navigation)
-              try {
-                await Promise.race([
-                  // Wait for navigation if it happens
-                  page
-                    .waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 })
-                    .catch(() => {
-                      // Navigation didn't happen, that's fine
-                    }),
-                  // Perform the click
-                  page.click(step.selector),
-                ]);
-                console.warn(`[WebScraper] Click successful (selector: ${step.selector})`);
-              } catch (navigationError) {
-                // If the click caused a navigation that destroyed the context,
-                // wait a bit for the new page to load
-                console.warn(
-                  `[WebScraper] Click may have triggered navigation, waiting for page to stabilize...`
-                );
-                await new Promise((resolve) => setTimeout(resolve, 2000));
-              }
-            } catch (clickError) {
-              // If CSS selector click fails, try clicking by text
-              if (step.description) {
-                const textMatch = step.description.match(/(?:click|select|tap)\s+(.+)/i);
-                let searchText = textMatch ? textMatch[1].trim() : step.description;
+            let clickSuccessful = false;
 
-                // Clean up search text
+            // Strategy 1: SVG parent click
+            if (step.selector.includes('svg')) {
+              try {
+                const clicked = await page.evaluate((selector: string) => {
+                  const doc = (globalThis as any).document;
+                  try {
+                    const svgElement = doc.querySelector(selector.replace(/\s*>\s*svg$/, ''));
+                    if (svgElement) {
+                      const parent = svgElement.closest('button, a, [role="button"], [onclick]');
+                      if (parent) {
+                        parent.click();
+                        return true;
+                      }
+                    }
+                  } catch (e) {
+                    // Continue to next strategy
+                  }
+                  return false;
+                }, step.selector);
+
+                if (clicked) {
+                  console.warn(`[WebScraper] Clicked SVG parent element`);
+                  clickSuccessful = true;
+                  await new Promise((resolve) => setTimeout(resolve, 2000));
+                }
+              } catch (e) {
+                // Continue to next strategy
+              }
+            }
+
+            // Strategy 2: Text-based click
+            if (!clickSuccessful && step.description) {
+              const textMatch = step.description.match(/(?:click|select|tap)\s+(.+)/i);
+              let searchText = textMatch ? textMatch[1].trim() : step.description;
+
+              if (!['svg', 'icon', 'button'].includes(searchText.toLowerCase())) {
                 searchText = searchText.split(/[⇆→←↔|]/)[0].trim();
                 searchText = searchText.split(/\s{2,}/)[0].trim();
                 searchText = searchText.substring(0, 100);
 
-                await page.evaluate((text: string) => {
-                  const doc = (globalThis as any).document;
-                  const elements = Array.from(doc.querySelectorAll('a, button, [role="button"]'));
+                try {
+                  const clicked = await page.evaluate((text: string) => {
+                    const doc = (globalThis as any).document;
+                    const elements = Array.from(
+                      doc.querySelectorAll('a, button, [role="button"], [onclick]')
+                    );
 
-                  const match = elements.find((el: any) => {
-                    const elText = el.textContent?.trim() || '';
-                    return elText.toLowerCase().includes(text.toLowerCase());
-                  });
-                  if (match) {
-                    (match as any).click();
+                    const match = elements.find((el: any) => {
+                      const elText = el.textContent?.trim() || '';
+                      const ariaLabel = el.getAttribute('aria-label') || '';
+                      const title = el.getAttribute('title') || '';
+                      return (
+                        elText.toLowerCase().includes(text.toLowerCase()) ||
+                        ariaLabel.toLowerCase().includes(text.toLowerCase()) ||
+                        title.toLowerCase().includes(text.toLowerCase())
+                      );
+                    });
+                    if (match) {
+                      (match as any).click();
+                      return true;
+                    }
+                    return false;
+                  }, searchText);
+
+                  if (clicked) {
+                    console.warn(`[WebScraper] Clicked by text/aria-label: "${searchText}"`);
+                    clickSuccessful = true;
+                    await new Promise((resolve) => setTimeout(resolve, 2000));
                   }
-                }, searchText);
+                } catch (e) {
+                  // Continue to next strategy
+                }
+              }
+            }
 
-                console.warn(`[WebScraper] Clicked by text fallback: "${searchText}"`);
-
-                // Wait for potential navigation after text-based click
+            // Strategy 3: Flexible selector (without nth-child)
+            if (!clickSuccessful && step.selector.includes('nth-child')) {
+              const flexibleSelector = step.selector.replace(
+                /:(nth-child|nth-of-type)\(\d+\)\s*>\s*/g,
+                ' '
+              );
+              try {
+                await page.click(flexibleSelector);
+                console.warn(`[WebScraper] Clicked with flexible selector: ${flexibleSelector}`);
+                clickSuccessful = true;
                 await new Promise((resolve) => setTimeout(resolve, 2000));
-              } else {
+              } catch (e) {
+                // Continue to next strategy
+              }
+            }
+
+            // Strategy 4: Original selector
+            if (!clickSuccessful) {
+              try {
+                await Promise.race([
+                  page
+                    .waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 })
+                    .catch(() => {}),
+                  page.click(step.selector),
+                ]);
+                console.warn(`[WebScraper] Clicked with original selector: ${step.selector}`);
+                clickSuccessful = true;
+              } catch (clickError) {
+                console.error(`[WebScraper] All click strategies failed for: ${step.description}`);
                 throw clickError;
               }
             }
@@ -463,8 +906,8 @@ export class WebScraper {
   private async extractMessages(page: Page, siteConfig: SiteConfig): Promise<RawMessage[]> {
     const selectors = siteConfig.selectors.messages;
 
-    if (!selectors) {
-      throw new Error('No message selectors configured');
+    if (!selectors || !selectors.container || !selectors.container.trim()) {
+      throw new Error('No message selectors configured - please reconfigure this integration');
     }
 
     console.warn(`[WebScraper] Extracting messages using AI-powered text extraction`);

@@ -31,7 +31,7 @@ export interface LoginResult {
 }
 
 export interface BrowserController {
-  newPage(options: { headless: boolean; sessionId: string }): Promise<Page>;
+  getPage(sessionId: string): Promise<Page>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -59,10 +59,8 @@ export class OAuthLoginHandler {
   ): Promise<LoginResult> {
     console.warn(`[OAuthLogin] Starting manual login for ${siteConfig.name}`);
 
-    const page = await this.browser.newPage({
-      headless: false, // IMPORTANT: visible browser for user
-      sessionId: `oauth-login-${siteConfig.id}-${Date.now()}`,
-    });
+    const sessionId = `oauth-login-${siteConfig.id}-${Date.now()}`;
+    const page = await this.browser.getPage(sessionId);
 
     try {
       // Navigate to login URL
@@ -74,6 +72,13 @@ export class OAuthLoginHandler {
 
       // Inject instruction overlay
       await this.injectInstructionOverlay(page, siteConfig);
+
+      // Re-inject overlays on page reload/navigation
+      page.on('load', async () => {
+        console.warn('[OAuthLogin] Page reloaded, re-injecting overlays');
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await this.injectInstructionOverlay(page, siteConfig);
+      });
 
       // Wait for user to complete login
       const loginSuccess = await this.waitForLoginCompletion(
@@ -127,12 +132,61 @@ export class OAuthLoginHandler {
   private async injectInstructionOverlay(page: Page, siteConfig: SiteConfig): Promise<void> {
     await page.evaluate((siteName: any) => {
       // @ts-expect-error - document available in browser context
+      const captchaBanner = document.createElement('div');
+      captchaBanner.id = 'wovly-captcha-banner';
+      captchaBanner.innerHTML = `
+        <div style="
+          position: fixed;
+          top: 0;
+          left: 0;
+          right: 0;
+          background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+          color: white;
+          padding: 12px 20px;
+          z-index: 9999999;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+        ">
+          <div style="display: flex; align-items: center; gap: 12px; flex: 1;">
+            <div style="font-size: 24px;">🤖</div>
+            <div>
+              <div style="font-weight: 600; font-size: 14px;">Bot Detection Alert</div>
+              <div style="font-size: 12px; opacity: 0.9;">If a CAPTCHA or verification appears, complete it manually, then click Refresh to continue automation</div>
+            </div>
+          </div>
+          <button
+            id="wovly-captcha-refresh"
+            style="
+              padding: 8px 20px;
+              background: white;
+              color: #f5576c;
+              border: none;
+              border-radius: 6px;
+              font-weight: 600;
+              cursor: pointer;
+              font-size: 13px;
+              white-space: nowrap;
+              box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+              transition: transform 0.2s;
+            "
+            onmouseover="this.style.transform='scale(1.05)'"
+            onmouseout="this.style.transform='scale(1)'"
+          >
+            🔄 Refresh & Continue
+          </button>
+        </div>
+      `;
+
+      // @ts-expect-error - document available in browser context
       const overlay = document.createElement('div');
       overlay.id = 'wovly-oauth-instructions';
       overlay.innerHTML = `
         <div style="
           position: fixed;
-          top: 20px;
+          top: 70px;
           right: 20px;
           background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
           color: white;
@@ -152,6 +206,7 @@ export class OAuthLoginHandler {
               <li>Click "Sign in with Google" (or other OAuth)</li>
               <li>Enter your credentials</li>
               <li>Complete any 2FA verification</li>
+              <li><strong>If CAPTCHA appears, solve it then click Refresh</strong></li>
             </ul>
           </div>
           <div style="
@@ -198,6 +253,8 @@ export class OAuthLoginHandler {
         </div>
       `;
       // @ts-expect-error - document available in browser context
+      document.body.insertBefore(captchaBanner, document.body.firstChild);
+      // @ts-expect-error - document available in browser context
       document.body.appendChild(overlay);
     }, siteConfig.name);
 
@@ -208,6 +265,10 @@ export class OAuthLoginHandler {
 
     await page.exposeFunction('wovlyOAuthCancel', () => {
       console.warn('[OAuthLogin] User cancelled login');
+    });
+
+    await page.exposeFunction('wovlyCaptchaRefresh', () => {
+      console.warn('[OAuthLogin] User requesting page refresh after captcha');
     });
 
     // Attach event listeners (browser context code)
@@ -227,6 +288,14 @@ export class OAuthLoginHandler {
         window.wovlyOAuthCancel();
         // @ts-expect-error - window available in browser context
         window.close();
+      });
+
+      // @ts-expect-error - document and window available in browser context
+      document.getElementById('wovly-captcha-refresh')?.addEventListener('click', () => {
+        // @ts-expect-error - window.wovlyCaptchaRefresh exposed by page.exposeFunction
+        window.wovlyCaptchaRefresh();
+        // @ts-expect-error - location available in browser context
+        location.reload();
       });
     });
   }
