@@ -289,11 +289,18 @@ Go to **Settings** → **AI Providers** and add your API keys:
 
 #### 2. Google Workspace
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project
-3. Enable **Gmail API** and **Google Calendar API**
-4. Create OAuth 2.0 credentials (Desktop app)
-5. In Wovly: **Integrations** → **Google Workspace** → Enter Client ID & Secret
+For Gmail, Calendar, and Drive integrations, you'll need to set up Google OAuth credentials:
+
+**Quick Setup:**
+1. Create a `.env` file from the template: `cp .env.example .env`
+2. Follow the detailed instructions in **[SETUP.md](./SETUP.md)** to get your OAuth credentials
+3. Add your credentials to the `.env` file
+4. Restart the app
+
+**Or configure in the app:**
+1. In Wovly: **Integrations** → **Google Workspace** → Enter Client ID & Secret
+
+See **[SETUP.md](./SETUP.md)** for step-by-step instructions with screenshots.
 
 #### 3. Slack
 
